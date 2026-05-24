@@ -1,0 +1,15 @@
+{
+  "name": "cairn-plugin",
+  "version": "0.1.0",
+  "description": "Cairn provenance plugin for OpenCode — logs tool calls to substrate via the Python bridge",
+  "main": "index.js",
+  "type": "module",
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^0.1.0"
+  },
+  "engines": {
+    "bun": ">=1.0"
+  },
+  "keywords": ["provenance", "audit", "opencode", "cairn"],
+  "license": "MIT"
+}

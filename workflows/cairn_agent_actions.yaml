@@ -1,0 +1,48 @@
+name: cairn_agent_actions
+version: 1
+substrate_version: "0.1.0"
+
+states:
+  - name: new
+    initial: true
+  - name: running
+  - name: completed
+    terminal: true
+  - name: failed
+    terminal: true
+
+transitions:
+  - name: tool_call_begin
+    from: new
+    to: running
+    allowed_roles: [agent]
+  - name: tool_call_begin
+    from: running
+    to: running
+    allowed_roles: [agent]
+  - name: tool_call_end
+    from: running
+    to: completed
+    allowed_roles: [agent]
+  - name: tool_call_fail
+    from: running
+    to: failed
+    allowed_roles: [agent]
+
+roles:
+  - name: agent
+
+work_item_types:
+  - name: tool_call
+    custom_fields:
+      - name: tool
+        type: string
+        required: true
+      - name: status
+        type: string
+        required: true
+
+link_types:
+  - name: parent_of
+    source_type: tool_call
+    target_type: tool_call
