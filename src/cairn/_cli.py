@@ -140,13 +140,18 @@ def export(
         )
     manifest["trust_model_caveat"] = trust_model_caveat
 
-    bundle = {
+    bundle: dict[str, Any] = {
         "manifest": manifest,
         "events": [ev.to_dict() for ev in events],
     }
 
     canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    bundle["manifest"]["bundle_hash"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+    bundle["manifest"]["bundle_hash"] = digest
+    bundle["manifest"]["bundle_hash_covers"] = (
+        "manifest (minus bundle_hash) + events, canonical JSON"
+    )
 
     output.write_text(json.dumps(bundle, indent=2))
     click.echo(f"Exported {len(events)} events to {output}")

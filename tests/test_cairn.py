@@ -67,15 +67,11 @@ def substrate_instance(hmac_keys: Path, tmp_path: Path) -> Substrate:
 
 @pytest.fixture
 def workflow_registered(substrate_instance: Substrate) -> None:
-    substrate_instance.register_workflow_file(
-        "workflows/cairn_agent_actions.yaml"
-    )
+    substrate_instance.register_workflow_file("workflows/cairn_agent_actions.yaml")
 
 
 @pytest.fixture
-def adapter(
-    substrate_instance: Substrate, workflow_registered: None
-) -> CairnAdapter:
+def adapter(substrate_instance: Substrate, workflow_registered: None) -> CairnAdapter:
     return CairnAdapter(
         substrate_instance,
         config=CairnConfig("opencode", "0.1.0"),
@@ -211,9 +207,7 @@ def test_attest_scope(adapter: CairnAdapter) -> None:
     assert payload.get("scope_statement") == "In scope: opencode."
 
 
-def test_begin_tool_call_creates_work_item(
-    adapter: CairnAdapter, tmp_path: Path
-) -> None:
+def test_begin_tool_call_creates_work_item(adapter: CairnAdapter, tmp_path: Path) -> None:
     test_file = tmp_path / "test.txt"
     test_file.write_text("hello\n")
 
@@ -234,9 +228,7 @@ def test_begin_tool_call_creates_work_item(
     assert len(events) >= 1
 
 
-def test_begin_and_end_tool_call(
-    adapter: CairnAdapter, tmp_path: Path
-) -> None:
+def test_begin_and_end_tool_call(adapter: CairnAdapter, tmp_path: Path) -> None:
     test_file = tmp_path / "test.txt"
     test_file.write_text("hello\n")
 
@@ -431,3 +423,126 @@ def test_verify_bundle_file(hmac_keys: Path, tmp_path: Path) -> None:
     verifier = Verifier(key_set)
     report = verifier.verify_bundle(bundle_path)
     assert report.ok == 1
+
+
+def test_verify_bundle_with_valid_hash(hmac_keys: Path, tmp_path: Path) -> None:
+    import hashlib
+
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    from substrate._signing import sign_event
+    from substrate._types import Event
+
+    ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+    event = Event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    manifest = {"events_count": 1}
+    bundle = {"manifest": manifest, "events": [event.to_dict()]}
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    manifest["bundle_hash"] = digest
+
+    bundle_path = tmp_path / "bundle_hashed.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+    assert report.ok == 1
+    assert report.bundle_hash_ok is True
+    assert report.all_ok
+
+
+def test_verify_bundle_tampered_hash(hmac_keys: Path, tmp_path: Path) -> None:
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    from substrate._signing import sign_event
+    from substrate._types import Event
+
+    ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+    event = Event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    bundle = {
+        "manifest": {
+            "events_count": 1,
+            "bundle_hash": "sha256:deadbeef",
+        },
+        "events": [event.to_dict()],
+    }
+    bundle_path = tmp_path / "bundle_tampered.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+    assert report.bundle_hash_ok is False
+    assert not report.all_ok
+    assert "mismatch" in (report.bundle_hash_detail or "")

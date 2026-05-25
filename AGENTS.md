@@ -94,16 +94,17 @@ In rough order. Do not assume any of these are done; check on entry.
    an auditor-ready report.
    **Done: `src/cairn/verifier.py` + CLI `cairn verify`.**
 
-## Current status (last updated 2026-05-24)
+## Current status (last updated 2026-05-25)
 
-- **Tests**: 21 passing (CI depends on Postgres).
+- **Tests**: 36 passing (CI depends on Postgres).
 - **Lint**: ruff clean.
 - **Gaps closed**: scope attestation as signed first-class event (README §2);
   opencode plugin + bridge end-to-end functional; bundle export/verify with
-  control narrative.
-- **Open gaps**: Claude Code hooks (Plan 004); project not registered with
-  agent-notes-mcp yet; live opencode dogfood bundle not yet committed to repo
-  (commit hash or artifact TBD).
+  control narrative; Claude Code hooks (Plan 004); session_id passthrough
+  from harness to bridge (fixes audit grouping bug).
+- **Open gaps**: project not registered with agent-notes-mcp yet; live
+  opencode dogfood bundle not yet committed to repo; Claude Code hooks not
+  yet tested in a live Claude Code session (mock tests only).
 
 ## What not to do
 

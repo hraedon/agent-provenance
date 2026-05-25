@@ -121,9 +121,7 @@ class ToolCallBegin:
             tool=data["tool"],
             tool_args_hash=data["tool_args_hash"],
             tool_args_redacted=data.get("tool_args_redacted"),
-            files=[FileDigest.from_dict(f) for f in data["files"]]
-            if "files" in data
-            else None,
+            files=[FileDigest.from_dict(f) for f in data["files"]] if "files" in data else None,
             on_behalf_of=data.get("on_behalf_of"),
             parent_action_event_id=data.get("parent_action_event_id"),
             harness=CairnConfig.from_dict(data["harness"]) if "harness" in data else None,
@@ -162,9 +160,7 @@ class ToolCallEnd:
         return cls(
             tool=data["tool"],
             tool_args_hash=data["tool_args_hash"],
-            files=[FileDigest.from_dict(f) for f in data["files"]]
-            if "files" in data
-            else None,
+            files=[FileDigest.from_dict(f) for f in data["files"]] if "files" in data else None,
             result_summary=ResultSummary.from_dict(data["result_summary"])
             if "result_summary" in data
             else None,
@@ -204,14 +200,18 @@ def build_redacted_args(
     return d
 
 
-def digest_file(path: str) -> str:
-    """Return SHA-256 hex digest of file contents, or hash of empty string if missing."""
+def digest_file(path: str) -> str | None:
+    """Return SHA-256 hex digest of file contents, or None if the file does not exist.
 
+    Returns None (rather than a hash of empty bytes) so that auditors can
+    distinguish "file was absent" from "file was empty" — a critical
+    distinction for tamper-evident logs.
+    """
     try:
         with open(path, "rb") as f:
             return hashlib.sha256(f.read()).hexdigest()
-    except OSError:
-        return hashlib.sha256(b"").hexdigest()
+    except (FileNotFoundError, PermissionError, IsADirectoryError):
+        return None
 
 
 @dataclass(frozen=True)
