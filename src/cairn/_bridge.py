@@ -35,10 +35,11 @@ import uuid
 logging.basicConfig(level=logging.CRITICAL)
 import structlog  # noqa: E402
 
+_null_fh = open("/dev/null", "w")
 structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(logging.CRITICAL),
     context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(file=open("/dev/null", "w")),
+    logger_factory=structlog.PrintLoggerFactory(file=_null_fh),
     cache_logger_on_first_use=True,
 )
 
@@ -46,12 +47,14 @@ from substrate import Substrate  # noqa: E402
 
 from cairn import CairnAdapter, CairnConfig  # noqa: E402
 
+_MAX_INPUT_BYTES = 10 * 1024 * 1024  # 10 MiB safety limit on stdin
+
 
 def main() -> None:
     if os.environ.get("CAIRN_DISABLE"):
         return
 
-    raw = sys.stdin.read()
+    raw = sys.stdin.read(_MAX_INPUT_BYTES)
     if not raw:
         sys.stderr.write("cairn_bridge: no input\n")
         sys.exit(1)
@@ -67,9 +70,7 @@ def main() -> None:
     key_path = os.environ.get("CAIRN_KEY_PATH")
 
     if not all([dsn, project, key_path]):
-        sys.stderr.write(
-            "cairn_bridge: CAIRN_DSN, CAIRN_PROJECT, CAIRN_KEY_PATH required\n"
-        )
+        sys.stderr.write("cairn_bridge: CAIRN_DSN, CAIRN_PROJECT, CAIRN_KEY_PATH required\n")
         sys.exit(1)
 
     harness_name = os.environ.get("CAIRN_HARNESS_NAME", "opencode")
@@ -89,16 +90,46 @@ def main() -> None:
         sys.stderr.write(f"cairn_bridge: unknown action {action!r}\n")
         sys.exit(1)
 
+    session_id = msg.get("session_id") or str(uuid.uuid4())
+
     sub = Substrate(dsn=dsn, project=project, hmac_key_path=key_path)
     adapter = CairnAdapter(
         sub,
         config=CairnConfig(harness_name, harness_version),
         on_behalf_of={
             "principal_id": principal_id,
-            "session_id": str(uuid.uuid4()),
+            "session_id": session_id,
         },
     )
 
+    try:
+        result = _dispatch(
+            adapter,
+            action,
+            msg,
+            principal_id,
+            harness_name,
+            harness_version,
+            session_id,
+            files,
+        )
+    finally:
+        _null_fh.close()
+        sub.close()
+
+    print(json.dumps(result))
+
+
+def _dispatch(
+    adapter: CairnAdapter,
+    action: str,
+    msg: dict,
+    principal_id: str,
+    harness_name: str,
+    harness_version: str,
+    session_id: str,
+    files: list[str],
+) -> dict:
     if action == "attest_scope":
         event = adapter.attest_scope(
             principal_id=principal_id,
@@ -106,42 +137,30 @@ def main() -> None:
                 "harnesses",
                 [{"name": harness_name, "version": harness_version}],
             ),
-            scope_statement=msg.get(
-                "scope_statement", f"In scope: {harness_name}."
-            ),
+            scope_statement=msg.get("scope_statement", f"In scope: {harness_name}."),
             harness_config_digests=msg.get("harness_config_digests"),
         )
-        print(json.dumps({"status": "ok", "event_id": str(event.event_id)}))
-        return
+        return {"status": "ok", "event_id": str(event.event_id)}
 
     if action == "begin":
         args = msg.get("args", {})
-        canonical = json.dumps(
-            args, separators=(",", ":"), sort_keys=True
-        ).encode("utf-8")
+        canonical = json.dumps(args, separators=(",", ":"), sort_keys=True).encode("utf-8")
         args_hash = "sha256:" + hashlib.sha256(canonical).hexdigest()
         wi = adapter.begin_tool_call(
             tool=msg.get("tool", "unknown"),
             tool_args=args,
             files=files,
         )
-        print(
-            json.dumps(
-                {
-                    "status": "ok",
-                    "work_item_id": str(wi.work_item_id),
-                    "args_hash": args_hash,
-                }
-            )
-        )
-        return
+        return {
+            "status": "ok",
+            "work_item_id": str(wi.work_item_id),
+            "args_hash": args_hash,
+        }
 
     if action == "end":
         wi_id_str = msg.get("work_item_id")
         if not wi_id_str:
-            sys.stderr.write(
-                "cairn_bridge: work_item_id required for end\n"
-            )
+            sys.stderr.write("cairn_bridge: work_item_id required for end\n")
             sys.exit(1)
         wi_id = uuid.UUID(wi_id_str)
         event = adapter.end_tool_call(
@@ -150,8 +169,9 @@ def main() -> None:
             files=files,
             error=msg.get("error"),
         )
-        print(json.dumps({"status": "ok", "event_id": str(event.event_id)}))
-        return
+        return {"status": "ok", "event_id": str(event.event_id)}
+
+    raise ValueError(f"unreachable: action={action}")
 
 
 if __name__ == "__main__":

@@ -86,7 +86,7 @@ export default async function cairnPlugin(ctx) {
         }
 
         const reply = await invokeBridge(
-          { action: "begin", tool, args, files },
+          { action: "begin", tool, args, files, session_id: sessionID },
           ctx.client
         );
 
@@ -123,6 +123,7 @@ export default async function cairnPlugin(ctx) {
           {
             action: "end",
             work_item_id: wi_id,
+            session_id: sessionID,
             result_summary: {
               exit_code: result.exit_code ?? 0,
               stdout:

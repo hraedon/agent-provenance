@@ -64,10 +64,17 @@ class VerificationReport:
     file_provenance: list[FileProvenanceEntry] = field(default_factory=list)
     scope_attestations: list[ScopeAttestationEntry] = field(default_factory=list)
     key_chain: dict[str, dict[str, Any]] = field(default_factory=dict)
+    bundle_hash_ok: bool | None = None
+    bundle_hash_detail: str | None = None
 
     @property
     def all_ok(self) -> bool:
-        return self.signature_failed == 0 and self.hash_mismatch == 0 and self.revoked_key == 0
+        return (
+            self.signature_failed == 0
+            and self.hash_mismatch == 0
+            and self.revoked_key == 0
+            and self.bundle_hash_ok is not False
+        )
 
 
 class Verifier:
@@ -130,11 +137,20 @@ class Verifier:
         """
         path = Path(bundle_path)
         raw = json.loads(path.read_text())
+        manifest = raw.get("manifest", {})
+
+        try:
+            self._verify_bundle_hash(raw, manifest)
+        except ValueError as exc:
+            report = VerificationReport()
+            report.bundle_hash_ok = False
+            report.bundle_hash_detail = str(exc)
+            report.key_chain["bundle"] = manifest
+            return report
+
         events = [Event.from_dict(e) for e in raw["events"]]
         report = self.verify_events(events)
-
-        # Record manifest info for the report
-        manifest = raw.get("manifest", {})
+        report.bundle_hash_ok = True
         report.key_chain["bundle"] = manifest
 
         return report
@@ -142,6 +158,28 @@ class Verifier:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _verify_bundle_hash(self, raw: dict, manifest: dict) -> None:
+        stored_hash = manifest.get("bundle_hash")
+        if not stored_hash:
+            log.warn("cairn.bundle_hash_missing")
+            return
+
+        redacted = {k: v for k, v in raw.items() if k != "manifest"}
+        exclude = ("bundle_hash", "bundle_hash_covers")
+        redacted_manifest = {k: v for k, v in manifest.items() if k not in exclude}
+        canonical_payload = {"manifest": redacted_manifest, **redacted}
+        canonical = json.dumps(canonical_payload, separators=(",", ":"), sort_keys=True).encode(
+            "utf-8"
+        )
+        computed = "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+        if computed == stored_hash:
+            log.info("cairn.bundle_hash_ok")
+            return
+
+        log.error("cairn.bundle_hash_mismatch", stored=stored_hash, computed=computed)
+        raise ValueError(f"Bundle hash mismatch: stored={stored_hash}, computed={computed}")
 
     def _verify_single(self, ev: Event) -> VerificationEntry:
         key = self._keys.get(ev.key_id)
@@ -267,6 +305,9 @@ class Verifier:
         lines.append(f"  Signature failures      : {report.signature_failed}")
         lines.append(f"  Hash mismatches         : {report.hash_mismatch}")
         lines.append(f"  Revoked / unknown keys  : {report.revoked_key}")
+        if report.bundle_hash_ok is not None:
+            status = "OK" if report.bundle_hash_ok else "FAILED"
+            lines.append(f"  Bundle integrity hash   : {status}")
         lines.append("")
 
         # Surface control narrative from the bundle manifest
@@ -282,6 +323,13 @@ class Verifier:
                 lines.append("")
             if caveat:
                 lines.append(f"  CAUTION: {caveat}")
+            lines.append("")
+
+        if report.bundle_hash_ok is False:
+            lines.append("BUNDLE INTEGRITY FAILURE")
+            lines.append("-" * 40)
+            lines.append(f"  {report.bundle_hash_detail}")
+            lines.append("  Events were NOT verified (bundle may be tampered).")
             lines.append("")
 
         if report.signature_failed or report.hash_mismatch or report.revoked_key:
@@ -306,9 +354,7 @@ class Verifier:
                 status = "MISSING"
             else:
                 status = "MODIFIED"
-            lines.append(
-                f"  [{fp.work_item_id}] {fp.path}: {status}"
-            )
+            lines.append(f"  [{fp.work_item_id}] {fp.path}: {status}")
             if fp.pre_digest:
                 lines.append(f"    pre :  {fp.pre_digest[:16]}...")
             if fp.post_digest:

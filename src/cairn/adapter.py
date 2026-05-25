@@ -369,4 +369,9 @@ class CairnAdapter:
         wi = self._sub.get_work_item(work_item_id)
         if wi is None:
             raise RuntimeError(f"Work item {work_item_id} not found")
+        log.warning(
+            "cairn.begin_payload_missing",
+            work_item_id=str(work_item_id),
+            fallback_tool=wi.custom_fields.get("tool", "unknown"),
+        )
         return {"tool": wi.custom_fields.get("tool", "unknown"), "tool_args_hash": ""}

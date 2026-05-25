@@ -210,3 +210,58 @@ def test_end_missing_work_item_id(
     )
     assert rc == 1
     assert "work_item_id required" in err
+
+
+@patch("cairn._bridge.Substrate")
+@patch("cairn._bridge.CairnAdapter")
+def test_session_id_passthrough(
+    mock_adapter_cls: Any,
+    mock_substrate_cls: Any,
+    _valid_env: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    wi_id = uuid.uuid4()
+    mock_adapter_cls.return_value.begin_tool_call.return_value = _make_mock_wi(wi_id)
+
+    explicit_session = "my-explicit-session-id"
+    rc, _out, _err = _run_bridge(
+        json.dumps(
+            {
+                "action": "begin",
+                "tool": "Edit",
+                "args": {"path": "/tmp/foo"},
+                "session_id": explicit_session,
+            }
+        ),
+        capsys=capsys,
+    )
+    assert rc == 0
+
+    call_kwargs = mock_adapter_cls.call_args
+    on_behalf_of = call_kwargs.kwargs.get("on_behalf_of") or call_kwargs[1].get("on_behalf_of")
+    assert on_behalf_of is not None
+    assert on_behalf_of["session_id"] == explicit_session
+
+
+@patch("cairn._bridge.Substrate")
+@patch("cairn._bridge.CairnAdapter")
+def test_session_id_fallback_to_uuid(
+    mock_adapter_cls: Any,
+    mock_substrate_cls: Any,
+    _valid_env: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    wi_id = uuid.uuid4()
+    mock_adapter_cls.return_value.begin_tool_call.return_value = _make_mock_wi(wi_id)
+
+    rc, _out, _err = _run_bridge(
+        json.dumps({"action": "begin", "tool": "Edit", "args": {"path": "/tmp/foo"}}),
+        capsys=capsys,
+    )
+    assert rc == 0
+
+    call_kwargs = mock_adapter_cls.call_args
+    on_behalf_of = call_kwargs.kwargs.get("on_behalf_of") or call_kwargs[1].get("on_behalf_of")
+    assert on_behalf_of is not None
+    assert len(on_behalf_of["session_id"]) == 36
+    uuid.UUID(on_behalf_of["session_id"])
