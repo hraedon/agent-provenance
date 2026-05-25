@@ -69,11 +69,12 @@ class VerificationReport:
 
     @property
     def all_ok(self) -> bool:
+        bundle_ok = self.bundle_hash_ok is not False
         return (
             self.signature_failed == 0
             and self.hash_mismatch == 0
             and self.revoked_key == 0
-            and self.bundle_hash_ok is not False
+            and bundle_ok
         )
 
 
@@ -139,18 +140,17 @@ class Verifier:
         raw = json.loads(path.read_text())
         manifest = raw.get("manifest", {})
 
-        try:
-            self._verify_bundle_hash(raw, manifest)
-        except ValueError as exc:
+        hash_verified = self._verify_bundle_hash(raw, manifest)
+        if hash_verified is False:
             report = VerificationReport()
             report.bundle_hash_ok = False
-            report.bundle_hash_detail = str(exc)
+            report.bundle_hash_detail = "Bundle integrity hash mismatch (see log)"
             report.key_chain["bundle"] = manifest
             return report
 
         events = [Event.from_dict(e) for e in raw["events"]]
         report = self.verify_events(events)
-        report.bundle_hash_ok = True
+        report.bundle_hash_ok = True if hash_verified else None
         report.key_chain["bundle"] = manifest
 
         return report
@@ -159,11 +159,12 @@ class Verifier:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _verify_bundle_hash(self, raw: dict, manifest: dict) -> None:
+    def _verify_bundle_hash(self, raw: dict, manifest: dict) -> bool | None:
+        """Return True if hash matches, False if mismatch, None if no hash present."""
         stored_hash = manifest.get("bundle_hash")
         if not stored_hash:
             log.warn("cairn.bundle_hash_missing")
-            return
+            return None
 
         redacted = {k: v for k, v in raw.items() if k != "manifest"}
         exclude = ("bundle_hash", "bundle_hash_covers")
@@ -176,10 +177,10 @@ class Verifier:
 
         if computed == stored_hash:
             log.info("cairn.bundle_hash_ok")
-            return
+            return True
 
         log.error("cairn.bundle_hash_mismatch", stored=stored_hash, computed=computed)
-        raise ValueError(f"Bundle hash mismatch: stored={stored_hash}, computed={computed}")
+        return False
 
     def _verify_single(self, ev: Event) -> VerificationEntry:
         key = self._keys.get(ev.key_id)
@@ -308,6 +309,8 @@ class Verifier:
         if report.bundle_hash_ok is not None:
             status = "OK" if report.bundle_hash_ok else "FAILED"
             lines.append(f"  Bundle integrity hash   : {status}")
+        else:
+            lines.append("  Bundle integrity hash   : NOT VERIFIED (missing)")
         lines.append("")
 
         # Surface control narrative from the bundle manifest
