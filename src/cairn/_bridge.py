@@ -24,7 +24,6 @@ Environment::
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -46,6 +45,7 @@ structlog.configure(
 from substrate import Substrate  # noqa: E402
 
 from cairn import CairnAdapter, CairnConfig  # noqa: E402
+from cairn.schema import hash_payload  # noqa: E402
 
 _MAX_INPUT_BYTES = 10 * 1024 * 1024  # 10 MiB safety limit on stdin
 
@@ -114,7 +114,6 @@ def main() -> None:
             files,
         )
     finally:
-        _null_fh.close()
         sub.close()
 
     print(json.dumps(result))
@@ -144,8 +143,7 @@ def _dispatch(
 
     if action == "begin":
         args = msg.get("args", {})
-        canonical = json.dumps(args, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        args_hash = "sha256:" + hashlib.sha256(canonical).hexdigest()
+        args_hash = "sha256:" + hash_payload(args)
         wi = adapter.begin_tool_call(
             tool=msg.get("tool", "unknown"),
             tool_args=args,

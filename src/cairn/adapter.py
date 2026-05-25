@@ -364,14 +364,16 @@ class CairnAdapter:
         )
         if events:
             payload = events[-1].payload or {}
-            return payload
+            if "tool" in payload and "tool_args_hash" in payload:
+                return payload
         # Fallback: read the creation event's custom fields
         wi = self._sub.get_work_item(work_item_id)
         if wi is None:
             raise RuntimeError(f"Work item {work_item_id} not found")
+        tool = wi.custom_fields.get("tool", "unknown")
         log.warning(
             "cairn.begin_payload_missing",
             work_item_id=str(work_item_id),
-            fallback_tool=wi.custom_fields.get("tool", "unknown"),
+            fallback_tool=tool,
         )
-        return {"tool": wi.custom_fields.get("tool", "unknown"), "tool_args_hash": ""}
+        return {"tool": tool, "tool_args_hash": "sha256:undefined"}
