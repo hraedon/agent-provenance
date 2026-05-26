@@ -94,14 +94,18 @@ In rough order. Do not assume any of these are done; check on entry.
    an auditor-ready report.
    **Done: `src/cairn/verifier.py` + CLI `cairn verify`.**
 
-## Current status (last updated 2026-05-25)
+## Current status (last updated 2026-05-26)
 
-- **Tests**: 36 passing (CI depends on Postgres).
+- **Tests**: 76 passing (CI depends on Postgres).
 - **Lint**: ruff clean.
 - **Gaps closed**: scope attestation as signed first-class event (README §2);
   opencode plugin + bridge end-to-end functional; bundle export/verify with
   control narrative; Claude Code hooks (Plan 004); session_id passthrough
-  from harness to bridge (fixes audit grouping bug).
+  from harness to bridge (fixes audit grouping bug); `cairn diff` command
+  (AP-008); self-contained HTML verification report (AP-006); FIM-class
+  positioning technical report published (AP-007); SDK wrapper (`CairnClient`);
+  `cairn extract-control` CLI command; key rotation event support in verifier
+  (partial AP-001 — structural verification, not yet Ed25519).
 - **Open gaps**: project not registered with agent-notes-mcp yet; live
   opencode dogfood bundle not yet committed to repo; Claude Code hooks not
   yet tested in a live Claude Code session (mock tests only).
