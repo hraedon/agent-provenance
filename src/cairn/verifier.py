@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
@@ -159,6 +160,7 @@ class TimestampBatchEntry:
     status: str = "pending"
     tsa_timestamp: str | None = None
     verified: bool | None = None
+    verification_detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -255,6 +257,10 @@ class VerificationReport:
         return sum(1 for dc in self.delegation_chains if not dc.validation_ok)
 
     @property
+    def tsa_signature_failures(self) -> int:
+        return sum(1 for tb in self.timestamp_batches if tb.verified is False)
+
+    @property
     def all_ok(self) -> bool:
         bundle_ok = self.bundle_hash_ok is not False
         chain_ok = self.chain_integrity_ok is not False
@@ -265,6 +271,7 @@ class VerificationReport:
             and self.key_rotation_failures == 0
             and self.key_revocation_failures == 0
             and self.delegation_chain_failures == 0
+            and self.tsa_signature_failures == 0
             and len(self.sequence_gaps) == 0
             and len(self.scope_violations) == 0
             and len(self.temporal_violations) == 0
@@ -312,6 +319,7 @@ class Verifier:
         self,
         key_set: dict[str, bytes],
         key_metadata: dict[str, dict[str, Any]] | None = None,
+        tsa_cert_path: str | None = None,
     ) -> None:
         """
         Args:
@@ -322,9 +330,13 @@ class Verifier:
             key_metadata: Optional mapping ``key_id → {role, revoked_at, ...}``
                 for key lifecycle enforcement.  When provided, the verifier
                 checks role gates and revocation timestamps.
+            tsa_cert_path: Path to a trusted TSA certificate (PEM or DER).
+                When provided, the verifier will verify CMS signatures on
+                TSA timestamp tokens against this trust anchor (BC-229).
         """
         self._keys = key_set
         self._key_meta = key_metadata or {}
+        self._tsa_cert_path = tsa_cert_path
 
     # ------------------------------------------------------------------
     # Public API
@@ -419,7 +431,8 @@ class Verifier:
             report.chain_integrity_ok = None
             log.warn("cairn.chain_link_missing")
 
-        self._accumulate_timestamp_batches(raw, events, report)
+        raw_tokens = self._accumulate_timestamp_batches(raw, events, report)
+        self._verify_timestamp_signatures(raw_tokens, report)
 
         return report
 
@@ -713,14 +726,19 @@ class Verifier:
         raw_bundle: dict[str, Any],
         events: list[Event],
         report: VerificationReport,
-    ) -> None:
-        """Load TSA timestamp batches from the bundle and check event coverage."""
+    ) -> dict[str, bytes]:
+        """Load TSA timestamp batches from the bundle and check event coverage.
+
+        Returns a mapping ``batch_id → tsa_token_bytes`` for confirmed batches
+        so that ``_verify_timestamp_signatures`` can verify them.
+        """
         raw_batches = raw_bundle.get("timestamp_batches")
         if not raw_batches:
-            return
+            return {}
 
         exported_ids = {str(ev.event_id) for ev in events}
         covered_ids: set[str] = set()
+        raw_tokens: dict[str, bytes] = {}
 
         for raw in raw_batches:
             entry = TimestampBatchEntry(
@@ -735,6 +753,9 @@ class Verifier:
             if raw.get("status") == "confirmed":
                 batch_ids = {str(eid) for eid in raw.get("event_ids", [])}
                 covered_ids.update(batch_ids & exported_ids)
+                token_hex = raw.get("tsa_token")
+                if token_hex:
+                    raw_tokens[raw.get("batch_id", "unknown")] = bytes.fromhex(token_hex)
 
         uncovered = exported_ids - covered_ids
         if uncovered:
@@ -743,6 +764,66 @@ class Verifier:
                 count=len(uncovered),
                 sample=sorted(uncovered)[:5],
             )
+        return raw_tokens
+
+    def _verify_timestamp_signatures(
+        self,
+        raw_tokens: dict[str, bytes],
+        report: VerificationReport,
+    ) -> None:
+        """Verify CMS signatures on TSA timestamp tokens (BC-229).
+
+        When a trust anchor (``_tsa_cert_path``) is configured, this method
+        calls ``regista.verify_tsa_token_full()`` to verify the CMS
+        signature on each confirmed timestamp batch.  Without a trust
+        anchor, the ``verified`` field stays ``None`` (not checked).
+        """
+        if not self._tsa_cert_path or not raw_tokens:
+            return
+
+        try:
+            from regista._timestamping import TSAConfig, verify_tsa_token_full
+        except ImportError:
+            log.warn("cairn.tsa_verify_import_failed")
+            return
+
+        config = TSAConfig(tsa_url="", tsa_cert_path=self._tsa_cert_path)
+
+        # We need to recompute the Merkle root data for each batch.
+        # The raw_tokens dict maps batch_id → token bytes.  We verify
+        # the token against the merkle_root from the report entry.
+        updated: list[TimestampBatchEntry] = []
+        for entry in report.timestamp_batches:
+            token = raw_tokens.get(entry.batch_id)
+            if token is None or entry.status != "confirmed":
+                updated.append(entry)
+                continue
+
+            # The merkle_root in the bundle is hex-encoded.  We verify
+            # the token's message imprint against those bytes.
+            merkle_bytes = bytes.fromhex(entry.merkle_root) if entry.merkle_root else b""
+            ok, detail = verify_tsa_token_full(token, merkle_bytes, config)
+            updated.append(
+                TimestampBatchEntry(
+                    batch_id=entry.batch_id,
+                    merkle_root=entry.merkle_root,
+                    first_global_seq=entry.first_global_seq,
+                    last_global_seq=entry.last_global_seq,
+                    event_count=entry.event_count,
+                    status=entry.status,
+                    tsa_timestamp=entry.tsa_timestamp,
+                    verified=ok,
+                    verification_detail=detail,
+                )
+            )
+            if ok:
+                log.info("cairn.tsa_signature_verified", batch_id=entry.batch_id[:8])
+            else:
+                log.warn("cairn.tsa_signature_failed", batch_id=entry.batch_id[:8], detail=detail)
+
+        # Replace the list contents in-place
+        report.timestamp_batches.clear()
+        report.timestamp_batches.extend(updated)
 
     def _check_event_sequence(self, events: list[Event], report: VerificationReport) -> None:
         """Detect gaps and ordering violations in event sequences.
@@ -988,7 +1069,7 @@ class Verifier:
                 )
 
         # Check TSA temporal ordering
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         for tb in report.timestamp_batches:
             if tb.status != "confirmed" or not tb.tsa_timestamp:
@@ -997,7 +1078,7 @@ class Verifier:
             try:
                 tsa_dt = datetime.fromisoformat(tb.tsa_timestamp)
                 if tsa_dt.tzinfo is None:
-                    tsa_dt = tsa_dt.replace(tzinfo=timezone.utc)
+                    tsa_dt = tsa_dt.replace(tzinfo=UTC)
                 tolerance = timedelta(seconds=_TSA_TOLERANCE_SECONDS)
                 deadline = tsa_dt + tolerance
             except (ValueError, TypeError):
@@ -1437,6 +1518,16 @@ class Verifier:
                     lines.append(f"    TSA time  : {tb.tsa_timestamp}")
                 if tb.merkle_root:
                     lines.append(f"    merkle    : {tb.merkle_root[:32]}...")
+                if tb.verified is True:
+                    lines.append("    signature : VERIFIED")
+                    if tb.verification_detail:
+                        lines.append(f"    detail    : {tb.verification_detail}")
+                elif tb.verified is False:
+                    lines.append("    signature : FAILED")
+                    if tb.verification_detail:
+                        lines.append(f"    -> {tb.verification_detail}")
+                elif tb.verified is None and tb.status == "confirmed":
+                    lines.append("    signature : NOT CHECKED (no --tsa-cert)")
             lines.append("")
 
         if report.scope_violations:
@@ -1617,6 +1708,8 @@ class Verifier:
                     "event_count": tb.event_count,
                     "status": tb.status,
                     "tsa_timestamp": tb.tsa_timestamp,
+                    "verified": tb.verified,
+                    "verification_detail": tb.verification_detail,
                 }
                 for tb in report.timestamp_batches
             ],
@@ -2023,6 +2116,49 @@ class Verifier:
             )
             sections.append(
                 f'<div class="section"><h2>{_esc(dc_header)}</h2>'
+                '<table style="border-collapse:collapse;width:100%">'
+                f"{hdr}<tbody>{rows}</tbody></table></div>"
+            )
+
+        # Timestamp batches
+        if report.timestamp_batches:
+            rows = ""
+            cell = "padding:4px 8px"
+            mono = f"{cell};font-family:monospace;font-size:12px"
+            for tb in report.timestamp_batches:
+                if tb.verified is True:
+                    sig_html = '<span style="color:#16a34a;font-weight:bold">VERIFIED</span>'
+                elif tb.verified is False:
+                    sig_html = '<span style="color:#dc2626;font-weight:bold">FAILED</span>'
+                elif tb.verified is None and tb.status == "confirmed":
+                    sig_html = '<span style="color:#6b7280">NOT CHECKED</span>'
+                else:
+                    sig_html = ""
+                detail = _esc(tb.verification_detail or "")
+                tsa_time = _esc(tb.tsa_timestamp or "")
+                rows += (
+                    f"<tr>"
+                    f'<td style="{mono}">{_esc(tb.batch_id[:16])}...</td>'
+                    f'<td style="{cell}">{tb.event_count}</td>'
+                    f'<td style="{cell}">{_esc(tb.status)}</td>'
+                    f'<td style="{cell}">{tsa_time}</td>'
+                    f'<td style="{cell};text-align:center">{sig_html}</td>'
+                    f'<td style="{cell};font-size:12px">{detail}</td>'
+                    f"</tr>"
+                )
+            th_style = f"{cell};text-align:left"
+            hdr = (
+                '<thead><tr style="background:#f1f5f9">'
+                f'<th style="{th_style}">Batch ID</th>'
+                f'<th style="{th_style}">Events</th>'
+                f'<th style="{th_style}">Status</th>'
+                f'<th style="{th_style}">TSA Time</th>'
+                f'<th style="{th_style};text-align:center">Signature</th>'
+                f'<th style="{th_style}">Detail</th>'
+                "</tr></thead>"
+            )
+            sections.append(
+                '<div class="section"><h2>Timestamp Batches (TSA)</h2>'
                 '<table style="border-collapse:collapse;width:100%">'
                 f"{hdr}<tbody>{rows}</tbody></table></div>"
             )

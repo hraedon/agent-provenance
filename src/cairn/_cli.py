@@ -120,14 +120,26 @@ def main() -> None:
     default="text",
     help="Report format: text (human-readable), JSON, or self-contained HTML",
 )
-def verify(bundle_path: Path, keys: Path, output: Path | None, fmt: str) -> None:
+@click.option(
+    "--tsa-cert",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Trusted TSA certificate (PEM or DER) for timestamp signature verification (BC-229).",
+)
+def verify(
+    bundle_path: Path,
+    keys: Path,
+    output: Path | None,
+    fmt: str,
+    tsa_cert: Path | None,
+) -> None:
     """Verify a signed Cairn bundle and emit an auditor-ready report."""
     for w in check_key_file_permissions(str(keys)):
         click.echo(f"WARNING: {w}", err=True)
 
     key_set = _load_key_set(keys)
 
-    verifier = Verifier(key_set)
+    verifier = Verifier(key_set, tsa_cert_path=str(tsa_cert) if tsa_cert else None)
     report = verifier.verify_bundle(bundle_path)
 
     if fmt == "json":
