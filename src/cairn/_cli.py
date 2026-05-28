@@ -288,12 +288,43 @@ def export(
     except Exception:
         pass
 
+    # Include witness registrations and confirmed receipts
+    try:
+        witnesses = sub.witnesses.list(status="active")
+        if witnesses:
+            safe_witnesses = []
+            for w in witnesses:
+                sw = {k: v for k, v in w.items() if k != "sign_secret"}
+                safe_witnesses.append(sw)
+            bundle["witness_registrations"] = safe_witnesses
+
+            witness_receipts = []
+            for ev_id in exported_event_ids:
+                receipts = sub.witnesses.receipts(event_id=ev_id, status="confirmed")
+                for r in receipts:
+                    witness_receipts.append({
+                        "event_id": str(r.get("event_id", "")),
+                        "witness_id": str(r.get("witness_id", "")),
+                        "status": r.get("status"),
+                        "confirmed_at": r.get("confirmed_at").isoformat()
+                        if r.get("confirmed_at")
+                        else None,
+                        "witness_signature": r.get("witness_signature").hex()
+                        if r.get("witness_signature")
+                        else None,
+                    })
+            if witness_receipts:
+                bundle["witness_receipts"] = witness_receipts
+    except Exception:
+        pass
+
     canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
     digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
 
     bundle["manifest"]["bundle_hash"] = digest
     bundle["manifest"]["bundle_hash_covers"] = (
-        "manifest (minus bundle_hash) + events + timestamp_batches (if present), canonical JSON"
+        "manifest (minus bundle_hash) + events + timestamp_batches (if present) "
+        "+ witness_registrations + witness_receipts, canonical JSON"
     )
 
     ts_count = len(bundle.get("timestamp_batches", []))
