@@ -198,6 +198,36 @@ class KeyRevocationEntry:
 
 
 @dataclass(frozen=True)
+class WitnessRegistrationEntry:
+    """A witness registration from the bundle."""
+
+    witness_id: str
+    url: str
+    status: str = "active"
+    mode: str = "witness"
+
+
+@dataclass(frozen=True)
+class WitnessReceiptEntry:
+    """A confirmed witness receipt from the bundle."""
+
+    event_id: str
+    witness_id: str
+    confirmed_at: str | None = None
+    has_signature: bool = False
+
+
+@dataclass(frozen=True)
+class WitnessCoverageViolation:
+    """An event that lacks confirmed receipts from all expected witnesses."""
+
+    event_id: str
+    work_item_id: str
+    missing_witnesses: list[str]
+    detail: str
+
+
+@dataclass(frozen=True)
 class TemporalOrderingViolation:
     """A cross-field temporal ordering violation."""
 
@@ -236,6 +266,9 @@ class VerificationReport:
     key_chain: dict[str, dict[str, Any]] = field(default_factory=dict)
     delegation_chains: list[DelegationChainEntry] = field(default_factory=list)
     timestamp_batches: list[TimestampBatchEntry] = field(default_factory=list)
+    witness_registrations: list[WitnessRegistrationEntry] = field(default_factory=list)
+    witness_receipts: list[WitnessReceiptEntry] = field(default_factory=list)
+    witness_coverage_violations: list[WitnessCoverageViolation] = field(default_factory=list)
     temporal_violations: list[TemporalOrderingViolation] = field(default_factory=list)
     role_gate_violations: list[RoleGateViolation] = field(default_factory=list)
     scheme_counts: dict[str, int] = field(default_factory=dict)
@@ -272,6 +305,7 @@ class VerificationReport:
             and self.key_revocation_failures == 0
             and self.delegation_chain_failures == 0
             and self.tsa_signature_failures == 0
+            and len(self.witness_coverage_violations) == 0
             and len(self.sequence_gaps) == 0
             and len(self.scope_violations) == 0
             and len(self.temporal_violations) == 0
@@ -433,6 +467,9 @@ class Verifier:
 
         raw_tokens = self._accumulate_timestamp_batches(raw, events, report)
         self._verify_timestamp_signatures(raw_tokens, report)
+
+        self._accumulate_witness_data(raw, events, report)
+        self._check_witness_coverage(events, report)
 
         return report
 
@@ -824,6 +861,84 @@ class Verifier:
         # Replace the list contents in-place
         report.timestamp_batches.clear()
         report.timestamp_batches.extend(updated)
+
+    def _accumulate_witness_data(
+        self,
+        raw_bundle: dict[str, Any],
+        events: list[Event],
+        report: VerificationReport,
+    ) -> None:
+        """Load witness registrations and receipts from the bundle."""
+        raw_witnesses = raw_bundle.get("witness_registrations")
+        if raw_witnesses:
+            for w in raw_witnesses:
+                report.witness_registrations.append(
+                    WitnessRegistrationEntry(
+                        witness_id=str(w.get("witness_id", "")),
+                        url=w.get("url", ""),
+                        status=w.get("status", "active"),
+                        mode=w.get("mode", "witness"),
+                    )
+                )
+
+        raw_receipts = raw_bundle.get("witness_receipts")
+        if raw_receipts:
+            for r in raw_receipts:
+                report.witness_receipts.append(
+                    WitnessReceiptEntry(
+                        event_id=str(r.get("event_id", "")),
+                        witness_id=str(r.get("witness_id", "")),
+                        confirmed_at=r.get("confirmed_at"),
+                        has_signature=r.get("witness_signature") is not None,
+                    )
+                )
+
+    def _check_witness_coverage(
+        self, events: list[Event], report: VerificationReport
+    ) -> None:
+        """Check that every event has confirmed receipts from all active witnesses.
+
+        Only checks witnesses whose ``event_filter`` matches the event.
+        When no witnesses are registered, this is a no-op.
+        """
+        if not report.witness_registrations:
+            return
+
+        active_witnesses = [
+            w for w in report.witness_registrations if w.status == "active"
+        ]
+        if not active_witnesses:
+            return
+
+        # Build lookup: event_id → set of witness_ids with confirmed receipts
+        receipts_by_event: dict[str, set[str]] = {}
+        for r in report.witness_receipts:
+            if r.event_id not in receipts_by_event:
+                receipts_by_event[r.event_id] = set()
+            receipts_by_event[r.event_id].add(r.witness_id)
+
+        witness_ids = {w.witness_id for w in active_witnesses}
+
+        for ev in events:
+            ev_id = str(ev.event_id)
+            confirmed_witnesses = receipts_by_event.get(ev_id, set())
+            missing = witness_ids - confirmed_witnesses
+            if missing:
+                missing_urls = [
+                    w.url for w in active_witnesses if w.witness_id in missing
+                ]
+                report.witness_coverage_violations.append(
+                    WitnessCoverageViolation(
+                        event_id=ev_id,
+                        work_item_id=str(ev.work_item_id),
+                        missing_witnesses=missing_urls,
+                        detail=(
+                            f"Event {ev_id[:8]}.. missing confirmed receipts "
+                            f"from {len(missing)} witness(es): "
+                            + ", ".join(missing_urls[:3])
+                        ),
+                    )
+                )
 
     def _check_event_sequence(self, events: list[Event], report: VerificationReport) -> None:
         """Detect gaps and ordering violations in event sequences.
@@ -1530,6 +1645,24 @@ class Verifier:
                     lines.append("    signature : NOT CHECKED (no --tsa-cert)")
             lines.append("")
 
+        if report.witness_registrations:
+            w_count = len(report.witness_registrations)
+            r_count = len(report.witness_receipts)
+            v_count = len(report.witness_coverage_violations)
+            lines.append(f"WITNESS FEDERATION ({w_count} witnesses, {r_count} receipts, {v_count} violations)")
+            lines.append("-" * 40)
+            for w in report.witness_registrations:
+                lines.append(f"  witness {w.witness_id[:8]}...")
+                lines.append(f"    url     : {w.url}")
+                lines.append(f"    status  : {w.status}")
+                lines.append(f"    mode    : {w.mode}")
+            if report.witness_coverage_violations:
+                lines.append("")
+                for v in report.witness_coverage_violations:
+                    lines.append(f"  event {v.event_id[:8]}.. MISSING COVERAGE")
+                    lines.append(f"    -> {v.detail}")
+            lines.append("")
+
         if report.scope_violations:
             lines.append("SCOPE VIOLATIONS")
             lines.append("-" * 40)
@@ -1712,6 +1845,24 @@ class Verifier:
                     "verification_detail": tb.verification_detail,
                 }
                 for tb in report.timestamp_batches
+            ],
+            "witness_registrations": [
+                {
+                    "witness_id": w.witness_id,
+                    "url": w.url,
+                    "status": w.status,
+                    "mode": w.mode,
+                }
+                for w in report.witness_registrations
+            ],
+            "witness_coverage_violations": [
+                {
+                    "event_id": v.event_id,
+                    "work_item_id": v.work_item_id,
+                    "missing_witnesses": v.missing_witnesses,
+                    "detail": v.detail,
+                }
+                for v in report.witness_coverage_violations
             ],
             "scope_violations": [
                 {
@@ -2162,6 +2313,60 @@ class Verifier:
                 '<table style="border-collapse:collapse;width:100%">'
                 f"{hdr}<tbody>{rows}</tbody></table></div>"
             )
+
+        # Witness federation
+        if report.witness_registrations:
+            w_count = len(report.witness_registrations)
+            r_count = len(report.witness_receipts)
+            v_count = len(report.witness_coverage_violations)
+            w_header = f"Witness Federation ({w_count} witnesses, {r_count} receipts, {v_count} violations)"
+            rows = ""
+            cell = "padding:4px 8px"
+            mono = f"{cell};font-family:monospace;font-size:12px"
+            for w in report.witness_registrations:
+                rows += (
+                    f"<tr>"
+                    f'<td style="{mono}">{_esc(w.witness_id[:16])}...</td>'
+                    f'<td style="{cell}">{_esc(w.url)}</td>'
+                    f'<td style="{cell}">{_esc(w.status)}</td>'
+                    f'<td style="{cell}">{_esc(w.mode)}</td>'
+                    f"</tr>"
+                )
+            th_style = f"{cell};text-align:left"
+            hdr = (
+                '<thead><tr style="background:#f1f5f9">'
+                f'<th style="{th_style}">Witness ID</th>'
+                f'<th style="{th_style}">URL</th>'
+                f'<th style="{th_style}">Status</th>'
+                f'<th style="{th_style}">Mode</th>'
+                "</tr></thead>"
+            )
+            w_html = (
+                f'<div class="section"><h2>{_esc(w_header)}</h2>'
+                '<table style="border-collapse:collapse;width:100%">'
+                f"{hdr}<tbody>{rows}</tbody></table></div>"
+            )
+            if report.witness_coverage_violations:
+                v_rows = ""
+                for v in report.witness_coverage_violations:
+                    v_rows += (
+                        f"<tr>"
+                        f'<td style="{mono}">{_esc(v.event_id[:16])}...</td>'
+                        f'<td style="{cell};font-size:12px">{_esc(v.detail)}</td>'
+                        f"</tr>"
+                    )
+                v_hdr = (
+                    '<thead><tr style="background:#fef2f2">'
+                    f'<th style="{th_style}">Event ID</th>'
+                    f'<th style="{th_style}">Detail</th>'
+                    "</tr></thead>"
+                )
+                w_html += (
+                    '<h3 style="color:#dc2626">Coverage Violations</h3>'
+                    '<table style="border-collapse:collapse;width:100%">'
+                    f"{v_hdr}<tbody>{v_rows}</tbody></table>"
+                )
+            sections.append(w_html)
 
         # Verification note
         note_style = (

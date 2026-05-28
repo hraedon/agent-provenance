@@ -2654,3 +2654,105 @@ def test_verifier_timestamp_signature_verification(tmp_path: Path) -> None:
     report_no_anchor = verifier_no_anchor.verify_bundle(bundle_path)
     assert report_no_anchor.all_ok
     assert report_no_anchor.timestamp_batches[0].verified is None
+
+
+def test_witness_coverage_check(tmp_path: Path) -> None:
+    """Verifier detects events missing witness receipts."""
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+    ev = Event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    witness_id = str(uuid.uuid4())
+    manifest: dict = {"events_count": 1}
+    bundle: dict = {
+        "manifest": manifest,
+        "events": [ev.to_dict()],
+        "witness_registrations": [
+            {
+                "witness_id": witness_id,
+                "url": "https://witness.example.com/receipt",
+                "status": "active",
+                "mode": "witness",
+            }
+        ],
+        # No witness_receipts — coverage should fail
+    }
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    manifest["bundle_hash"] = digest
+
+    bundle_path = tmp_path / "bundle_witness.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+    assert not report.all_ok
+    assert len(report.witness_registrations) == 1
+    assert report.witness_registrations[0].witness_id == witness_id
+    assert len(report.witness_coverage_violations) == 1
+    assert str(ev_id) in report.witness_coverage_violations[0].event_id
+
+    # Now add a receipt — coverage should pass
+    bundle["witness_receipts"] = [
+        {
+            "event_id": str(ev_id),
+            "witness_id": witness_id,
+            "status": "confirmed",
+            "confirmed_at": now.isoformat(),
+        }
+    ]
+    # Recompute hash over the complete bundle (including witness_receipts)
+    canonical = json.dumps(
+        {k: v for k, v in bundle.items() if k != "manifest"},
+        separators=(",", ":"), sort_keys=True,
+    ).encode("utf-8")
+    # Include manifest without bundle_hash
+    redacted_manifest = {k: v for k, v in manifest.items() if k not in ("bundle_hash", "bundle_hash_covers")}
+    full_canonical = json.dumps(
+        {"manifest": redacted_manifest, **{k: v for k, v in bundle.items() if k != "manifest"}},
+        separators=(",", ":"), sort_keys=True,
+    ).encode("utf-8")
+    digest = "sha256:" + hashlib.sha256(full_canonical).hexdigest()
+    manifest["bundle_hash"] = digest
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+
+    report2 = verifier.verify_bundle(bundle_path)
+    assert report2.all_ok
+    assert len(report2.witness_coverage_violations) == 0
