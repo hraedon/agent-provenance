@@ -2,7 +2,9 @@
 
 ## Status
 
-In progress 2026-05-25.
+Implemented 2026-05-25. Hook script, state management, degradation logging,
+settings digest, and session cleanup all done. Mock tests passing. Not yet
+tested in a live Claude Code session.
 
 ## Goal
 
@@ -20,7 +22,7 @@ Code's hook JSON into bridge calls.
 Same as Plan 002:
 
 - **Non-invasive.** Public hooks only; no fork, no vendor.
-- **Graceful degradation.** If substrate is down or the hook crashes, the
+- **Graceful degradation.** If regista is down or the hook crashes, the
   agent continues. Audit-layer, not enforcement-layer.
 - **Minimal config.** One `.claude/settings.json` entry + env vars.
 

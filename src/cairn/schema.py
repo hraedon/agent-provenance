@@ -1,6 +1,6 @@
 """Canonical event schema for Cairn.
 
-Normalizes tool calls from different harnesses into a uniform substrate payload.
+Normalizes tool calls from different harnesses into a uniform regista payload.
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
-from substrate._jcs import canonicalize
+from regista._jcs import canonicalize
 
 
 @dataclass(frozen=True)
@@ -18,7 +18,7 @@ class FileDigest:
     pre_digest: str | None
     post_digest: str | None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"path": self.path}
         if self.pre_digest is not None:
             d["pre_digest"] = self.pre_digest
@@ -27,7 +27,7 @@ class FileDigest:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict) -> FileDigest:
+    def from_dict(cls, data: dict[str, Any]) -> FileDigest:
         return cls(
             path=data["path"],
             pre_digest=data.get("pre_digest"),
@@ -42,7 +42,7 @@ class ResultSummary:
     stderr_digest: str | None = None
     error: str | None = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {}
         if self.exit_code is not None:
             d["exit_code"] = self.exit_code
@@ -55,7 +55,7 @@ class ResultSummary:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict) -> ResultSummary:
+    def from_dict(cls, data: dict[str, Any]) -> ResultSummary:
         return cls(
             exit_code=data.get("exit_code"),
             stdout_digest=data.get("stdout_digest"),
@@ -70,7 +70,7 @@ class CairnConfig:
     harness_version: str
     config_digest: str | None = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "name": self.harness_name,
             "version": self.harness_version,
@@ -80,7 +80,7 @@ class CairnConfig:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict) -> CairnConfig:
+    def from_dict(cls, data: dict[str, Any]) -> CairnConfig:
         return cls(
             harness_name=data["name"],
             harness_version=data["version"],
@@ -98,7 +98,7 @@ class ToolCallBegin:
     parent_action_event_id: str | None = None
     harness: CairnConfig | None = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "tool": self.tool,
             "tool_args_hash": self.tool_args_hash,
@@ -116,7 +116,7 @@ class ToolCallBegin:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict) -> ToolCallBegin:
+    def from_dict(cls, data: dict[str, Any]) -> ToolCallBegin:
         return cls(
             tool=data["tool"],
             tool_args_hash=data["tool_args_hash"],
@@ -138,7 +138,7 @@ class ToolCallEnd:
     parent_action_event_id: str | None = None
     harness: CairnConfig | None = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "tool": self.tool,
             "tool_args_hash": self.tool_args_hash,
@@ -156,7 +156,7 @@ class ToolCallEnd:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict) -> ToolCallEnd:
+    def from_dict(cls, data: dict[str, Any]) -> ToolCallEnd:
         return cls(
             tool=data["tool"],
             tool_args_hash=data["tool_args_hash"],
@@ -206,10 +206,15 @@ def digest_file(path: str) -> str | None:
     Returns None (rather than a hash of empty bytes) so that auditors can
     distinguish "file was absent" from "file was empty" — a critical
     distinction for tamper-evident logs.
+
+    Uses streaming hash to avoid loading entire file into memory.
     """
     try:
+        h = hashlib.sha256()
         with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
+            while chunk := f.read(65536):
+                h.update(chunk)
+        return h.hexdigest()
     except (FileNotFoundError, PermissionError, IsADirectoryError):
         return None
 
@@ -223,7 +228,7 @@ class ScopeAttestationPayload:
     scope_statement: str
     harness_config_digests: dict[str, str] | None = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "version": self.version,
             "principal_id": self.principal_id,
@@ -236,7 +241,7 @@ class ScopeAttestationPayload:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict) -> ScopeAttestationPayload:
+    def from_dict(cls, data: dict[str, Any]) -> ScopeAttestationPayload:
         return cls(
             version=data["version"],
             principal_id=data["principal_id"],
@@ -252,3 +257,29 @@ def digest_string(text: str | None) -> str | None:
     if text is None:
         return None
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def check_key_file_permissions(path: str) -> list[str]:
+    """Check that a key file has restrictive permissions.
+
+    Returns a list of warning strings (empty if permissions are acceptable).
+    Warns if the file is readable by group or others.
+    """
+    import os
+    import stat
+
+    warnings: list[str] = []
+    try:
+        st = os.stat(path)
+        mode = stat.S_IMODE(st.st_mode)
+        if mode & stat.S_IRGRP:
+            warnings.append(f"Key file {path} is group-readable (mode {oct(mode)})")
+        if mode & stat.S_IROTH:
+            warnings.append(f"Key file {path} is world-readable (mode {oct(mode)})")
+        if mode & stat.S_IWGRP:
+            warnings.append(f"Key file {path} is group-writable (mode {oct(mode)})")
+        if mode & stat.S_IWOTH:
+            warnings.append(f"Key file {path} is world-writable (mode {oct(mode)})")
+    except OSError:
+        warnings.append(f"Could not check permissions on {path} (stat failed)")
+    return warnings

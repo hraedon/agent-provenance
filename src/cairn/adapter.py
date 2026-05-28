@@ -1,14 +1,14 @@
-"""Harness adapter — normalizes agent tool calls into substrate events.
+"""Harness adapter — normalizes agent tool calls into regista events.
 
 The adapter sits between the agent harness (Claude Code, OpenCode, etc.)
-and substrate.  It owns the canonical schema defined in :mod:`cairn.schema`.
+and regista.  It owns the canonical schema defined in :mod:`cairn.schema`.
 
 Usage::
 
-    from substrate import Substrate
+    from regista import Regista
     from cairn import CairnAdapter, CairnConfig
 
-    sub = Substrate(dsn=..., project="cairn", hmac_key_path=...)
+    sub = Regista(dsn=..., project="cairn", hmac_key_path=...)
     adapter = CairnAdapter(sub, config=CairnConfig("opencode", "0.x.y"))
 
     # Pre-tool-use
@@ -37,7 +37,7 @@ import uuid
 from typing import Any
 
 import structlog
-from substrate import Substrate
+from regista import Regista
 
 from .schema import (
     CairnConfig,
@@ -56,7 +56,7 @@ log = structlog.get_logger()
 
 
 class CairnAdapter:
-    """Bridge between agent harnesses and the substrate event log."""
+    """Bridge between agent harnesses and the regista event log."""
 
     # Default workflow used when the adapter creates its own work items.
     # Harness integrations may override these.
@@ -66,7 +66,7 @@ class CairnAdapter:
 
     def __init__(
         self,
-        substrate: Substrate,
+        regista: Regista,
         config: CairnConfig,
         *,
         workflow_name: str = DEFAULT_WORKFLOW,
@@ -77,7 +77,7 @@ class CairnAdapter:
     ) -> None:
         """
         Args:
-            substrate: Connected Substrate instance.
+            regista: Connected Regista instance.
             config: Harness metadata (name, version, config digest).
             workflow_name: Workflow to use for created work items.
             work_item_type: Work-item type to use for created work items.
@@ -85,7 +85,7 @@ class CairnAdapter:
             actor_kind: Default actor kind (``agent``, ``human``, ``system``).
             on_behalf_of: Default delegation chain applied to every event.
         """
-        self._sub = substrate
+        self._sub = regista
         self._config = config
         self._workflow = workflow_name
         self._work_item_type = work_item_type
@@ -112,7 +112,7 @@ class CairnAdapter:
 
         The scope attestation declares which harnesses are configured and
         therefore in scope for audit.  Every attestation is an immutable,
-        signed substrate event that an auditor can verify.
+        signed regista event that an auditor can verify.
 
         Args:
             principal_id: Human principal on whose behalf this deployment
@@ -128,7 +128,7 @@ class CairnAdapter:
             event_id: Explicit UUID for idempotency.
 
         Returns:
-            The :class:`~substrate.Event` that records the attestation.
+            The :class:`~regista.Event` that records the attestation.
         """
         actor = actor_id or self._actor_id
         ts = attested_at or datetime.datetime.now(datetime.UTC).isoformat().replace("+", "Z")
@@ -209,7 +209,7 @@ class CairnAdapter:
             event_id: Explicit UUID for idempotency.
 
         Returns:
-            The :class:`~substrate.WorkItem` that carries this tool call.
+            The :class:`~regista.WorkItem` that carries this tool call.
         """
         actor = actor_id or self._actor_id
         delegation = on_behalf_of or self._on_behalf_of
@@ -256,9 +256,9 @@ class CairnAdapter:
         )
 
         if parent_action_event_id:
-            # Substrate links connect work items, not events.
+            # Regista links connect work items, not events.
             # In v1 we store the parent_event_id in the payload;
-            # true causal links via substrate typed links come in v2.
+            # true causal links via regista typed links come in v2.
             pass
 
         log.info(
@@ -294,7 +294,7 @@ class CairnAdapter:
             error: If set, the tool call is treated as failed.
 
         Returns:
-            The appended :class:`~substrate.Event`.
+            The appended :class:`~regista.Event`.
         """
         actor = actor_id or self._actor_id
         delegation = on_behalf_of or self._on_behalf_of
@@ -356,16 +356,25 @@ class CairnAdapter:
         return out
 
     def _resolve_begin_payload(self, work_item_id: uuid.UUID) -> dict[str, Any]:
-        """Fetch the most recent ``tool_call_begin`` payload for a work item."""
+        """Fetch the ``tool_call_begin`` payload for a work item.
+
+        Reads all begin events and returns the last one (matching the most
+        recent begin transition).  Falls back to work-item custom fields
+        if no begin payload is found.
+        """
         events = self._sub.read_events(
             work_item_id=work_item_id,
             transition="tool_call_begin",
-            limit=1,
         )
-        if events:
-            payload = events[-1].payload or {}
+        # Walk events in order; keep the last one with a valid payload.
+        best: dict[str, Any] | None = None
+        for ev in events:
+            payload = ev.payload or {}
             if "tool" in payload and "tool_args_hash" in payload:
-                return payload
+                best = payload
+        if best is not None:
+            return best
+
         # Fallback: read the creation event's custom fields
         wi = self._sub.get_work_item(work_item_id)
         if wi is None:

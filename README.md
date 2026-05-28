@@ -1,9 +1,9 @@
 # agent-provenance *(working name — not final)*
 
-Cryptographic provenance for agentic workflows. Built on [substrate](../substrate).
+Cryptographic provenance for agentic workflows. Built on [regista](../regista).
 
 > **Status:** Skeleton implemented.  Adapter (`CairnAdapter`), verifier
-> (`cairn verify` / `cairn export`), and the substrate workflow are in place.
+> (`cairn verify` / `cairn export`), and the regista workflow are in place.
 > Scope attestation (README §2) is implemented as a signed first-class event.
 > OpenCode plugin + Python bridge end-to-end functional; Claude Code hooks
 > remain open (Plan 004).
@@ -32,7 +32,7 @@ verifiable offline by a third-party auditor."**
 
 ## 2. Honest scope statement (load-bearing)
 
-This is an **audit layer**, not an **enforcement layer**. Substrate signs and
+This is an **audit layer**, not an **enforcement layer**. Regista signs and
 records the events that reach it. It does not, and will not in v1, prevent a
 user from running an unsanctioned agent harness or routing model calls around
 the audit path. That gap is real, and we name it explicitly:
@@ -47,13 +47,13 @@ the audit path. That gap is real, and we name it explicitly:
 
 To make the scope statement defensible rather than hand-wavy, the *scope itself
 must be a signed first-class artifact in the event log* — an attestation that
-declares "this substrate instance captures events from configured harnesses A,
+declares "this regista instance captures events from configured harnesses A,
 B, C; other sources are out of scope." An auditor reading the log can verify
 the scope and reason precisely about completeness. This is non-negotiable for
-v1 credibility. Implemented: `CairnAdapter.attest_scope()` records the attestation as substrate
+v1 credibility. Implemented: `CairnAdapter.attest_scope()` records the attestation as regista
 work-item transitions, and `Verifier` surfaces attestations in its report.
 
-## 3. Foundation: what substrate already gives us
+## 3. Foundation: what regista already gives us
 
 - Append-only event log with HMAC-SHA256 over RFC 8785 canonical JSON.
 - Role-gated, validated state transitions.
@@ -61,43 +61,50 @@ work-item transitions, and `Verifier` surfaces attestations in its report.
 - Typed links between work items (e.g., parent action → child action).
 - Schema-per-project isolation in shared Postgres.
 
-What substrate **does not yet** give us, tracked as breadcrumbs against
-substrate:
+What regista **does not yet** give us, tracked as breadcrumbs against
+regista:
 
-- **BC-196** — HMAC is symmetric; no external/adversarial verifiability.
-  The org holding the key can still forge events. v1 needs pluggable signing
-  (Ed25519 minimum), v2 needs witness/transparency-log anchoring.
-- **BC-197** — No delegation chain. Substrate today records "agent A did X"
-  but not "agent A did X on behalf of human H, under session S, authenticated
-  at time T." Critical for the regulated-buyer accountability question.
-- **BC-198** — Defense against the operator-forgery problem at the
-  substrate layer: RFC 3161 trusted timestamping → Merkle-tree event chain
-  with witness co-signatures → optional OpenTimestamps anchoring for public
-  immutability without running a private blockchain.
+- **BC-196** — **Landed** (Plan 011). Ed25519 asymmetric signing is now
+  available. Auditors can verify events with a public key; no signing
+  secret required. Operator-forgery resistance is achieved for Ed25519-signed
+  events.
+- **BC-197** — **Landed** (Plan 010). Delegation chain (`on_behalf_of`) is
+  now a first-class field on events, validated by regista's contract layer.
+  Includes `principal_id`, `session_id`, `authenticated_at`, `scope`,
+  and `expires_at`.
+- **BC-198** — **Partially landed**. RFC 3161 trusted timestamping (Plan 012)
+  and witness federation (Plan 013) are implemented in regista.
+  `cairn timestamp` submits Merkle-rooted event batches to a TSA.
+  TSA signature verification against a trust anchor (BC-229) is not yet
+  implemented. OpenTimestamps anchoring is not yet implemented.
 
-These are substrate-level concerns; this project consumes substrate's
+These are regista-level concerns; this project consumes regista's
 guarantees and shouldn't reimplement them. As they land, this project's
 guarantees strengthen automatically.
 
 ## 4. Trust model (target end-state, not v1)
 
-Layered, ordered cheapest-to-most-defensible. v1 ships the first two; v2+
-adds the rest as substrate's primitives land.
+Layered, ordered cheapest-to-most-defensible. v1 shipped the first two;
+layers 3-4 are now available as regista's primitives have landed.
 
-1. **Canonical-JSON HMAC signature** on every tool-call event (substrate's
-   existing primitive).
+1. **Canonical-JSON HMAC signature** on every tool-call event (regista's
+   existing primitive). — **v1, available.**
 2. **Delegation chain** in the event payload: `principal_id`, `session_id`,
-   `authenticated_at`, `scope`. Signed as part of canonical JSON.
+   `authenticated_at`, `scope`. Signed as part of canonical JSON. — **v1,
+   available** (regista BC-197, Plan 010).
 3. **RFC 3161 trusted-timestamp tokens** on event batches. Cheap defense
-   against the operator backdating events with their own key.
+   against the operator backdating events with their own key. — **available**
+   (regista Plan 012; `cairn timestamp` command).
 4. **Asymmetric signing** (Ed25519) so auditors verify with a public key
-   instead of holding the signing secret.
+   instead of holding the signing secret. — **available** (regista BC-196,
+   Plan 011).
 5. **Witness federation**: periodic Merkle-root co-signatures by N
    independent parties (auditor, customer, third party). Operator cannot
-   rewrite history without compromising the witnesses.
+   rewrite history without compromising the witnesses. — **regista
+   infrastructure available** (Plan 013); cairn integration pending.
 6. **Optional OpenTimestamps anchoring**: piggyback Bitcoin's economic
    security without running a private blockchain. Off by default; on for
-   customers who want maximum independence.
+   customers who want maximum independence. — **not yet implemented.**
 
 The honest residual problem at every layer: **missing events.** No
 cryptographic primitive defends against "the operator chose not to record."
@@ -142,10 +149,9 @@ established practice:
 FIM precedent and the absence of contrary published guidance both
 support it, but it has not been validated by putting a sample bundle
 in front of a practicing IT auditor. That validation is the highest-
-leverage outstanding research item. See §13 (Open questions) and
-[`design/research-findings.md`](../agent-wake/design/research-findings.md)
-+ [`research-findings-round2.md`](../agent-wake/design/research-findings-round2.md)
-for the supporting analysis.
+leverage outstanding research item. See §13 (Open questions).
+Supporting analysis lives in the sibling `agent-wake` repository
+(not included in this repo; see `AGENTS.md` for cross-project context).
 
 ### 4.2 Key management control description (template)
 
@@ -252,8 +258,8 @@ sign-off. See §8.
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  Agent harness (Claude Code, OpenCode, Cursor, …)            │
-│  ─ PreToolUse  → adapter  → substrate event (action_begin)   │
-│  ─ PostToolUse → adapter  → substrate event (action_end,     │
+│  ─ PreToolUse  → adapter  → regista event (action_begin)   │
+│  ─ PostToolUse → adapter  → regista event (action_end,     │
 │                                              result_digest)  │
 └──────────────────────────────────────────────────────────────┘
                             │
@@ -264,18 +270,18 @@ sign-off. See §8.
 │  ─ Computes file digests (before/after for Edit/Write)       │
 │  ─ Hashes tool arguments (canonical form)                    │
 │  ─ Resolves delegation chain (principal_id, session_id)      │
-│  ─ Threads parent-action link via substrate typed links      │
+│  ─ Threads parent-action link via regista typed links      │
 └──────────────────────────────────────────────────────────────┘
                             │
                             ▼
 ┌──────────────────────────────────────────────────────────────┐
-│  substrate (append-only, signed, replay-verifiable)          │
+│  regista (append-only, signed, replay-verifiable)          │
 └──────────────────────────────────────────────────────────────┘
                             │
                             ▼
 ┌──────────────────────────────────────────────────────────────┐
 │  Verifier (offline tool, this project)                       │
-│  ─ Replays substrate events                                  │
+│  ─ Replays regista events                                  │
 │  ─ Verifies signatures, delegation chain, timestamps         │
 │  ─ Re-derives file-content provenance for any action         │
 │  ─ Emits auditor-ready report                                │
@@ -308,7 +314,7 @@ on_behalf_of:                # delegation chain (BC-197 dependency)
   session_id: claude-code-session-…
   authenticated_at: 2026-05-22T14:32:00Z
   scope: [edit, read, bash:safe-subset]
-parent_action_event_id: …    # substrate typed link to parent
+parent_action_event_id: …    # regista typed link to parent
 harness:
   name: claude-code | opencode
   version: 0.x.y
@@ -327,7 +333,7 @@ in a regulated context and currently cannot, because nobody has built this.
 
 Therefore:
 
-- **Open source from day one.** MIT, same as substrate.
+- **Open source from day one.** MIT, same as regista.
 - **Dogfood at the owner's workplace** as the primary validation. One real
   regulated deployment, with internal compliance sign-off documentation,
   is worth more than any number of design partners.
@@ -396,14 +402,14 @@ project owner will pick. Until then, anywhere this README says
 ## 12. Origin
 
 This project crystallized out of a 2026-05-22 design conversation that
-started with the question *"could substrate be adapted to provide
+started with the question *"could regista be adapted to provide
 cryptographic tracking for agentic workflows?"* The compliance-substrate
 project is the immediate ancestor; it is being tabled (not deleted) in favor
-of this repositioning. Many of the substrate-level breadcrumbs that
+of this repositioning. Many of the regista-level breadcrumbs that
 compliance-substrate would have driven (BC-196 asymmetric signing, BC-197
 delegation chain) remain relevant here and were filed during that
 conversation.
 
 ## License
 
-MIT (planned, matching substrate).
+MIT (planned, matching regista).

@@ -66,10 +66,11 @@ JSON. The signing key is:
 Key rotation is performed by signing a `key_rotation` event with the
 predecessor key, preserving identity continuity across rotations.
 
-**Limitation:** HMAC-SHA256 is symmetric — the party holding the key can
-forge events. This is the same limitation that applies to FIM tools using
-symmetric signing. Asymmetric signing (Ed25519) is on the roadmap and
-will eliminate this limitation when it lands.
+**Limitation (partial):** HMAC-SHA256 is symmetric — the party holding the
+key can forge events. This is the same limitation that applies to FIM tools
+using symmetric signing. Ed25519 asymmetric signing is now available and
+provides operator-forgery resistance for events signed with the Ed25519 scheme.
+HMAC-signed events retain the symmetric limitation.
 
 ---
 
@@ -213,7 +214,8 @@ signing. It is mitigated by:
 
 - Key access restricted to the service account (mode `0600`)
 - Key rotation events creating an auditable chain
-- Planned asymmetric signing (Ed25519) on the roadmap
+- Ed25519 asymmetric signing available for operator-forgery resistance
+- RFC 3161 trusted timestamping available for backdating defense
 
 ### 5.2 Missing Events
 
@@ -278,8 +280,8 @@ teams as:
 | FIM-class positioning analysis | Complete (this document) |
 | Control description template | Complete (§4) |
 | Auditor validation | **Open** — highest-leverage research item |
-| Asymmetric signing (Ed25519) | Roadmap (substrate dependency) |
-| RFC 3161 timestamping | Roadmap (substrate dependency) |
+| Asymmetric signing (Ed25519) | **Landed** (regista BC-196, Plan 011) |
+| RFC 3161 timestamping | **Landed** (regista Plan 012; TSA sig verify pending BC-229) |
 | Witness federation | Roadmap |
 
 ---

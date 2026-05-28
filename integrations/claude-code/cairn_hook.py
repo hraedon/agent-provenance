@@ -2,7 +2,7 @@
 """Cairn hook for Claude Code.
 
 Handles PreToolUse, PostToolUse, PostToolUseFailure, and SessionStart events.
-Dispatches to the `cairn-bridge` script for substrate communication.
+Dispatches to the `cairn-bridge` script for regista communication.
 
 Manages work_item_id state between Pre and Post calls via session-scoped
 temp files under ${CAIRN_STATE_DIR:-/tmp/cairn-sessions}/{session_id}/.
@@ -18,8 +18,8 @@ Usage (from .claude/settings.json)::
 
 Environment::
 
-    CAIRN_DSN             Postgres DSN for substrate
-    CAIRN_PROJECT         Substrate project name
+    CAIRN_DSN             Postgres DSN for regista
+    CAIRN_PROJECT         Regista project name
     CAIRN_KEY_PATH        Path to HMAC key file
     CAIRN_STATE_DIR       Directory for session state (default: /tmp/cairn-sessions)
     CAIRN_DISABLE         If set, silently exits 0
@@ -30,6 +30,7 @@ Environment::
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import os
@@ -37,6 +38,10 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+_DEFAULT_STATE_DIR = "/tmp/cairn-sessions"
+_FALLBACK_SESSION_ID = "unknown"
+_FALLBACK_TOOL_NAME = "unknown"
 
 
 def _safe_session_id(session_id: str) -> str:
@@ -50,9 +55,21 @@ def _safe_session_id(session_id: str) -> str:
 
 
 def _state_dir(session_id: str) -> Path:
-    base = os.environ.get("CAIRN_STATE_DIR", "/tmp/cairn-sessions")
+    base = os.environ.get("CAIRN_STATE_DIR", _DEFAULT_STATE_DIR)
     d = Path(base) / _safe_session_id(session_id)
     d.mkdir(parents=True, exist_ok=True)
+    # Restrict directory permissions to owner-only (0o700).
+    try:
+        d.chmod(0o700)
+    except OSError:
+        pass
+    # Also restrict the base directory if we created it.
+    base_path = Path(base)
+    if base_path.exists():
+        try:
+            base_path.chmod(0o700)
+        except OSError:
+            pass
     return d
 
 
@@ -83,6 +100,15 @@ def _run_bridge(payload: dict) -> dict | None:
     return None
 
 
+def _mark_degraded(session_id: str, action: str, detail: str) -> None:
+    ts = datetime.datetime.now(datetime.UTC).isoformat()
+    sd = _state_dir(session_id)
+    marker = sd / "degradation.log"
+    entry = json.dumps({"ts": ts, "action": action, "detail": detail}, separators=(",", ":"))
+    with marker.open("a") as f:
+        f.write(entry + "\n")
+
+
 def _extract_files(tool_name: str, tool_input: dict) -> list[str]:
     files: list[str] = []
     for key in ("filePath", "file_path", "path", "file"):
@@ -100,9 +126,9 @@ def _extract_files(tool_name: str, tool_input: dict) -> list[str]:
 
 def handle_pre() -> None:
     hook_input = json.loads(sys.stdin.read())
-    tool_name = hook_input.get("tool_name", "unknown")
+    tool_name = hook_input.get("tool_name", _FALLBACK_TOOL_NAME)
     tool_input = hook_input.get("tool_input", {})
-    session_id = hook_input.get("session_id", "unknown")
+    session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
 
     files = _extract_files(tool_name, tool_input)
 
@@ -128,13 +154,15 @@ def handle_pre() -> None:
                 }
             )
         )
+    else:
+        _mark_degraded(session_id, "pre", f"bridge call failed for {tool_name}")
 
 
 def handle_post(*, failure: bool = False) -> None:
     hook_input = json.loads(sys.stdin.read())
-    tool_name = hook_input.get("tool_name", "unknown")
+    tool_name = hook_input.get("tool_name", _FALLBACK_TOOL_NAME)
     tool_input = hook_input.get("tool_input", {})
-    session_id = hook_input.get("session_id", "unknown")
+    session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
     tool_output = hook_input.get("tool_output", "")
 
     key = _call_key(tool_name, tool_input)
@@ -164,7 +192,7 @@ def handle_post(*, failure: bool = False) -> None:
     elif isinstance(tool_output, dict):
         stdout_text = json.dumps(tool_output)[:2000]
 
-    _run_bridge(
+    reply = _run_bridge(
         {
             "action": "end",
             "work_item_id": work_item_id,
@@ -177,6 +205,8 @@ def handle_post(*, failure: bool = False) -> None:
             "error": error,
         }
     )
+    if not reply or reply.get("status") != "ok":
+        _mark_degraded(session_id, "post", f"bridge call failed for {tool_name} end")
 
     try:
         state_file.unlink(missing_ok=True)
@@ -184,40 +214,63 @@ def handle_post(*, failure: bool = False) -> None:
         pass
 
 
+def _resolve_settings_digest() -> str | None:
+    candidates: list[Path] = []
+    project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+    if project_dir:
+        candidates.append(Path(project_dir) / ".claude" / "settings.json")
+    home = Path.home()
+    candidates.append(home / ".claude" / "settings.json")
+    for p in candidates:
+        if p.is_file():
+            return "sha256:" + hashlib.sha256(p.read_bytes()).hexdigest()
+    return None
+
+
 def handle_session_start() -> None:
     hook_input = json.loads(sys.stdin.read())
-    session_id = hook_input.get("session_id", "unknown")
+    session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
 
-    _run_bridge(
+    harness_name = os.environ.get("CAIRN_HARNESS_NAME", "claude-code")
+    config_digest = _resolve_settings_digest()
+
+    reply = _run_bridge(
         {
             "action": "attest_scope",
             "session_id": session_id,
             "harnesses": [
                 {
-                    "name": os.environ.get("CAIRN_HARNESS_NAME", "claude-code"),
-                    "version": os.environ.get("CAIRN_HARNESS_VERSION", "unknown"),
+                    "name": harness_name,
+                    "version": os.environ.get("CAIRN_HARNESS_VERSION", _FALLBACK_TOOL_NAME),
                 }
             ],
             "scope_statement": "In scope: claude-code.",
+            "harness_config_digests": {harness_name: config_digest} if config_digest else None,
         }
     )
+    if not reply or reply.get("status") != "ok":
+        _mark_degraded(session_id, "session_start", "scope attestation bridge call failed")
 
 
 def handle_session_end() -> None:
     hook_input = json.loads(sys.stdin.read())
-    session_id = hook_input.get("session_id", "unknown")
+    session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
     state = _state_dir(session_id)
     if not state.exists():
         return
+    has_degradation = (state / "degradation.log").exists()
     for f in state.iterdir():
+        if has_degradation and f.name == "degradation.log":
+            continue
         try:
             f.unlink()
         except OSError:
             pass
-    try:
-        state.rmdir()
-    except OSError:
-        pass
+    if not has_degradation:
+        try:
+            state.rmdir()
+        except OSError:
+            pass
 
 
 def main() -> None:
@@ -249,6 +302,7 @@ def main() -> None:
             sys.exit(1)
     except Exception as exc:
         print(f"cairn_hook error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

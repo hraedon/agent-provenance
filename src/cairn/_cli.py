@@ -12,6 +12,7 @@ import base64
 import datetime
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,28 +23,75 @@ from .schema import check_key_file_permissions
 from .verifier import Verifier
 
 TRUST_MODEL_CAVEAT = (
-    "HMAC-SHA256 only; Ed25519 + RFC 3161 + witness federation are tracked as "
-    "substrate Plan 011/012/013 dependencies. FIM-class positioning is a working "
-    "hypothesis (README §4.1), not auditor-validated."
+    "Ed25519 and HMAC-SHA256 supported; RFC 3161 timestamping available via "
+    "'cairn timestamp'. FIM-class positioning is a working hypothesis "
+    "(README §4.1), not auditor-validated."
 )
 
 README_PATH = Path(__file__).resolve().parent.parent.parent / "README.md"
 
 
+def _load_key_set(keys_path: Path) -> dict[str, bytes]:
+    """Load a key set from a JSON key file.
+
+    Supports both HMAC-SHA256 (``secret`` field) and Ed25519
+    (``public_key`` field for verification, ``secret`` for signing).
+    For Ed25519 verification, only the public key is needed.
+    """
+    key_data = json.loads(keys_path.read_text())
+    key_set: dict[str, bytes] = {}
+    for entry in key_data["keys"]:
+        key_id: str = entry["key_id"]
+        scheme = entry.get("scheme", "hmac-sha256")
+
+        if scheme == "ed25519":
+            # For verification, use the public key
+            public_key_raw = entry.get("public_key")
+            if public_key_raw is None:
+                click.echo(
+                    f"WARNING: Ed25519 key {key_id!r} has no public_key; "
+                    "verification will fail for events signed by this key.",
+                    err=True,
+                )
+                continue
+            encoding = entry.get("encoding", "base64")
+            if encoding == "base64":
+                key_set[key_id] = base64.b64decode(public_key_raw)
+            else:
+                key_set[key_id] = public_key_raw.encode("utf-8")
+        else:
+            # HMAC-SHA256: use the secret
+            secret_raw = entry["secret"]
+            encoding = entry.get("encoding", "utf8")
+            if encoding == "base64":
+                secret: bytes = base64.b64decode(secret_raw)
+            else:
+                secret = secret_raw.encode("utf-8")
+            key_set[key_id] = secret
+
+    return key_set
+
+
+_SECTION_RE = re.compile(r"^#+\s+(\d+(?:\.\d+)?)")
+
+
 def _extract_readme_sections(readme_text: str) -> tuple[str | None, str | None]:
     """Return control description and caveat from README §4.2.
 
-    Uses simple heading-match heuristics.
+    Uses regex to match section headings like ``## 4.2`` or ``### 4.2.1``.
     """
     control_lines: list[str] = []
     in_control = False
     for raw in readme_text.splitlines():
         line = raw.rstrip()
-        if line.lstrip("#").startswith(" 4.2"):
-            in_control = True
-            continue
-        if line.lstrip("#").startswith(" 4.3"):
-            in_control = False
+        m = _SECTION_RE.match(line)
+        if m:
+            section = m.group(1)
+            if section.startswith("4.2"):
+                in_control = True
+                continue
+            elif section.startswith("4.3"):
+                in_control = False
         if in_control:
             if line.startswith("> "):
                 control_lines.append(line[2:])
@@ -65,24 +113,19 @@ def main() -> None:
 @click.option("--bundle-path", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--keys", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--output", type=click.Path(path_type=Path), default=None)
-@click.option("--format", "fmt", type=click.Choice(["text", "json", "html"]), default="text",
-              help="Report format: text (human-readable), JSON, or self-contained HTML")
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "json", "html"]),
+    default="text",
+    help="Report format: text (human-readable), JSON, or self-contained HTML",
+)
 def verify(bundle_path: Path, keys: Path, output: Path | None, fmt: str) -> None:
     """Verify a signed Cairn bundle and emit an auditor-ready report."""
     for w in check_key_file_permissions(str(keys)):
         click.echo(f"WARNING: {w}", err=True)
 
-    key_data = json.loads(keys.read_text())
-    key_set: dict[str, bytes] = {}
-    for entry in key_data["keys"]:
-        key_id: str = entry["key_id"]
-        secret_raw = entry["secret"]
-        encoding = entry.get("encoding", "utf8")
-        if encoding == "base64":
-            secret: bytes = base64.b64decode(secret_raw)
-        else:
-            secret = secret_raw.encode("utf-8")
-        key_set[key_id] = secret
+    key_set = _load_key_set(keys)
 
     verifier = Verifier(key_set)
     report = verifier.verify_bundle(bundle_path)
@@ -114,8 +157,13 @@ def verify(bundle_path: Path, keys: Path, output: Path | None, fmt: str) -> None
 )
 @click.option("--keys", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--output", type=click.Path(path_type=Path), default=None)
-@click.option("--format", "fmt", type=click.Choice(["text", "json", "html"]), default="text",
-              help="Report format: text (human-readable), JSON, or self-contained HTML")
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "json", "html"]),
+    default="text",
+    help="Report format: text (human-readable), JSON, or self-contained HTML",
+)
 def verify_chain(
     bundles: tuple[Path, ...],
     keys: Path,
@@ -126,17 +174,7 @@ def verify_chain(
     for w in check_key_file_permissions(str(keys)):
         click.echo(f"WARNING: {w}", err=True)
 
-    key_data = json.loads(keys.read_text())
-    key_set: dict[str, bytes] = {}
-    for entry in key_data["keys"]:
-        key_id: str = entry["key_id"]
-        secret_raw = entry["secret"]
-        encoding = entry.get("encoding", "utf8")
-        if encoding == "base64":
-            secret: bytes = base64.b64decode(secret_raw)
-        else:
-            secret = secret_raw.encode("utf-8")
-        key_set[key_id] = secret
+    key_set = _load_key_set(keys)
 
     verifier = Verifier(key_set)
     report = verifier.verify_bundle_chain(list(bundles))
@@ -160,7 +198,7 @@ def verify_chain(
 
 @main.command()
 @click.option("--dsn", required=True, help="Postgres DSN")
-@click.option("--project", required=True, help="Substrate project name")
+@click.option("--project", required=True, help="Regista project name")
 @click.option("--keys", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--output", required=True, type=click.Path(path_type=Path))
 @click.option("--since", default=None, help="ISO timestamp for lower bound")
@@ -179,13 +217,13 @@ def export(
     until: str | None,
     previous_bundle_hash: str | None,
 ) -> None:
-    """Export events from substrate into a signed bundle for offline verification."""
+    """Export events from regista into a signed bundle for offline verification."""
     for w in check_key_file_permissions(str(keys)):
         click.echo(f"WARNING: {w}", err=True)
 
-    from substrate import Substrate
+    from regista import Regista
 
-    sub = Substrate(dsn=dsn, project=project, hmac_key_path=str(keys))
+    sub = Regista(dsn=dsn, project=project, hmac_key_path=str(keys))
 
     start = datetime.datetime.fromisoformat(since) if since else None
     end = datetime.datetime.fromisoformat(until) if until else None
@@ -225,25 +263,49 @@ def export(
         "events": [ev.to_dict() for ev in events],
     }
 
+    exported_event_ids = {str(ev.event_id) for ev in events}
+    try:
+        confirmed_batches = sub.timestamping.list_batches(status="confirmed")
+        covering_batches = []
+        for batch in confirmed_batches:
+            batch_event_ids = {str(eid) for eid in batch.event_ids}
+            if batch_event_ids & exported_event_ids:
+                covering_batches.append(batch.to_dict())
+        if covering_batches:
+            bundle["timestamp_batches"] = covering_batches
+    except Exception:
+        pass
+
     canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
     digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
 
     bundle["manifest"]["bundle_hash"] = digest
     bundle["manifest"]["bundle_hash_covers"] = (
-        "manifest (minus bundle_hash) + events, canonical JSON"
+        "manifest (minus bundle_hash) + events + timestamp_batches (if present), canonical JSON"
     )
 
+    ts_count = len(bundle.get("timestamp_batches", []))
+    ts_note = f", {ts_count} TSA timestamp batches" if ts_count else ""
     output.write_text(json.dumps(bundle, indent=2))
-    click.echo(f"Exported {len(events)} events to {output}")
+    click.echo(f"Exported {len(events)} events{ts_note} to {output}")
     sub.close()
 
 
 @main.command("extract-control")
-@click.option("--readme", type=click.Path(exists=True, path_type=Path), default=None,
-              help="Path to README.md (auto-detected if omitted)")
+@click.option(
+    "--readme",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Path to README.md (auto-detected if omitted)",
+)
 @click.option("--output", type=click.Path(path_type=Path), default=None)
-@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text",
-              help="Output format: text (human-readable) or JSON")
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format: text (human-readable) or JSON",
+)
 def extract_control(readme: Path | None, output: Path | None, fmt: str) -> None:
     """Extract the control description and trust-model caveat from README §4.2.
 
@@ -262,13 +324,16 @@ def extract_control(readme: Path | None, output: Path | None, fmt: str) -> None:
     source_digest = "sha256:" + hashlib.sha256(readme_text.encode("utf-8")).hexdigest()
 
     if fmt == "json":
-        result = json.dumps({
-            "control_description": control_description,
-            "trust_model_caveat": trust_model_caveat,
-            "source_path": str(readme),
-            "source_digest": source_digest,
-            "source_section": "§4.2",
-        }, indent=2)
+        result = json.dumps(
+            {
+                "control_description": control_description,
+                "trust_model_caveat": trust_model_caveat,
+                "source_path": str(readme),
+                "source_digest": source_digest,
+                "source_section": "§4.2",
+            },
+            indent=2,
+        )
     else:
         lines: list[str] = []
         lines.append("=" * 60)
@@ -283,7 +348,7 @@ def extract_control(readme: Path | None, output: Path | None, fmt: str) -> None:
         lines.append("-" * 60)
         lines.append("TRUST MODEL CAVEAT")
         lines.append("-" * 60)
-        lines.append(trust_model_caveat)
+        lines.append(trust_model_caveat or "(no caveat)")
         lines.append("")
         lines.append(f"Source: {readme}")
         lines.append(f"Digest: {source_digest}")
@@ -298,13 +363,26 @@ def extract_control(readme: Path | None, output: Path | None, fmt: str) -> None:
 
 
 @main.command()
-@click.option("--older", required=True, type=click.Path(exists=True, path_type=Path),
-              help="Older bundle path (baseline)")
-@click.option("--newer", required=True, type=click.Path(exists=True, path_type=Path),
-              help="Newer bundle path to compare against baseline")
+@click.option(
+    "--older",
+    required=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="Older bundle path (baseline)",
+)
+@click.option(
+    "--newer",
+    required=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="Newer bundle path to compare against baseline",
+)
 @click.option("--output", type=click.Path(path_type=Path), default=None)
-@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text",
-              help="Report format: text (human-readable) or JSON")
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Report format: text (human-readable) or JSON",
+)
 def diff(older: Path, newer: Path, output: Path | None, fmt: str) -> None:
     """Compare two bundles and show what changed."""
     verifier = Verifier({})
@@ -320,6 +398,60 @@ def diff(older: Path, newer: Path, output: Path | None, fmt: str) -> None:
         click.echo(f"Diff written to {output}")
     else:
         click.echo(result, nl=False)
+
+
+@main.command()
+@click.option("--dsn", required=True, help="Postgres DSN")
+@click.option("--project", required=True, help="Regista project name")
+@click.option("--keys", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--tsa-url", required=True, help="RFC 3161 TSA endpoint URL")
+@click.option("--batch-size", default=1000, help="Max events per batch")
+@click.option("--hash-algo", default="sha256", help="Hash algorithm (sha256/sha384/sha512)")
+def timestamp(
+    dsn: str,
+    project: str,
+    keys: Path,
+    tsa_url: str,
+    batch_size: int,
+    hash_algo: str,
+) -> None:
+    """Submit event batches to an RFC 3161 TSA for timestamping.
+
+    Connects to regista, computes a Merkle root over unbaptized events,
+    submits it to the configured TSA, and stores the resulting token.
+    Requires asn1crypto: pip install regista[timestamping]
+    """
+    for w in check_key_file_permissions(str(keys)):
+        click.echo(f"WARNING: {w}", err=True)
+
+    from regista import Regista
+    from regista._timestamping import TSAConfig
+
+    sub = Regista(dsn=dsn, project=project, hmac_key_path=str(keys))
+
+    tsa_config = TSAConfig(
+        tsa_url=tsa_url,
+        batch_size=batch_size,
+        hash_algorithm=hash_algo,
+    )
+    sub.timestamping.set_config(tsa_config)
+
+    try:
+        batch = sub.timestamping.trigger()
+        if batch is None:
+            click.echo("No unbaptized events to timestamp.")
+        else:
+            click.echo(f"Timestamped batch {batch.batch_id}")
+            click.echo(f"  Events      : {len(batch.event_ids)}")
+            click.echo(f"  Merkle root : {batch.merkle_root.hex()[:32]}...")
+            click.echo(f"  Status      : {batch.status}")
+            if batch.tsa_timestamp:
+                click.echo(f"  TSA time    : {batch.tsa_timestamp}")
+    except Exception as exc:
+        click.echo(f"Timestamping failed: {exc}", err=True)
+        raise SystemExit(1) from exc
+    finally:
+        sub.close()
 
 
 if __name__ == "__main__":
