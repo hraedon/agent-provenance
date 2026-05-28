@@ -95,6 +95,14 @@ def main() -> None:
         sys.stderr.write("cairn_bridge: session_id required for audit grouping\n")
         sys.exit(1)
 
+    # regista requires session_id to be a valid UUID.  If the harness
+    # provides a non-UUID string (e.g. opencode's "ses_..."), derive a
+    # deterministic UUID v5 from it.
+    try:
+        uuid.UUID(session_id)
+    except ValueError:
+        session_id = str(uuid.uuid5(uuid.NAMESPACE_URL, session_id))
+
     sub = Regista(dsn=dsn, project=project, hmac_key_path=key_path)
     adapter = CairnAdapter(
         sub,
