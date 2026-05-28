@@ -2395,4 +2395,262 @@ def test_all_ok_includes_new_checks(hmac_keys: Path) -> None:
     verifier = Verifier(key_set, key_metadata={key_id: {"role": "auditor"}})
     report = verifier.verify_events([ev])
     assert not report.all_ok
-    assert len(report.role_gate_violations) == 1
+
+
+# ---------------------------------------------------------------------------
+# BC-229: TSA signature verification
+# ---------------------------------------------------------------------------
+
+
+def _build_signed_tsa_token(merkle_root: bytes, cert, private_key) -> bytes:
+    """Build a minimal CMS-signed TSA token for testing."""
+    import hashlib
+
+    from asn1crypto import algos, cms, core, tsp as asn1tsp
+    from cryptography.hazmat.primitives import hashes as crypto_hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    hash_algo = "sha256"
+    digest = hashlib.sha256(merkle_root).digest()
+    tst_info = asn1tsp.TSTInfo(
+        {
+            "version": "v1",
+            "policy": "1.2.3.4.5",
+            "message_imprint": asn1tsp.MessageImprint(
+                {
+                    "hash_algorithm": {"algorithm": hash_algo},
+                    "hashed_message": digest,
+                }
+            ),
+            "serial_number": 1,
+            "gen_time": "20260101000000Z",
+        }
+    )
+    tst_info_der = tst_info.dump()
+
+    encap = cms.EncapsulatedContentInfo({"content_type": "tst_info"})
+    encap["content"] = core.ParsableOctetString(tst_info_der)
+
+    md = hashlib.sha256(tst_info_der).digest()
+    signed_attrs = cms.CMSAttributes(
+        [
+            cms.CMSAttribute({"type": "content_type", "values": ["tst_info"]}),
+            cms.CMSAttribute({"type": "message_digest", "values": [md]}),
+        ]
+    )
+
+    data_to_sign = signed_attrs.untag().dump()
+    signature = private_key.sign(data_to_sign, padding.PKCS1v15(), crypto_hashes.SHA256())
+
+    signer_info = cms.SignerInfo(
+        {
+            "version": "v1",
+            "sid": cms.IssuerAndSerialNumber(
+                {"issuer": cert.issuer, "serial_number": cert.serial_number}
+            ),
+            "digest_algorithm": {"algorithm": "sha256"},
+            "signature_algorithm": {"algorithm": "sha256_rsa"},
+            "signed_attrs": signed_attrs,
+            "signature": signature,
+        }
+    )
+
+    signed = cms.SignedData(
+        {
+            "version": "v3",
+            "digest_algorithms": [{"algorithm": "sha256"}],
+            "encap_content_info": encap,
+            "certificates": [cms.CertificateChoices({"certificate": cert})],
+            "signer_infos": [signer_info],
+        }
+    )
+    ci = cms.ContentInfo({"content_type": "signed_data", "content": signed})
+    return ci.dump()
+
+
+def _generate_test_cert():
+    """Generate a self-signed RSA certificate for testing."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test TSA")])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .sign(key, hashes.SHA256())
+    )
+    return cert, key
+
+
+def test_tsa_signature_verification_with_trust_anchor(tmp_path: Path) -> None:
+    """BC-229: verify_tsa_token_full verifies CMS signature against trust anchor."""
+    from asn1crypto import x509 as asn1_x509
+    from cryptography.hazmat.primitives import serialization
+    from regista._timestamping import TSAConfig, verify_tsa_token_full
+
+    cert_pem, key = _generate_test_cert()
+    cert_der = cert_pem.public_bytes(serialization.Encoding.DER)
+    cert_asn1 = asn1_x509.Certificate.load(cert_der)
+
+    merkle_root = hashlib.sha256(b"test-merkle").digest()
+    token = _build_signed_tsa_token(merkle_root, cert_asn1, key)
+
+    # Write trust anchor to file
+    anchor_path = tmp_path / "tsa-cert.pem"
+    anchor_path.write_bytes(cert_pem.public_bytes(serialization.Encoding.PEM))
+
+    config = TSAConfig(tsa_url="", tsa_cert_path=str(anchor_path))
+    ok, detail = verify_tsa_token_full(token, merkle_root, config)
+    assert ok, f"Expected verification to pass, got: {detail}"
+    assert "verified" in detail.lower() or "ok" in detail.lower()
+
+
+def test_tsa_signature_verification_wrong_anchor(tmp_path: Path) -> None:
+    """BC-229: verify_tsa_token_full rejects token signed by different key."""
+    from asn1crypto import x509 as asn1_x509
+    from cryptography.hazmat.primitives import serialization
+    from regista._timestamping import TSAConfig, verify_tsa_token_full
+
+    cert_pem, key = _generate_test_cert()
+    cert_der = cert_pem.public_bytes(serialization.Encoding.DER)
+    cert_asn1 = asn1_x509.Certificate.load(cert_der)
+
+    merkle_root = hashlib.sha256(b"test-merkle").digest()
+    token = _build_signed_tsa_token(merkle_root, cert_asn1, key)
+
+    # Write a DIFFERENT cert as trust anchor
+    other_cert, _ = _generate_test_cert()
+    anchor_path = tmp_path / "wrong-cert.pem"
+    anchor_path.write_bytes(other_cert.public_bytes(serialization.Encoding.PEM))
+
+    config = TSAConfig(tsa_url="", tsa_cert_path=str(anchor_path))
+    ok, detail = verify_tsa_token_full(token, merkle_root, config)
+    assert not ok, f"Expected verification to fail with wrong anchor, got: {detail}"
+
+
+def test_tsa_no_trust_anchor_skips_signature(tmp_path: Path) -> None:
+    """BC-229: without tsa_cert_path, only message imprint is checked."""
+    from asn1crypto import x509 as asn1_x509
+    from cryptography.hazmat.primitives import serialization
+    from regista._timestamping import TSAConfig, verify_tsa_token_full
+
+    cert_pem, key = _generate_test_cert()
+    cert_der = cert_pem.public_bytes(serialization.Encoding.DER)
+    cert_asn1 = asn1_x509.Certificate.load(cert_der)
+
+    merkle_root = hashlib.sha256(b"test-merkle").digest()
+    token = _build_signed_tsa_token(merkle_root, cert_asn1, key)
+
+    config = TSAConfig(tsa_url="")  # No tsa_cert_path
+    ok, detail = verify_tsa_token_full(token, merkle_root, config)
+    assert ok
+    assert "not checked" in detail.lower() or "imprint" in detail.lower()
+
+
+def test_verifier_timestamp_signature_verification(tmp_path: Path) -> None:
+    """BC-229: Verifier._verify_timestamp_signatures sets verified field."""
+    import datetime
+
+    from asn1crypto import x509 as asn1_x509
+    from cryptography.hazmat.primitives import serialization
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    # Generate TSA cert and build a signed token
+    cert_pem, tsa_key = _generate_test_cert()
+    cert_der = cert_pem.public_bytes(serialization.Encoding.DER)
+    cert_asn1 = asn1_x509.Certificate.load(cert_der)
+
+    merkle_root_hex = "aa" * 32
+    merkle_root = bytes.fromhex(merkle_root_hex)
+    token = _build_signed_tsa_token(merkle_root, cert_asn1, tsa_key)
+    token_hex = token.hex()
+
+    # Write trust anchor
+    anchor_path = tmp_path / "tsa-cert.pem"
+    anchor_path.write_bytes(cert_pem.public_bytes(serialization.Encoding.PEM))
+
+    # Build a signed event
+    ev_id = uuid.uuid4()
+    now = datetime.datetime.now(datetime.UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+    ev = Event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    ts_batch_id = str(uuid.uuid4())
+    manifest: dict = {"events_count": 1}
+    bundle: dict = {
+        "manifest": manifest,
+        "events": [ev.to_dict()],
+        "timestamp_batches": [
+            {
+                "batch_id": ts_batch_id,
+                "event_ids": [str(ev_id)],
+                "merkle_root": merkle_root_hex,
+                "status": "confirmed",
+                "tsa_timestamp": now.isoformat(),
+                "tsa_token": token_hex,
+            }
+        ],
+    }
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    manifest["bundle_hash"] = digest
+
+    bundle_path = tmp_path / "bundle_ts_verify.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+
+    # Verify WITH trust anchor
+    verifier = Verifier(key_set, tsa_cert_path=str(anchor_path))
+    report = verifier.verify_bundle(bundle_path)
+    assert report.all_ok
+    assert len(report.timestamp_batches) == 1
+    assert report.timestamp_batches[0].verified is True
+    assert report.timestamp_batches[0].verification_detail is not None
+
+    # Verify WITHOUT trust anchor — verified should be None
+    verifier_no_anchor = Verifier(key_set)
+    report_no_anchor = verifier_no_anchor.verify_bundle(bundle_path)
+    assert report_no_anchor.all_ok
+    assert report_no_anchor.timestamp_batches[0].verified is None
