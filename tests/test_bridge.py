@@ -255,7 +255,9 @@ def test_session_id_passthrough(
     call_kwargs = mock_adapter_cls.call_args
     on_behalf_of = call_kwargs.kwargs.get("on_behalf_of") or call_kwargs[1].get("on_behalf_of")
     assert on_behalf_of is not None
-    assert on_behalf_of["session_id"] == explicit_session
+    # Non-UUID session IDs are hashed to a deterministic UUID v5
+    expected_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, explicit_session))
+    assert on_behalf_of["session_id"] == expected_uuid
 
 
 @patch("cairn._bridge.Regista")

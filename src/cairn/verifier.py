@@ -879,15 +879,17 @@ class Verifier:
             # No scope attestations at all — flag every tool call
             for ev in tool_calls:
                 payload = ev.payload or {}
+                h_raw = payload.get("harness", "")
+                h_name = h_raw.get("name", "") if isinstance(h_raw, dict) else h_raw
                 report.scope_violations.append(
                     ScopeViolation(
                         event_id=str(ev.event_id),
                         work_item_id=str(ev.work_item_id),
                         transition=ev.transition,
-                        harness=payload.get("harness", ""),
+                        harness=h_name,
                         detail=(
                             "No scope attestation found in the log. "
-                            f"Tool call from harness '{payload.get('harness', '')}' "
+                            f"Tool call from harness '{h_name}' "
                             "has no covering scope."
                         ),
                     )
@@ -902,7 +904,8 @@ class Verifier:
 
         for ev in tool_calls:
             payload = ev.payload or {}
-            harness = payload.get("harness", "")
+            harness_raw = payload.get("harness", "")
+            harness = harness_raw.get("name", "") if isinstance(harness_raw, dict) else harness_raw
             ev_ts = ev.timestamp.isoformat()
 
             # Find the latest scope attestation that predates this event
