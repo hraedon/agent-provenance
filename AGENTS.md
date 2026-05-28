@@ -1,5 +1,7 @@
 # agent-provenance — Agent Guide
 
+> **Upstream renamed 2026-05-27:** the coordination spine was previously `substrate`; it is now `regista` (Plan 005 consumer migration here, regista Plan 018 upstream). Note: `compliance-substrate` (the dormant ancestor referenced below) is a *different* project and keeps its name. Older breadcrumbs and reflections that still say "substrate" are intentional historical record.
+
 ## Status
 
 **Skeleton complete.** Adapter, verifier, CLI, and scope attestation are in.
