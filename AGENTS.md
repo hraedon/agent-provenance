@@ -68,11 +68,14 @@ MCP at time of writing:
   (Plan 011). Ed25519 support integrated into verifier and CLI.
 - **BC-197** — delegation chain (`on_behalf_of`). **Landed** (Plan 010).
   Delegation chain validation integrated into verifier.
-- **BC-229** — TSA signature verification against a trust anchor. **Open.**
-  Blocks full RFC 3161 timestamp verification.
+- **BC-229** — TSA signature verification against a trust anchor. **Landed.**
+  CMS signature + certificate chain verification in regista; cairn
+  verifier accepts `--tsa-cert` for trust anchor, reports verified/failed
+  status per batch.
 - (to file) — operator-forgery defense at regista layer (RFC 3161
   timestamping — **Plan 012 landed**; witness federation — **Plan 013
-  landed**; OpenTimestamps anchoring — **not yet**).
+  landed**; witness coverage check in cairn — **done**; OpenTimestamps
+  anchoring — **not yet**).
 
 When these land in regista, revisit `README.md §4` (trust model) and the
 event schema in §7.
@@ -98,9 +101,9 @@ In rough order. Do not assume any of these are done; check on entry.
    an auditor-ready report.
    **Done: `src/cairn/verifier.py` + CLI `cairn verify`.**
 
-## Current status (last updated 2026-05-26)
+## Current status (last updated 2026-05-28)
 
-- **Tests**: 114 passing (CI depends on Postgres).
+- **Tests**: 132 passing (CI depends on Postgres).
 - **Lint**: ruff clean.
 - **Gaps closed**: scope attestation as signed first-class event (README §2);
   opencode plugin + bridge end-to-end functional; bundle export/verify with
@@ -121,11 +124,16 @@ In rough order. Do not assume any of these are done; check on entry.
   **Delegation chain validation** (AP-003 partial, regista BC-197);
   **`cairn timestamp` CLI command** (AP-004 partial, regista Plan 012);
   **Scheme-aware verifier** (dispatches HMAC/Ed25519 per event `scheme_id`);
-  **Scheme-aware reports** (text/JSON/HTML show scheme usage and delegation chains).
+  **Scheme-aware reports** (text/JSON/HTML show scheme usage and delegation chains);
+  **Ed25519 signing support** (regista BC-196, verifier + CLI);
+  **Delegation chain validation** (regista BC-197, verifier);
+  **`cairn timestamp` CLI command** (regista Plan 012);
+  **TSA signature verification against trust anchor** (BC-229 completed);
+  **Witness federation coverage check** (bundle export + verifier);
+  **OpenCode plugin live end-to-end** (Node.js bridge, UUID v5 session IDs).
 - **Open gaps**: project not registered with agent-notes yet; live
   opencode dogfood bundle not yet committed to repo; Claude Code hooks not
   yet tested in a live Claude Code session (mock tests only);
-  TSA signature verification (BC-229); witness federation integration;
   real IdP integration for principal_id.
 
 ## What not to do
