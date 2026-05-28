@@ -1,7 +1,7 @@
-# Plan 005 — Consumer migration: regista → regista
+# Plan 005 — Consumer migration: substrate → regista
 
 **Status:** Phase 2 of the cross-project rename. **Blocked until regista Plan 018 completes** and `v0.4.0` is tagged.
-**Scope:** agent-provenance specifically. See `/projects/RENAME-regista-to-regista.md` for orchestration.
+**Scope:** agent-provenance specifically. See `/projects/RENAME-substrate-to-regista.md` for orchestration.
 **Regista refs in this repo:** 31.
 
 ---
@@ -10,7 +10,7 @@
 
 - [ ] Regista has tagged `v0.4.0` with the rename complete.
 - [ ] Tests pass on current main: `pytest -q`.
-- [ ] Fresh branch: `git checkout -b rename/regista-to-regista`.
+- [ ] Fresh branch: `git checkout -b rename/substrate-to-regista`.
 
 ## Why this one needs more care than other consumers
 
@@ -61,7 +61,7 @@ grep -rn 'import regista\|from regista' \
   | grep -v -E 'node_modules/|\.venv/'
 ```
 
-For each hit: `regista` → `regista`. If imports exist (likely yes — provenance reads regista's event log), also update test fixtures that mock regista's API.
+For each hit: `substrate` → `regista`. If imports exist (likely yes — provenance reads regista's event log), also update test fixtures that mock regista's API.
 
 ### 5. Hand-review substantive prose
 
@@ -79,8 +79,8 @@ If integration tests spin up regista (`from regista import Regista` or similar),
 
 ```bash
 git add -A
-git commit -m "rename: regista → regista (Plan 005)"
-git push -u origin rename/regista-to-regista
+git commit -m "rename: substrate → regista (Plan 005)"
+git push -u origin rename/substrate-to-regista
 ```
 
 ## Exit criteria
