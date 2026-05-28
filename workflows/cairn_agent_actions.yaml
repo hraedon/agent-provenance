@@ -1,6 +1,6 @@
 name: cairn_agent_actions
 version: 1
-substrate_version: "0.1.0"
+regista_version: "0.1.0"
 
 states:
   - name: new
