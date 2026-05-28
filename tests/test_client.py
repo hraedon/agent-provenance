@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import os
 import uuid
 from pathlib import Path
 
 import pytest
-from substrate import Substrate
+from regista import Regista
 
 from cairn.client import CairnClient, ToolCallContext
 
@@ -18,30 +17,10 @@ from cairn.client import CairnClient, ToolCallContext
 
 
 @pytest.fixture
-def hmac_keys(tmp_path: Path) -> Path:
-    key_file = tmp_path / "keys.json"
-    key_file.write_text(
-        json.dumps(
-            {
-                "keys": [
-                    {
-                        "key_id": "cairn-test-001",
-                        "secret": "supersecret-test-key-32bytes!!",
-                        "status": "active",
-                        "alg": "HMAC-SHA256",
-                    }
-                ]
-            }
-        )
-    )
-    return key_file
-
-
-@pytest.fixture
 def dsn() -> str:
     return os.environ.get(
-        "SUBSTRATE_TEST_DSN",
-        "postgresql://substrate_test:substrate_test@localhost/substrate_test",
+        "REGISTA_TEST_DSN",
+        "postgresql://regista_test:regista_test@localhost/regista_test",
     )
 
 
@@ -51,28 +30,21 @@ def project() -> str:
 
 
 @pytest.fixture
-def substrate_instance(dsn: str, project: str, hmac_keys: Path) -> Substrate:
+def regista_instance(dsn: str, project: str, hmac_keys: Path) -> Regista:
     try:
-        sub = Substrate.create_project(
+        sub = Regista.create_project(
             dsn=dsn,
             project=project,
             hmac_key_path=str(hmac_keys),
         )
     except Exception:
-        pytest.skip("Postgres not available; set SUBSTRATE_TEST_DSN to run")
+        pytest.skip("Postgres not available; set REGISTA_TEST_DSN to run")
     yield sub
     sub.close()
 
 
 @pytest.fixture
-def workflow_registered(substrate_instance: Substrate) -> None:
-    substrate_instance.register_workflow_file("workflows/cairn_agent_actions.yaml")
-
-
-@pytest.fixture
-def client(
-    dsn: str, project: str, hmac_keys: Path, workflow_registered: None
-) -> CairnClient:
+def client(dsn: str, project: str, hmac_keys: Path, workflow_registered: None) -> CairnClient:
     return CairnClient(
         dsn=dsn,
         project=project,

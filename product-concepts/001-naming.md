@@ -37,9 +37,9 @@ roughly grouped by mental model.
 - **provenant** — Invented (from *provenire*, the root of "provenance").
   Direct but coined-feeling.
 
-## Mental model: derived from substrate
+## Mental model: derived from regista
 
-- **stratum** — A layer of substrate; literal continuation of the metaphor.
+- **stratum** — A layer of regista; literal continuation of the metaphor.
   Slightly heavy.
 - **strata** — Plural. Same.
 

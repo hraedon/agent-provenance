@@ -2,19 +2,19 @@
 """Lightweight bridge for OpenCode skill integration.
 
 Receives tool calls from the OpenCode TypeScript plugin via stdin
-(JSON serialized), computes file digests, and writes substrate events.
+(JSON serialized), computes file digests, and writes regista events.
 
 Usage::
 
     echo '{"action":"begin", "tool":"Edit", ...}' \
-        | python3 -m cairn.bridge
+        | python3 -m cairn
     echo '{"action":"end", "work_item_id":"...", ...}' \
-        | python3 -m cairn.bridge
+        | python3 -m cairn
 
 Environment::
 
-    CAIRN_DSN            Postgres DSN for substrate
-    CAIRN_PROJECT        Substrate project name
+    CAIRN_DSN            Postgres DSN for regista
+    CAIRN_PROJECT        Regista project name
     CAIRN_KEY_PATH       Path to HMAC key file
     CAIRN_HARNESS_NAME   Harness name (default: opencode)
     CAIRN_HARNESS_VERSION Harness version (default: detected)
@@ -29,20 +29,20 @@ import logging
 import os
 import sys
 import uuid
+from typing import Any
 
-# Silence substrate/structlog logging before importing anything that uses it
+# Silence regista/structlog logging before importing anything that uses it
 logging.basicConfig(level=logging.CRITICAL)
 import structlog  # noqa: E402
 
-_null_fh = open("/dev/null", "w")
 structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(logging.CRITICAL),
     context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(file=_null_fh),
+    logger_factory=structlog.PrintLoggerFactory(),
     cache_logger_on_first_use=True,
 )
 
-from substrate import Substrate  # noqa: E402
+from regista import Regista  # noqa: E402
 
 from cairn import CairnAdapter, CairnConfig  # noqa: E402
 from cairn.schema import hash_payload  # noqa: E402
@@ -90,9 +90,12 @@ def main() -> None:
         sys.stderr.write(f"cairn_bridge: unknown action {action!r}\n")
         sys.exit(1)
 
-    session_id = msg.get("session_id") or str(uuid.uuid4())
+    session_id = msg.get("session_id")
+    if not session_id:
+        sys.stderr.write("cairn_bridge: session_id required for audit grouping\n")
+        sys.exit(1)
 
-    sub = Substrate(dsn=dsn, project=project, hmac_key_path=key_path)
+    sub = Regista(dsn=dsn, project=project, hmac_key_path=key_path)
     adapter = CairnAdapter(
         sub,
         config=CairnConfig(harness_name, harness_version),
@@ -122,13 +125,13 @@ def main() -> None:
 def _dispatch(
     adapter: CairnAdapter,
     action: str,
-    msg: dict,
+    msg: dict[str, Any],
     principal_id: str,
     harness_name: str,
     harness_version: str,
     session_id: str,
     files: list[str],
-) -> dict:
+) -> dict[str, Any]:
     if action == "attest_scope":
         event = adapter.attest_scope(
             principal_id=principal_id,

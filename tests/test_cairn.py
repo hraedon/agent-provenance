@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 import pytest
-from substrate import Substrate
+from regista import Regista
 
 from cairn import CairnAdapter, CairnConfig
 from cairn.schema import (
@@ -34,56 +34,30 @@ from cairn.verifier import (
 # ----------------------------------------------------------------------
 
 
-@pytest.fixture
-def hmac_keys(tmp_path: Path) -> Path:
-    """Create a minimal substrate HMAC key file."""
-    key_file = tmp_path / "keys.json"
-    key_file.write_text(
-        json.dumps(
-            {
-                "keys": [
-                    {
-                        "key_id": "cairn-test-001",
-                        "secret": "supersecret-test-key-32bytes!!",
-                        "status": "active",
-                        "alg": "HMAC-SHA256",
-                    }
-                ]
-            }
-        )
-    )
-    return key_file
-
-
 @pytest.fixture(scope="function")
-def substrate_instance(hmac_keys: Path, tmp_path: Path) -> Substrate:
-    """Create a fresh in-memory substrate for each test."""
+def regista_instance(hmac_keys: Path, tmp_path: Path) -> Regista:
+    """Create a fresh in-memory regista for each test."""
     dsn = os.environ.get(
-        "SUBSTRATE_TEST_DSN",
-        "postgresql://substrate_test:substrate_test@localhost/substrate_test",
+        "REGISTA_TEST_DSN",
+        "postgresql://regista_test:regista_test@localhost/regista_test",
     )
     project = f"cairn_test_{uuid.uuid4().hex[:8]}"
     try:
-        sub = Substrate.create_project(
+        sub = Regista.create_project(
             dsn=dsn,
             project=project,
             hmac_key_path=str(hmac_keys),
         )
     except Exception:
-        pytest.skip("Postgres not available; set SUBSTRATE_TEST_DSN to run")
+        pytest.skip("Postgres not available; set REGISTA_TEST_DSN to run")
     yield sub
     sub.close()
 
 
 @pytest.fixture
-def workflow_registered(substrate_instance: Substrate) -> None:
-    substrate_instance.register_workflow_file("workflows/cairn_agent_actions.yaml")
-
-
-@pytest.fixture
-def adapter(substrate_instance: Substrate, workflow_registered: None) -> CairnAdapter:
+def adapter(regista_instance: Regista, workflow_registered: None) -> CairnAdapter:
     return CairnAdapter(
-        substrate_instance,
+        regista_instance,
         config=CairnConfig("opencode", "0.1.0"),
         on_behalf_of={
             "principal_id": "human:test",
@@ -136,8 +110,8 @@ def test_scope_attestation_roundtrip() -> None:
 def test_verify_scope_attestation_in_report() -> None:
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     key_bytes = b"supersecret-test-key-32bytes!!"
     key_set = {"cairn-test-001": key_bytes}
@@ -276,8 +250,8 @@ def test_verify_single_signature(hmac_keys: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     ev_id = uuid.uuid4()
     wi_id = uuid.uuid4()
@@ -327,8 +301,8 @@ def test_verify_bad_key(hmac_keys: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     ev_id = uuid.uuid4()
     wi_id = uuid.uuid4()
@@ -386,8 +360,8 @@ def test_verify_bundle_file(hmac_keys: Path, tmp_path: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     ev_id = uuid.uuid4()
     wi_id = uuid.uuid4()
@@ -444,8 +418,8 @@ def test_verify_bundle_with_valid_hash(hmac_keys: Path, tmp_path: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     ev_id = uuid.uuid4()
     wi_id = uuid.uuid4()
@@ -504,8 +478,8 @@ def test_verify_bundle_tampered_hash(hmac_keys: Path, tmp_path: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     ev_id = uuid.uuid4()
     wi_id = uuid.uuid4()
@@ -571,8 +545,8 @@ def test_verify_events_sequence_ok(hmac_keys: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     wi_id = uuid.uuid4()
     now = datetime.now(UTC)
@@ -626,8 +600,8 @@ def test_verify_events_sequence_gap(hmac_keys: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     wi_id = uuid.uuid4()
     now = datetime.now(UTC)
@@ -725,8 +699,8 @@ def test_verify_bundle_chain_valid(hmac_keys: Path, tmp_path: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     def make_event(seq: int) -> Event:
         ev_id = uuid.uuid4()
@@ -798,8 +772,8 @@ def test_verify_bundle_chain_broken(hmac_keys: Path, tmp_path: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     def make_event(seq: int) -> Event:
         ev_id = uuid.uuid4()
@@ -928,8 +902,8 @@ def test_diff_bundles_identical(hmac_keys: Path, tmp_path: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     ev_id = uuid.uuid4()
     wi_id = uuid.uuid4()
@@ -986,8 +960,8 @@ def test_diff_bundles_new_event(hmac_keys: Path, tmp_path: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     def make_event(seq: int) -> Event:
         ev_id = uuid.uuid4()
@@ -1058,8 +1032,8 @@ def test_diff_bundles_scope_change(hmac_keys: Path, tmp_path: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     def make_scope_event(scope: str) -> Event:
         ev_id = uuid.uuid4()
@@ -1239,8 +1213,8 @@ def test_key_rotation_detected(hmac_keys: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     # Create a key rotation event signed by the predecessor key
     ev_id = uuid.uuid4()
@@ -1305,8 +1279,8 @@ def test_key_rotation_wrong_signer(hmac_keys: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     ev_id = uuid.uuid4()
     wi_id = uuid.uuid4()
@@ -1412,8 +1386,8 @@ def test_non_rotation_event_ignored(hmac_keys: Path) -> None:
 
     from datetime import UTC, datetime
 
-    from substrate._signing import sign_event
-    from substrate._types import Event
+    from regista._signing import sign_event
+    from regista._types import Event
 
     ev_id = uuid.uuid4()
     wi_id = uuid.uuid4()
@@ -1454,3 +1428,971 @@ def test_non_rotation_event_ignored(hmac_keys: Path) -> None:
     assert len(report.key_rotations) == 0
     assert report.key_rotation_failures == 0
     assert report.all_ok
+
+
+# ----------------------------------------------------------------------
+# Ed25519 signing tests
+# ----------------------------------------------------------------------
+
+
+def _make_ed25519_keypair() -> tuple[bytes, bytes]:
+    """Generate an Ed25519 keypair for testing. Returns (signing_key, verify_key)."""
+    pytest.importorskip("nacl.signing")
+    from nacl.signing import SigningKey
+
+    signing_key = SigningKey.generate()
+    verify_key = signing_key.verify_key
+    return bytes(signing_key), bytes(verify_key)
+
+
+def test_ed25519_signature_verifies() -> None:
+    """An Ed25519-signed event verifies with the public key."""
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    signing_key, verify_key = _make_ed25519_keypair()
+    key_set = {"ed25519-test-001": verify_key}
+
+    ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id="ed25519-test-001",
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Edit", "tool_args_hash": "sha256:abc"},
+        key=signing_key,
+        scheme=get_scheme("ed25519"),
+    )
+    event = Event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="ed25519-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Edit", "tool_args_hash": "sha256:abc"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+        scheme_id="ed25519",
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([event])
+    assert report.total_events == 1
+    assert report.ok == 1
+    assert report.all_ok
+    assert report.scheme_counts == {"ed25519": 1}
+
+
+def test_ed25519_wrong_key_fails() -> None:
+    """An Ed25519-signed event fails verification with a different public key."""
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    signing_key, _ = _make_ed25519_keypair()
+    _, wrong_verify_key = _make_ed25519_keypair()
+    key_set = {"ed25519-test-001": wrong_verify_key}
+
+    ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id="ed25519-test-001",
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        key=signing_key,
+        scheme=get_scheme("ed25519"),
+    )
+    event = Event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="ed25519-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+        scheme_id="ed25519",
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([event])
+    assert report.signature_failed == 1
+    assert not report.all_ok
+
+
+def test_mixed_hmac_ed25519_bundle() -> None:
+    """A bundle with both HMAC and Ed25519 events verifies correctly."""
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    hmac_key = b"hmac-test-key-32bytes-long-enough"
+    signing_key, verify_key = _make_ed25519_keypair()
+    key_set = {
+        "hmac-key-001": hmac_key,
+        "ed25519-key-001": verify_key,
+    }
+
+    now = datetime.now(UTC)
+
+    # HMAC event
+    hmac_ev_id = uuid.uuid4()
+    hmac_sig, hmac_chash, hmac_env = sign_event(
+        event_id=hmac_ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="hmac-key-001",
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        key=hmac_key,
+    )
+    hmac_event = Event(
+        event_id=hmac_ev_id,
+        work_item_id=uuid.uuid4(),
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="hmac-key-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        payload_canonical_hash=hmac_chash,
+        signature=hmac_sig,
+        canonical_envelope=hmac_env,
+        scheme_id="hmac-sha256",
+    )
+
+    # Ed25519 event
+    ed_ev_id = uuid.uuid4()
+    ed_sig, ed_chash, ed_env = sign_event(
+        event_id=ed_ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-2",
+        key_id="ed25519-key-001",
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        key=signing_key,
+        scheme=get_scheme("ed25519"),
+    )
+    ed_event = Event(
+        event_id=ed_ev_id,
+        work_item_id=uuid.uuid4(),
+        event_seq=0,
+        actor_id="agent-2",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="ed25519-key-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        payload_canonical_hash=ed_chash,
+        signature=ed_sig,
+        canonical_envelope=ed_env,
+        scheme_id="ed25519",
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([hmac_event, ed_event])
+    assert report.total_events == 2
+    assert report.ok == 2
+    assert report.all_ok
+    assert report.scheme_counts == {"hmac-sha256": 1, "ed25519": 1}
+
+    # Report text should mention both schemes
+    text = Verifier.format_report(report)
+    assert "hmac-sha256" in text
+    assert "ed25519" in text
+    assert "Ed25519 (asymmetric) signatures were found" in text
+
+
+# ----------------------------------------------------------------------
+# Delegation chain validation tests
+# ----------------------------------------------------------------------
+
+
+def test_delegation_chain_valid(hmac_keys: Path) -> None:
+    """A valid on_behalf_of delegation chain passes validation."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    delegation = {
+        "principal_id": "human:alice",
+        "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "authenticated_at": now.isoformat(),
+        "scope": ["read", "write"],
+    }
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        key=key_bytes,
+        on_behalf_of=delegation,
+    )
+    event = Event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+        on_behalf_of=delegation,
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([event])
+    assert len(report.delegation_chains) == 1
+    dc = report.delegation_chains[0]
+    assert dc.principal_id == "human:alice"
+    assert dc.session_id == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    assert dc.validation_ok is True
+    assert dc.validation_detail is None
+    assert report.all_ok
+
+
+def test_delegation_chain_expired(hmac_keys: Path) -> None:
+    """An expired delegation chain is detected as invalid."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime, timedelta
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    # expires_at is in the past
+    expired = (now - timedelta(hours=1)).isoformat()
+    delegation = {
+        "principal_id": "human:bob",
+        "expires_at": expired,
+    }
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        key=key_bytes,
+        on_behalf_of=delegation,
+    )
+    event = Event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+        on_behalf_of=delegation,
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([event])
+    assert len(report.delegation_chains) == 1
+    dc = report.delegation_chains[0]
+    assert dc.principal_id == "human:bob"
+    assert dc.validation_ok is False
+    assert dc.validation_detail is not None
+    assert (
+        "expired" in dc.validation_detail.lower()
+        or "DELEGATION_CHAIN_EXPIRED" in dc.validation_detail
+    )
+    assert report.delegation_chain_failures == 1
+    assert not report.all_ok
+
+
+def test_no_delegation_chain(hmac_keys: Path) -> None:
+    """Events without on_behalf_of produce no delegation chain entries."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+    event = Event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([event])
+    assert len(report.delegation_chains) == 0
+    assert report.all_ok
+
+
+# ----------------------------------------------------------------------
+# Scheme count tests
+# ----------------------------------------------------------------------
+
+
+def test_scheme_counts_in_report(hmac_keys: Path) -> None:
+    """Scheme counts are tracked in the report."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    now = datetime.now(UTC)
+    events = []
+    for i in range(3):
+        ev_id = uuid.uuid4()
+        sig, c_hash, env = sign_event(
+            event_id=ev_id,
+            work_item_id=uuid.uuid4(),
+            actor_id="agent-1",
+            key_id="cairn-test-001",
+            event_seq=i,
+            workflow_name="cairn_agent_actions",
+            workflow_version=1,
+            timestamp=now,
+            transition="tool_call_begin",
+            payload={"tool": "Read"},
+            key=key_bytes,
+        )
+        events.append(
+            Event(
+                event_id=ev_id,
+                work_item_id=uuid.uuid4(),
+                event_seq=i,
+                actor_id="agent-1",
+                actor_kind="agent",
+                actor_metadata=None,
+                key_id="cairn-test-001",
+                workflow_name="cairn_agent_actions",
+                workflow_version=1,
+                timestamp=now,
+                transition="tool_call_begin",
+                payload={"tool": "Read"},
+                payload_canonical_hash=c_hash,
+                signature=sig,
+                canonical_envelope=env,
+                scheme_id="hmac-sha256",
+            )
+        )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events(events)
+    assert report.scheme_counts == {"hmac-sha256": 3}
+    assert report.all_ok
+
+
+def test_verify_bundle_with_timestamp_batches(tmp_path: Path) -> None:
+    """Verifier populates timestamp_batches from bundle and logs uncovered events."""
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+    ev = Event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    ts_batch_id = str(uuid.uuid4())
+    manifest: dict = {"events_count": 1}
+    bundle: dict = {
+        "manifest": manifest,
+        "events": [ev.to_dict()],
+        "timestamp_batches": [
+            {
+                "batch_id": ts_batch_id,
+                "event_ids": [str(ev_id)],
+                "merkle_root": "a" * 64,
+                "status": "confirmed",
+                "tsa_timestamp": now.isoformat(),
+            }
+        ],
+    }
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    manifest["bundle_hash"] = digest
+
+    bundle_path = tmp_path / "bundle_ts.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+    assert report.all_ok
+    assert len(report.timestamp_batches) == 1
+    assert report.timestamp_batches[0].batch_id == ts_batch_id
+    assert report.timestamp_batches[0].status == "confirmed"
+    assert report.timestamp_batches[0].event_count == 1
+
+
+def test_verify_bundle_without_timestamp_batches(tmp_path: Path) -> None:
+    """Verifier handles bundles without timestamp_batches gracefully."""
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+    ev = Event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    manifest: dict = {"events_count": 1}
+    bundle: dict = {"manifest": manifest, "events": [ev.to_dict()]}
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    manifest["bundle_hash"] = digest
+
+    bundle_path = tmp_path / "bundle_no_ts.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+    assert report.all_ok
+    assert report.timestamp_batches == []
+
+
+def get_scheme(scheme_id: str):
+    from regista._signing_scheme import get_scheme as _get_scheme
+
+    return _get_scheme(scheme_id)
+
+
+# ----------------------------------------------------------------------
+# Tests for new verifier enforcement (v1 spec items 3, 4, 6, 8)
+# ----------------------------------------------------------------------
+
+
+def _make_signed_event(
+    key_bytes: bytes,
+    key_id: str = "cairn-test-001",
+    event_seq: int = 0,
+    transition: str = "tool_call_begin",
+    payload: dict | None = None,
+    timestamp=None,
+    work_item_id=None,
+):
+    """Helper to create a signed event for verifier tests."""
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    ev_id = uuid.uuid4()
+    wi_id = work_item_id or uuid.uuid4()
+    now = timestamp or datetime.now(UTC)
+    payload = payload or {"tool": "Read"}
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id=key_id,
+        event_seq=event_seq,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition=transition,
+        payload=payload,
+        key=key_bytes,
+    )
+    return Event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        event_seq=event_seq,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id=key_id,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition=transition,
+        payload=payload,
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+
+def test_scope_coverage_no_violation(hmac_keys: Path) -> None:
+    """Tool call with matching scope attestation passes."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    wi_id = uuid.uuid4()
+
+    # Scope attestation event (predates tool call)
+    scope_ev = _make_signed_event(
+        key_bytes,
+        event_seq=0,
+        transition="scope_statement",
+        payload={
+            "harnesses": [{"name": "claude-code"}],
+            "scope_statement": "full access",
+            "version": "1",
+            "principal_id": "test-user",
+            "attested_at": now.isoformat(),
+        },
+        timestamp=now,
+        work_item_id=wi_id,
+    )
+
+    # Tool call event (covered by scope)
+    tool_ev = _make_signed_event(
+        key_bytes,
+        event_seq=1,
+        transition="tool_call_begin",
+        payload={"tool": "Read", "harness": "claude-code"},
+        timestamp=now,
+        work_item_id=wi_id,
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([scope_ev, tool_ev])
+    assert len(report.scope_violations) == 0
+    assert report.all_ok
+
+
+def test_scope_coverage_violation(hmac_keys: Path) -> None:
+    """Tool call from harness not in scope is flagged."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    wi_id = uuid.uuid4()
+
+    # Scope attestation for claude-code only
+    scope_ev = _make_signed_event(
+        key_bytes,
+        event_seq=0,
+        transition="scope_statement",
+        payload={
+            "harnesses": [{"name": "claude-code"}],
+            "scope_statement": "limited",
+            "version": "1",
+            "principal_id": "test-user",
+            "attested_at": now.isoformat(),
+        },
+        timestamp=now,
+        work_item_id=wi_id,
+    )
+
+    # Tool call from an unscoped harness
+    tool_ev = _make_signed_event(
+        key_bytes,
+        event_seq=1,
+        transition="tool_call_begin",
+        payload={"tool": "Write", "harness": "opencode"},
+        timestamp=now,
+        work_item_id=wi_id,
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([scope_ev, tool_ev])
+    assert len(report.scope_violations) == 1
+    assert report.scope_violations[0].harness == "opencode"
+    assert "not in active scope" in report.scope_violations[0].detail
+    assert not report.all_ok
+
+
+def test_scope_coverage_no_attestation(hmac_keys: Path) -> None:
+    """Tool call with no scope attestation at all is flagged."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    tool_ev = _make_signed_event(
+        key_bytes,
+        transition="tool_call_begin",
+        payload={"tool": "Read", "harness": "claude-code"},
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([tool_ev])
+    assert len(report.scope_violations) == 1
+    assert "No scope attestation" in report.scope_violations[0].detail
+
+
+def test_key_revocation_event_detected(hmac_keys: Path) -> None:
+    """key_revocation events are collected in the report."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    rev_ev = _make_signed_event(
+        key_bytes,
+        transition="tool_call_begin",
+        payload={
+            "tool": "key_revocation",
+            "revoked_key_id": "some-key",
+            "revoked_at": "2026-05-27T00:00:00Z",
+        },
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([rev_ev])
+    assert len(report.key_revocations) == 1
+    assert report.key_revocations[0].key_id == "some-key"
+
+
+def test_key_revocation_post_revocation_flagged(hmac_keys: Path) -> None:
+    """Events signed after key revocation are flagged."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_id = key_data["keys"][0]["key_id"]
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+
+    from datetime import UTC, datetime
+
+    before_revocation = datetime(2026, 1, 1, tzinfo=UTC)
+    after_revocation = datetime(2026, 6, 1, tzinfo=UTC)
+
+    # Key is revoked at 2026-03-01
+    key_set = {key_id: key_bytes}
+    key_meta = {key_id: {"role": "actor", "revoked_at": "2026-03-01T00:00:00Z"}}
+
+    # Event signed before revocation — OK
+    ev_before = _make_signed_event(
+        key_bytes,
+        key_id=key_id,
+        event_seq=0,
+        timestamp=before_revocation,
+    )
+
+    # Event signed after revocation — should be flagged
+    ev_after = _make_signed_event(
+        key_bytes,
+        key_id=key_id,
+        event_seq=1,
+        timestamp=after_revocation,
+    )
+
+    verifier = Verifier(key_set, key_metadata=key_meta)
+    report = verifier.verify_events([ev_before, ev_after])
+    # Should have 2 entries: 1 for the key_revocation tool detection (none here)
+    # + 1 for the post-revocation event
+    violations = [kr for kr in report.key_revocations if kr.detail is not None]
+    assert len(violations) == 1
+    assert violations[0].event_id == str(ev_after.event_id)
+
+
+def test_temporal_ordering_authenticated_after_event(hmac_keys: Path) -> None:
+    """authenticated_at after event.timestamp is flagged."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    ev_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    auth_time = "2026-01-01T13:00:00Z"  # 1 hour AFTER event
+
+    ev = _make_signed_event(
+        key_bytes,
+        timestamp=ev_time,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+    )
+    # Inject on_behalf_of with authenticated_at after event time
+    ev = replace(ev, on_behalf_of={
+        "principal_id": "test-user",
+        "authenticated_at": auth_time,
+    })
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([ev])
+    tvs = [t for t in report.temporal_violations if t.kind == "authenticated_after_event"]
+    assert len(tvs) == 1
+    assert "authenticated_at" in tvs[0].detail
+
+
+def test_role_gate_actor_signs_auditor_transition(hmac_keys: Path) -> None:
+    """Actor key signing an auditor-only transition is flagged."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_id = key_data["keys"][0]["key_id"]
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_id: key_bytes}
+    key_meta = {key_id: {"role": "actor"}}
+
+    ev = _make_signed_event(
+        key_bytes,
+        key_id=key_id,
+        transition="auditor_attestation",
+        payload={"verdict": "passed"},
+    )
+
+    verifier = Verifier(key_set, key_metadata=key_meta)
+    report = verifier.verify_events([ev])
+    assert len(report.role_gate_violations) == 1
+    assert report.role_gate_violations[0].role == "actor"
+    assert "auditor" in report.role_gate_violations[0].detail
+
+
+def test_role_gate_auditor_signs_actor_transition(hmac_keys: Path) -> None:
+    """Auditor key signing an actor-only transition is flagged."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_id = key_data["keys"][0]["key_id"]
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_id: key_bytes}
+    key_meta = {key_id: {"role": "auditor"}}
+
+    ev = _make_signed_event(
+        key_bytes,
+        key_id=key_id,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+    )
+
+    verifier = Verifier(key_set, key_metadata=key_meta)
+    report = verifier.verify_events([ev])
+    assert len(report.role_gate_violations) == 1
+    assert report.role_gate_violations[0].role == "auditor"
+    assert "actor" in report.role_gate_violations[0].detail
+
+
+def test_role_gate_no_metadata_no_violation(hmac_keys: Path) -> None:
+    """Without key_metadata, role gate is skipped (backward-compatible)."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_id = key_data["keys"][0]["key_id"]
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_id: key_bytes}
+
+    ev = _make_signed_event(
+        key_bytes,
+        key_id=key_id,
+        transition="auditor_attestation",
+        payload={"verdict": "passed"},
+    )
+
+    # No key_metadata — role gate should not fire
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([ev])
+    assert len(report.role_gate_violations) == 0
+
+
+def test_role_gate_matching_role_no_violation(hmac_keys: Path) -> None:
+    """Actor signing actor-transition and auditor signing auditor-transition is OK."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_id = key_data["keys"][0]["key_id"]
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_id: key_bytes}
+    key_meta = {key_id: {"role": "actor"}}
+
+    ev = _make_signed_event(
+        key_bytes,
+        key_id=key_id,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+    )
+
+    verifier = Verifier(key_set, key_metadata=key_meta)
+    report = verifier.verify_events([ev])
+    assert len(report.role_gate_violations) == 0
+
+
+def test_all_ok_includes_new_checks(hmac_keys: Path) -> None:
+    """all_ok returns False when any new violation type is present."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_id = key_data["keys"][0]["key_id"]
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_id: key_bytes}
+    key_meta = {key_id: {"role": "actor"}}
+
+    # Auditor signing actor transition — role violation
+    ev = _make_signed_event(
+        key_bytes,
+        key_id=key_id,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+    )
+
+    verifier = Verifier(key_set, key_metadata={key_id: {"role": "auditor"}})
+    report = verifier.verify_events([ev])
+    assert not report.all_ok
+    assert len(report.role_gate_violations) == 1

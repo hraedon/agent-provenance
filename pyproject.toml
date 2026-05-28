@@ -20,7 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "substrate @ file:///projects/substrate",
+    "regista>=0.4.0",
     "rfc8785>=0.1.4",
     "structlog>=24.1",
     "click>=8.1",

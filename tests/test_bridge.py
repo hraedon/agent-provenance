@@ -101,7 +101,7 @@ def test_unknown_action_exits_1(_valid_env: Path, capsys: pytest.CaptureFixture[
 
 
 # ----------------------------------------------------------------------
-# Action tests (mocked substrate / adapter)
+# Action tests (mocked regista / adapter)
 # ----------------------------------------------------------------------
 
 
@@ -119,11 +119,11 @@ def _make_mock_event(event_id: uuid.UUID | None = None) -> MagicMock:
     return ev
 
 
-@patch("cairn._bridge.Substrate")
+@patch("cairn._bridge.Regista")
 @patch("cairn._bridge.CairnAdapter")
 def test_attest_scope(
     mock_adapter_cls: Any,
-    mock_substrate_cls: Any,
+    mock_regista_cls: Any,
     _valid_env: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -136,6 +136,7 @@ def test_attest_scope(
                 "action": "attest_scope",
                 "harnesses": [{"name": "opencode", "version": "0.2.0"}],
                 "scope_statement": "In scope: opencode test.",
+                "session_id": "test-session",
             }
         ),
         capsys=capsys,
@@ -147,11 +148,11 @@ def test_attest_scope(
     adapter.attest_scope.assert_called_once()
 
 
-@patch("cairn._bridge.Substrate")
+@patch("cairn._bridge.Regista")
 @patch("cairn._bridge.CairnAdapter")
 def test_begin(
     mock_adapter_cls: Any,
-    mock_substrate_cls: Any,
+    mock_regista_cls: Any,
     _valid_env: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -159,7 +160,14 @@ def test_begin(
     mock_adapter_cls.return_value.begin_tool_call.return_value = _make_mock_wi(wi_id)
 
     rc, out, _err = _run_bridge(
-        json.dumps({"action": "begin", "tool": "Edit", "args": {"path": "/tmp/foo"}}),
+        json.dumps(
+            {
+                "action": "begin",
+                "tool": "Edit",
+                "args": {"path": "/tmp/foo"},
+                "session_id": "test-session",
+            }
+        ),
         capsys=capsys,
     )
     assert rc == 0
@@ -169,11 +177,11 @@ def test_begin(
     assert "sha256:" in data["args_hash"]
 
 
-@patch("cairn._bridge.Substrate")
+@patch("cairn._bridge.Regista")
 @patch("cairn._bridge.CairnAdapter")
 def test_end(
     mock_adapter_cls: Any,
-    mock_substrate_cls: Any,
+    mock_regista_cls: Any,
     _valid_env: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -186,6 +194,7 @@ def test_end(
                 "action": "end",
                 "work_item_id": str(ev_id),
                 "result_summary": {"exit_code": 0},
+                "session_id": "test-session",
             }
         ),
         capsys=capsys,
@@ -196,27 +205,33 @@ def test_end(
     assert data["event_id"] == str(ev_id)
 
 
-@patch("cairn._bridge.Substrate")
+@patch("cairn._bridge.Regista")
 @patch("cairn._bridge.CairnAdapter")
 def test_end_missing_work_item_id(
     mock_adapter_cls: Any,
-    mock_substrate_cls: Any,
+    mock_regista_cls: Any,
     _valid_env: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     rc, _out, err = _run_bridge(
-        json.dumps({"action": "end", "result_summary": {"exit_code": 0}}),
+        json.dumps(
+            {
+                "action": "end",
+                "result_summary": {"exit_code": 0},
+                "session_id": "test-session",
+            }
+        ),
         capsys=capsys,
     )
     assert rc == 1
     assert "work_item_id required" in err
 
 
-@patch("cairn._bridge.Substrate")
+@patch("cairn._bridge.Regista")
 @patch("cairn._bridge.CairnAdapter")
 def test_session_id_passthrough(
     mock_adapter_cls: Any,
-    mock_substrate_cls: Any,
+    mock_regista_cls: Any,
     _valid_env: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -243,25 +258,17 @@ def test_session_id_passthrough(
     assert on_behalf_of["session_id"] == explicit_session
 
 
-@patch("cairn._bridge.Substrate")
+@patch("cairn._bridge.Regista")
 @patch("cairn._bridge.CairnAdapter")
-def test_session_id_fallback_to_uuid(
+def test_session_id_required(
     mock_adapter_cls: Any,
-    mock_substrate_cls: Any,
+    mock_regista_cls: Any,
     _valid_env: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    wi_id = uuid.uuid4()
-    mock_adapter_cls.return_value.begin_tool_call.return_value = _make_mock_wi(wi_id)
-
-    rc, _out, _err = _run_bridge(
+    rc, _out, err = _run_bridge(
         json.dumps({"action": "begin", "tool": "Edit", "args": {"path": "/tmp/foo"}}),
         capsys=capsys,
     )
-    assert rc == 0
-
-    call_kwargs = mock_adapter_cls.call_args
-    on_behalf_of = call_kwargs.kwargs.get("on_behalf_of") or call_kwargs[1].get("on_behalf_of")
-    assert on_behalf_of is not None
-    assert len(on_behalf_of["session_id"]) == 36
-    uuid.UUID(on_behalf_of["session_id"])
+    assert rc == 1
+    assert "session_id required" in err

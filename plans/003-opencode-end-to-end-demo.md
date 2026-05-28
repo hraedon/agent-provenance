@@ -51,7 +51,7 @@ control narrative attached.
    3–5 file edits, exports, verifies, and produces a bundle the user
    can read top-to-bottom. The bundle is the deliverable.
 6. **First attested cross-project action.** Drive at least one
-   `agent-notes-mcp` CLI invocation through opencode during the
+   `agent-notes` CLI invocation through opencode during the
    dogfood session so the bundle shows attestation of a sibling
    project's tool. Validates the cross-project audit story.
 
@@ -59,11 +59,11 @@ control narrative attached.
 
 - Claude Code PreToolUse / PostToolUse hooks. Moves to Plan 004.
 - Cursor, Aider, SDK wrapper. Plan 005+.
-- Asymmetric signing (Ed25519). Tracked as substrate Plan 011
+- Asymmetric signing (Ed25519). Tracked as regista Plan 011
   dependency; verify report labels HMAC-only bundles with a working-
   hypothesis caveat.
-- RFC 3161 timestamping. Substrate Plan 012 dependency.
-- Delegation chain with real IdP. Substrate Plan 010 dependency.
+- RFC 3161 timestamping. Regista Plan 012 dependency.
+- Delegation chain with real IdP. Regista Plan 010 dependency.
   `principal_id` continues to stub from OS user.
 - Wake-event attestation (`agent-wake` integration). Becomes a real
   plan once agent-wake has a stable signal source the bridge can
@@ -102,20 +102,20 @@ the source, and embeds:
   "manifest": {
     "control_description": "...verbatim text...",
     "control_description_source_digest": "sha256:...",
-    "trust_model_caveat": "HMAC-SHA256 only; Ed25519 + RFC 3161 + witness federation are tracked as substrate Plan 011/012/013 dependencies. FIM-class positioning is a working hypothesis (README §4.1), not auditor-validated."
+    "trust_model_caveat": "HMAC-SHA256 only; Ed25519 + RFC 3161 + witness federation are tracked as regista Plan 011/012/013 dependencies. FIM-class positioning is a working hypothesis (README §4.1), not auditor-validated."
   }
 }
 ```
 
-The caveat string is mandatory until substrate plans 011/012 land and
+The caveat string is mandatory until regista plans 011/012 land and
 until the auditor-validation open question (README §9) is closed.
 
-### Cross-project attestation: agent-notes-mcp CLI
+### Cross-project attestation: agent-notes CLI
 
 Plan 003 demo includes at least one tool call where opencode invokes
 the `agent-notes` CLI (filing a breadcrumb, listing notes). This
 confirms the bundle attests actions across the project boundary and
-gives `agent-notes-mcp`'s CLI refactor a concrete first integration
+gives `agent-notes`'s CLI refactor a concrete first integration
 consumer.
 
 ## Work items
@@ -142,7 +142,7 @@ consumer.
 - `pipx install .` from a clean shell produces a working `cairn`
   command.
 - `pytest tests/` passes, including new bridge tests.
-- An opencode session with the plugin loaded produces substrate
+- An opencode session with the plugin loaded produces regista
   events for every tool call in that session.
 - `cairn export` produces a bundle containing the control
   description and the trust-model caveat.
@@ -168,13 +168,13 @@ consumer.
 
 ## Cross-project dependencies
 
-- **substrate**: HMAC signing (have); Plan 010 delegation chain,
+- **regista**: HMAC signing (have); Plan 010 delegation chain,
   Plan 011 Ed25519 signing, Plan 012 RFC 3161 timestamping all
   drafted RFCs and *not blocking this plan* — they upgrade the
-  bundle's guarantees when they land. Track as substrate breadcrumbs
+  bundle's guarantees when they land. Track as regista breadcrumbs
   if not already filed: operator-forgery defense (witness federation)
   is BC-TBD.
-- **agent-notes-mcp**: this plan is the first downstream consumer of
+- **agent-notes**: this plan is the first downstream consumer of
   the CLI refactor. Need at least one CLI subcommand stable enough
   for opencode to invoke. Coordinate timing.
 - **agent-wake**: out of scope for this plan. Open future-work plan
@@ -184,7 +184,7 @@ consumer.
 ## Open questions
 
 - Does the bundle's `control_description` need to be a separate
-  signed substrate event (parallel to the scope attestation in
+  signed regista event (parallel to the scope attestation in
   Plan 001) rather than just a manifest field? Lean yes — it's
   the same "load-bearing claim must be a signed event" pattern
   README §2 already establishes. If yes, lift into WI-5 scope

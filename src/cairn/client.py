@@ -1,7 +1,7 @@
 """High-level SDK for Cairn provenance logging.
 
 Provides :class:`CairnClient`, the recommended entry point for Python
-applications that want to log agent tool calls to substrate.
+applications that want to log agent tool calls to regista.
 
 Usage::
 
@@ -81,7 +81,9 @@ class ToolCallContext:
         if self._ended:
             return None
         self._ended = True
-        return self._client._adapter.end_tool_call(
+        if self._client._closed:
+            return None
+        return self._client._ensure_connected().end_tool_call(
             self.work_item_id,
             result_summary=self._result_summary,
             files=self.files,
@@ -100,12 +102,12 @@ class ToolCallContext:
 class CairnClient:
     """High-level client for Cairn provenance logging.
 
-    Handles substrate connection lifecycle, session management, and
+    Handles regista connection lifecycle, session management, and
     provides a clean API for logging agent tool calls.
 
     Args:
-        dsn: Postgres DSN for substrate.
-        project: Substrate project name.
+        dsn: Postgres DSN for regista.
+        project: Regista project name.
         key_path: Path to HMAC key file.
         harness_name: Name of the agent harness (e.g. ``"opencode"``).
         harness_version: Version of the agent harness.
@@ -113,9 +115,9 @@ class CairnClient:
         session_id: Session identifier for grouping events.  Defaults
             to a random UUID.
         config_digest: SHA-256 of the harness configuration file.
-        actor_id: Actor identifier for substrate events.
+        actor_id: Actor identifier for regista events.
         actor_kind: Actor kind (``"agent"``, ``"human"``, ``"system"``).
-        workflow_name: Substrate workflow name.
+        workflow_name: Regista workflow name.
 
     Example::
 
@@ -158,7 +160,7 @@ class CairnClient:
         self._closed = False
 
         # Lazy-initialized
-        self._substrate: Any = None
+        self._regista: Any = None
         self._adapter: CairnAdapter | None = None
         self._config = CairnConfig(
             harness_name=harness_name,
@@ -183,19 +185,19 @@ class CairnClient:
             return f"human:{getpass.getuser()}"
 
     def _ensure_connected(self) -> CairnAdapter:
-        """Lazily connect to substrate and create the adapter."""
+        """Lazily connect to regista and create the adapter."""
         if self._adapter is not None:
             return self._adapter
 
-        from substrate import Substrate
+        from regista import Regista
 
-        self._substrate = Substrate(
+        self._regista = Regista(
             dsn=self._dsn,
             project=self._project,
             hmac_key_path=self._key_path,
         )
         self._adapter = CairnAdapter(
-            self._substrate,
+            self._regista,
             config=self._config,
             on_behalf_of={
                 "principal_id": self._principal_id,
@@ -237,13 +239,11 @@ class CairnClient:
             harness_config_digests: Map of harness name to config digest.
 
         Returns:
-            The substrate event recording the attestation.
+            The regista event recording the attestation.
         """
         adapter = self._ensure_connected()
         if harnesses is None:
-            harnesses = [
-                {"name": self._harness_name, "version": self._harness_version}
-            ]
+            harnesses = [{"name": self._harness_name, "version": self._harness_version}]
         if scope_statement is None:
             scope_statement = f"In scope: {self._harness_name}."
         return adapter.attest_scope(
@@ -306,7 +306,7 @@ class CairnClient:
             error: Error message (marks the call as failed).
 
         Returns:
-            The substrate event recording the completion.
+            The regista event recording the completion.
         """
         if error:
             tc.set_error(error)
@@ -355,13 +355,13 @@ class CairnClient:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Close the substrate connection."""
+        """Close the regista connection."""
         if self._closed:
             return
         self._closed = True
-        if self._substrate is not None:
-            self._substrate.close()
-            self._substrate = None
+        if self._regista is not None:
+            self._regista.close()
+            self._regista = None
             self._adapter = None
 
     def __enter__(self) -> CairnClient:
@@ -371,4 +371,9 @@ class CairnClient:
         self.close()
 
     def __del__(self) -> None:
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            # During Python shutdown, imports may fail (e.g. structlog
+            # accessing sys.meta_path when it's None).  Silently ignore.
+            pass
