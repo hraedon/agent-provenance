@@ -3,7 +3,7 @@ import { $ } from "bun";
 
 /**
  * Cairn provenance plugin — wraps the Python bridge script to log every
- * tool call to substrate.
+ * tool call to regista.
  *
  * Installation:
  *   1. Ensure `cairn` Python package is installed and `cairn-bridge` is in PATH
@@ -16,7 +16,7 @@ import { $ } from "bun";
  *        "plugins": ["cairn-plugin"]
  *
  * Architecture:
- *   The plugin is a thin TypeScript wrapper.  All heavy lifting (substrate
+ *   The plugin is a thin TypeScript wrapper.  All heavy lifting (regista
  *   connection, event signing, file digest computation) lives in the Python
  *   `cairn_bridge.py` script that ships with the `cairn` Python package.
  *   This keeps Cairn the single source of truth and avoids duplicating logic

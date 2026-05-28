@@ -3,7 +3,7 @@ import { writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
-// Prepare substrate key file
+// Prepare regista key file
 const tmpDir = tmpdir();
 const keyFile = join(tmpDir, "cairn_test_keys.json");
 writeFileSync(

@@ -1,7 +1,7 @@
 {
   "name": "cairn-plugin",
   "version": "0.1.0",
-  "description": "Cairn provenance plugin for OpenCode — logs tool calls to substrate via the Python bridge",
+  "description": "Cairn provenance plugin for OpenCode — logs tool calls to regista via the Python bridge",
   "main": "index.js",
   "type": "module",
   "peerDependencies": {
