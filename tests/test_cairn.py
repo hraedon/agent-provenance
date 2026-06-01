@@ -2050,6 +2050,7 @@ def _make_signed_event(
     payload: dict | None = None,
     timestamp=None,
     work_item_id=None,
+    on_behalf_of: dict | None = None,
 ):
     """Helper to create a signed event for verifier tests."""
     from datetime import UTC, datetime
@@ -2073,6 +2074,7 @@ def _make_signed_event(
         transition=transition,
         payload=payload,
         key=key_bytes,
+        on_behalf_of=on_behalf_of,
     )
     return Event(
         event_id=ev_id,
@@ -2090,6 +2092,7 @@ def _make_signed_event(
         payload_canonical_hash=c_hash,
         signature=sig,
         canonical_envelope=env,
+        on_behalf_of=on_behalf_of,
     )
 
 
@@ -2120,7 +2123,8 @@ def test_scope_coverage_no_violation(hmac_keys: Path) -> None:
         work_item_id=wi_id,
     )
 
-    # Tool call event (covered by scope)
+    # Tool call event (covered by scope); BC-013 requires a principal binding
+    # that matches the active scope attestation's principal ("test-user").
     tool_ev = _make_signed_event(
         key_bytes,
         event_seq=1,
@@ -2128,11 +2132,13 @@ def test_scope_coverage_no_violation(hmac_keys: Path) -> None:
         payload={"tool": "Read", "harness": "claude-code"},
         timestamp=now,
         work_item_id=wi_id,
+        on_behalf_of={"principal_id": "test-user"},
     )
 
     verifier = Verifier(key_set)
     report = verifier.verify_events([scope_ev, tool_ev])
     assert len(report.scope_violations) == 0
+    assert len(report.principal_binding_violations) == 0
     assert report.all_ok
 
 
@@ -2570,13 +2576,19 @@ def test_verifier_timestamp_signature_verification(tmp_path: Path) -> None:
     key_bytes = b"supersecret-test-key-32bytes!!"
     key_set = {"cairn-test-001": key_bytes}
 
-    # Generate TSA cert and build a signed token
+    # Generate TSA cert
     cert_pem, tsa_key = _generate_test_cert()
     cert_der = cert_pem.public_bytes(serialization.Encoding.DER)
     cert_asn1 = asn1_x509.Certificate.load(cert_der)
 
-    merkle_root_hex = "aa" * 32
-    merkle_root = bytes.fromhex(merkle_root_hex)
+    # BC-015: the TSA token must be signed over the Merkle root recomputed
+    # from the bundle's actual events (the event UUIDs the batch covers), not
+    # an arbitrary root.  Compute that root the same way regista does.
+    from regista._timestamping import compute_merkle_root
+
+    ev_id = uuid.uuid4()
+    merkle_root = compute_merkle_root([ev_id])
+    merkle_root_hex = merkle_root.hex()
     token = _build_signed_tsa_token(merkle_root, cert_asn1, tsa_key)
     token_hex = token.hex()
 
@@ -2585,7 +2597,6 @@ def test_verifier_timestamp_signature_verification(tmp_path: Path) -> None:
     anchor_path.write_bytes(cert_pem.public_bytes(serialization.Encoding.PEM))
 
     # Build a signed event
-    ev_id = uuid.uuid4()
     now = datetime.datetime.now(datetime.UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
@@ -2756,3 +2767,510 @@ def test_witness_coverage_check(tmp_path: Path) -> None:
     report2 = verifier.verify_bundle(bundle_path)
     assert report2.all_ok
     assert len(report2.witness_coverage_violations) == 0
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the four enforcement fixes (BC-010, BC-013, BC-015,
+# BC-017).  Each test demonstrates that the corresponding attack is now CAUGHT
+# (report turns red / cairn verify exits non-zero), not merely displayed.
+# ---------------------------------------------------------------------------
+
+
+def _make_chained_event(
+    key_bytes: bytes,
+    *,
+    work_item_id,
+    event_seq: int,
+    global_seq: int,
+    prev_event_hash: bytes | None,
+    key_id: str = "cairn-test-001",
+    transition: str = "tool_call_begin",
+    payload: dict | None = None,
+    timestamp=None,
+):
+    """Build a v3-chained signed event the way regista's event store does.
+
+    ``prev_event_hash`` is sha256(prev.canonical_envelope + prev.signature) of
+    the event at (work_item_id, event_seq - 1); callers pass it through from the
+    previous event's ``_chain_hash`` (returned below).
+    """
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    ev_id = uuid.uuid4()
+    now = timestamp or datetime.now(UTC)
+    payload = payload if payload is not None else {"tool": "Read"}
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=work_item_id,
+        actor_id="agent-1",
+        key_id=key_id,
+        event_seq=event_seq,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition=transition,
+        payload=payload,
+        key=key_bytes,
+        prev_event_hash=prev_event_hash,
+        global_seq=global_seq,
+    )
+    ev = Event(
+        event_id=ev_id,
+        work_item_id=work_item_id,
+        event_seq=event_seq,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id=key_id,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition=transition,
+        payload=payload,
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+        prev_event_hash=prev_event_hash,
+        global_seq=global_seq,
+    )
+    chain_hash = hashlib.sha256(bytes(env) + bytes(sig)).digest()
+    return ev, chain_hash
+
+
+def test_bc010_deleted_work_item_caught(hmac_keys: Path) -> None:
+    """BC-010: deleting a single-event work item leaves a global_seq gap that
+    is now detected (previously the <2-events skip + no global_seq check made
+    the deletion invisible)."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    wi_a = uuid.uuid4()
+    wi_b = uuid.uuid4()
+    wi_c = uuid.uuid4()
+
+    # Three single-event work items at global_seq 1, 2, 3.
+    ev_a, _ = _make_chained_event(
+        key_bytes, work_item_id=wi_a, event_seq=1, global_seq=1, prev_event_hash=None
+    )
+    _ev_b, _ = _make_chained_event(
+        key_bytes, work_item_id=wi_b, event_seq=1, global_seq=2, prev_event_hash=None
+    )
+    ev_c, _ = _make_chained_event(
+        key_bytes, work_item_id=wi_c, event_seq=1, global_seq=3, prev_event_hash=None
+    )
+
+    # Operator deletes the middle work item (global_seq 2) entirely.
+    surviving = [ev_a, ev_c]
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events(surviving)
+
+    # Every surviving signature still verifies...
+    assert report.signature_failed == 0
+    # ...but the global_seq gap is now caught.
+    gaps = [v for v in report.chain_contiguity_violations if v.kind == "global_seq_gap"]
+    assert len(gaps) == 1
+    assert not report.all_ok
+
+
+def test_bc010_prev_hash_splice_caught(hmac_keys: Path) -> None:
+    """BC-010: substituting (splicing) the predecessor of a chained event is
+    caught by the prev_event_hash contiguity walk."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    wi = uuid.uuid4()
+    ev0, h0 = _make_chained_event(
+        key_bytes, work_item_id=wi, event_seq=1, global_seq=1, prev_event_hash=None,
+        payload={"tool": "Read", "path": "/etc/passwd"},
+    )
+    ev1, _ = _make_chained_event(
+        key_bytes, work_item_id=wi, event_seq=2, global_seq=2, prev_event_hash=h0,
+        payload={"tool": "Write"},
+    )
+
+    # Sanity: the genuine pair verifies clean.
+    ok_report = Verifier(key_set).verify_events([ev0, ev1])
+    assert not ok_report.chain_contiguity_violations
+
+    # Operator splices a different event in at seq 1 (same wi/seq, signed, but
+    # different content) — ev1.prev_event_hash no longer matches.
+    forged0, _ = _make_chained_event(
+        key_bytes, work_item_id=wi, event_seq=1, global_seq=1, prev_event_hash=None,
+        payload={"tool": "Read", "path": "/innocent"},
+    )
+
+    report = Verifier(key_set).verify_events([forged0, ev1])
+    assert report.signature_failed == 0  # forged event is validly signed
+    mism = [v for v in report.chain_contiguity_violations if v.kind == "prev_hash_mismatch"]
+    assert len(mism) == 1
+    assert not report.all_ok
+
+
+def test_bc010_v2_downgrade_refused(hmac_keys: Path) -> None:
+    """BC-010: a v3-chained event (carries global_seq) presented without its
+    prev_event_hash is rejected as a downgrade."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from dataclasses import replace
+
+    wi = uuid.uuid4()
+    ev0, h0 = _make_chained_event(
+        key_bytes, work_item_id=wi, event_seq=1, global_seq=1, prev_event_hash=None
+    )
+    ev1, _ = _make_chained_event(
+        key_bytes, work_item_id=wi, event_seq=2, global_seq=2, prev_event_hash=h0
+    )
+
+    # Strip the chain field from ev1 (downgrade attempt) while keeping global_seq.
+    downgraded = replace(ev1, prev_event_hash=None)
+
+    report = Verifier(key_set).verify_events([ev0, downgraded])
+    downgrades = [
+        v for v in report.chain_contiguity_violations if v.kind == "v2_downgrade"
+    ]
+    assert len(downgrades) == 1
+    assert not report.all_ok
+
+
+def test_bc013_unbound_tool_call_caught(hmac_keys: Path) -> None:
+    """BC-013: a tool call with no on_behalf_of.principal_id is rejected."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    # Tool call (harness present) but NO principal binding.
+    tool_ev = _make_signed_event(
+        key_bytes,
+        transition="tool_call_begin",
+        payload={"tool": "Bash", "harness": "claude-code"},
+        on_behalf_of=None,
+    )
+
+    report = Verifier(key_set).verify_events([tool_ev])
+    missing = [
+        v for v in report.principal_binding_violations if v.kind == "missing_principal"
+    ]
+    assert len(missing) == 1
+    assert not report.all_ok
+
+
+def test_bc013_principal_mismatch_caught(hmac_keys: Path) -> None:
+    """BC-013: a tool call attributed to a principal other than the active
+    scope attestation's principal is rejected."""
+    from datetime import UTC, datetime
+
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    now = datetime.now(UTC)
+    wi = uuid.uuid4()
+
+    # Scope attestation declares principal "human:alice".
+    scope_ev = _make_signed_event(
+        key_bytes,
+        event_seq=0,
+        transition="scope_statement",
+        payload={
+            "harnesses": [{"name": "claude-code"}],
+            "scope_statement": "full",
+            "version": "1",
+            "principal_id": "human:alice",
+            "attested_at": now.isoformat(),
+        },
+        timestamp=now,
+        work_item_id=wi,
+    )
+
+    # Tool call attributed to a DIFFERENT principal "human:mallory".
+    tool_ev = _make_signed_event(
+        key_bytes,
+        event_seq=1,
+        transition="tool_call_begin",
+        payload={"tool": "Bash", "harness": "claude-code"},
+        timestamp=now,
+        work_item_id=wi,
+        on_behalf_of={"principal_id": "human:mallory"},
+    )
+
+    report = Verifier(key_set).verify_events([scope_ev, tool_ev])
+    mism = [
+        v for v in report.principal_binding_violations if v.kind == "principal_mismatch"
+    ]
+    assert len(mism) == 1
+    assert mism[0].principal_id == "human:mallory"
+    assert mism[0].expected_principal_id == "human:alice"
+    assert not report.all_ok
+
+
+def test_bc015_tsa_token_over_wrong_root_rejected(tmp_path: Path) -> None:
+    """BC-015: a genuine TSA token whose signed Merkle root does NOT match the
+    root recomputed from the bundle's events is rejected (anti-backdating /
+    token-reuse defense)."""
+    import datetime as _dt
+
+    from asn1crypto import x509 as asn1_x509
+    from cryptography.hazmat.primitives import serialization
+    from regista._signing import sign_event
+    from regista._timestamping import compute_merkle_root
+    from regista._types import Event
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    cert_pem, tsa_key = _generate_test_cert()
+    cert_der = cert_pem.public_bytes(serialization.Encoding.DER)
+    cert_asn1 = asn1_x509.Certificate.load(cert_der)
+    anchor_path = tmp_path / "tsa-cert.pem"
+    anchor_path.write_bytes(cert_pem.public_bytes(serialization.Encoding.PEM))
+
+    # The operator holds a GENUINE token for some OTHER (honest) batch whose
+    # root is over a different event set.
+    honest_other_id = uuid.uuid4()
+    honest_root = compute_merkle_root([honest_other_id])
+    token = _build_signed_tsa_token(honest_root, cert_asn1, tsa_key)
+    token_hex = token.hex()
+
+    # The forged bundle contains a DIFFERENT event but copies the genuine token
+    # and its honest root into the timestamp batch.
+    ev_id = uuid.uuid4()
+    now = _dt.datetime.now(_dt.UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+    ev = Event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    manifest: dict = {"events_count": 1}
+    bundle: dict = {
+        "manifest": manifest,
+        "events": [ev.to_dict()],
+        "timestamp_batches": [
+            {
+                "batch_id": str(uuid.uuid4()),
+                # Batch claims to cover the bundle's event...
+                "event_ids": [str(ev_id)],
+                # ...but the root + token are the honest batch's (over a
+                # different event).
+                "merkle_root": honest_root.hex(),
+                "status": "confirmed",
+                "tsa_timestamp": now.isoformat(),
+                "tsa_token": token_hex,
+            }
+        ],
+    }
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    manifest["bundle_hash"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+    bundle_path = tmp_path / "forged_ts.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+
+    verifier = Verifier(key_set, tsa_cert_path=str(anchor_path))
+    report = verifier.verify_bundle(bundle_path)
+
+    assert len(report.timestamp_batches) == 1
+    assert report.timestamp_batches[0].verified is False
+    assert report.tsa_signature_failures == 1
+    assert not report.all_ok
+
+
+def test_bc017_cli_enforces_revocation(tmp_path: Path) -> None:
+    """BC-017: through the CLI verify path, an event signed AFTER its key's
+    revocation is now caught because the CLI builds key_metadata from the key
+    file (previously dead code — no revoked_at field, never passed)."""
+    import datetime as _dt
+
+    from click.testing import CliRunner
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    from cairn._cli import main
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_id = "cairn-test-001"
+
+    # Key file now carries revoked_at; CLI must surface it as key_metadata.
+    keys_path = tmp_path / "keys.json"
+    keys_path.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {
+                        "key_id": key_id,
+                        "secret": key_bytes.decode("utf-8"),
+                        "scheme": "hmac-sha256",
+                        "encoding": "utf8",
+                        "role": "actor",
+                        "revoked_at": "2026-03-01T00:00:00+00:00",
+                    }
+                ]
+            }
+        )
+    )
+    os.chmod(keys_path, 0o600)
+
+    # Event signed AFTER revocation.
+    after = _dt.datetime(2026, 6, 1, tzinfo=_dt.UTC)
+    ev_id = uuid.uuid4()
+    wi = uuid.uuid4()
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=wi,
+        actor_id="agent-1",
+        key_id=key_id,
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=after,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+    ev = Event(
+        event_id=ev_id,
+        work_item_id=wi,
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id=key_id,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=after,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    bundle = {"manifest": {"events_count": 1}, "events": [ev.to_dict()]}
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    bundle["manifest"]["bundle_hash"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["verify", "--bundle-path", str(bundle_path), "--keys", str(keys_path)],
+    )
+    # Revocation enforcement now runs through the CLI: exit 1 + reported.
+    assert result.exit_code == 1, result.output
+    assert "KEY REVOCATIONS" in result.output
+    assert "revoked" in result.output.lower()
+
+
+def test_bc017_cli_enforces_role_gate(tmp_path: Path) -> None:
+    """BC-017: through the CLI verify path, an actor key signing an
+    auditor-only transition is caught because key_metadata.role is now built
+    from the key file."""
+    import datetime as _dt
+
+    from click.testing import CliRunner
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    from cairn._cli import main
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_id = "cairn-test-001"
+
+    keys_path = tmp_path / "keys.json"
+    keys_path.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {
+                        "key_id": key_id,
+                        "secret": key_bytes.decode("utf-8"),
+                        "scheme": "hmac-sha256",
+                        "encoding": "utf8",
+                        "role": "actor",
+                    }
+                ]
+            }
+        )
+    )
+    os.chmod(keys_path, 0o600)
+
+    now = _dt.datetime.now(_dt.UTC)
+    ev_id = uuid.uuid4()
+    wi = uuid.uuid4()
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=wi,
+        actor_id="agent-1",
+        key_id=key_id,
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="auditor_attestation",
+        payload={"verdict": "passed"},
+        key=key_bytes,
+    )
+    ev = Event(
+        event_id=ev_id,
+        work_item_id=wi,
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id=key_id,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="auditor_attestation",
+        payload={"verdict": "passed"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    bundle = {"manifest": {"events_count": 1}, "events": [ev.to_dict()]}
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    bundle["manifest"]["bundle_hash"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["verify", "--bundle-path", str(bundle_path), "--keys", str(keys_path)],
+    )
+    assert result.exit_code == 1, result.output
+    assert "ROLE GATE VIOLATIONS" in result.output

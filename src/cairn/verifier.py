@@ -32,10 +32,12 @@ log = structlog.get_logger()
 __all__ = [
     "BundleDiff",
     "BundleDiffEntry",
+    "ChainContiguityViolation",
     "DelegationChainEntry",
     "FileProvenanceEntry",
     "KeyRevocationEntry",
     "KeyRotationEntry",
+    "PrincipalBindingViolation",
     "RoleGateViolation",
     "ScopeAttestationEntry",
     "ScopeViolation",
@@ -249,6 +251,41 @@ class RoleGateViolation:
     detail: str
 
 
+@dataclass(frozen=True)
+class ChainContiguityViolation:
+    """A break in the event-level hash chain (BC-010).
+
+    Either a ``global_seq`` gap (cross-work-item total order is not
+    contiguous), or a ``prev_event_hash`` link that does not match the
+    canonical hash of the preceding event in the work item, or a v3-chained
+    event that was presented in a downgraded (v2) envelope.
+    """
+
+    kind: str  # "global_seq_gap" | "prev_hash_mismatch" | "missing_predecessor" | "v2_downgrade"
+    detail: str
+    event_id: str | None = None
+    work_item_id: str | None = None
+    expected: str | None = None
+    actual: str | None = None
+
+
+@dataclass(frozen=True)
+class PrincipalBindingViolation:
+    """A tool-call event that is not bound to an authenticated principal (BC-013).
+
+    Either no ``on_behalf_of.principal_id`` is present, or the principal does
+    not match the principal declared by the active scope attestation.
+    """
+
+    kind: str  # "missing_principal" | "principal_mismatch"
+    event_id: str
+    work_item_id: str
+    transition: str | None
+    detail: str
+    principal_id: str | None = None
+    expected_principal_id: str | None = None
+
+
 @dataclass
 class VerificationReport:
     total_events: int = 0
@@ -271,6 +308,8 @@ class VerificationReport:
     witness_coverage_violations: list[WitnessCoverageViolation] = field(default_factory=list)
     temporal_violations: list[TemporalOrderingViolation] = field(default_factory=list)
     role_gate_violations: list[RoleGateViolation] = field(default_factory=list)
+    chain_contiguity_violations: list[ChainContiguityViolation] = field(default_factory=list)
+    principal_binding_violations: list[PrincipalBindingViolation] = field(default_factory=list)
     scheme_counts: dict[str, int] = field(default_factory=dict)
     bundle_hash_ok: bool | None = None
     bundle_hash_detail: str | None = None
@@ -310,6 +349,8 @@ class VerificationReport:
             and len(self.scope_violations) == 0
             and len(self.temporal_violations) == 0
             and len(self.role_gate_violations) == 0
+            and len(self.chain_contiguity_violations) == 0
+            and len(self.principal_binding_violations) == 0
             and bundle_ok
             and chain_ok
         )
@@ -371,6 +412,9 @@ class Verifier:
         self._keys = key_set
         self._key_meta = key_metadata or {}
         self._tsa_cert_path = tsa_cert_path
+        # Per-batch claimed event_ids, captured during _accumulate_timestamp_batches
+        # so _verify_timestamp_signatures can recompute Merkle roots (BC-015).
+        self._batch_claimed_ids: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -417,7 +461,9 @@ class Verifier:
             self._check_role_gate(report, ev)
 
         self._check_event_sequence(events, report)
+        self._check_chain_contiguity(events, report)
         self._check_scope_coverage(events, report)
+        self._check_principal_binding(events, report)
         self._check_temporal_ordering(events, report)
 
         return report
@@ -466,7 +512,7 @@ class Verifier:
             log.warn("cairn.chain_link_missing")
 
         raw_tokens = self._accumulate_timestamp_batches(raw, events, report)
-        self._verify_timestamp_signatures(raw_tokens, report)
+        self._verify_timestamp_signatures(raw_tokens, events, report)
 
         self._accumulate_witness_data(raw, events, report)
         self._check_witness_coverage(events, report)
@@ -768,6 +814,12 @@ class Verifier:
 
         Returns a mapping ``batch_id → tsa_token_bytes`` for confirmed batches
         so that ``_verify_timestamp_signatures`` can verify them.
+
+        Also records, per confirmed batch, the list of event UUIDs the batch
+        claims to cover that are actually present in the bundle, so that
+        ``_verify_timestamp_signatures`` can recompute the Merkle root from the
+        bundle's own events (BC-015) rather than trusting the bundle-supplied
+        ``merkle_root``.
         """
         raw_batches = raw_bundle.get("timestamp_batches")
         if not raw_batches:
@@ -778,8 +830,9 @@ class Verifier:
         raw_tokens: dict[str, bytes] = {}
 
         for raw in raw_batches:
+            batch_id = raw.get("batch_id", "unknown")
             entry = TimestampBatchEntry(
-                batch_id=raw.get("batch_id", "unknown"),
+                batch_id=batch_id,
                 merkle_root=raw.get("merkle_root", ""),
                 event_count=len(raw.get("event_ids", [])),
                 status=raw.get("status", "unknown"),
@@ -790,9 +843,14 @@ class Verifier:
             if raw.get("status") == "confirmed":
                 batch_ids = {str(eid) for eid in raw.get("event_ids", [])}
                 covered_ids.update(batch_ids & exported_ids)
+                # Record the claimed coverage and present coverage for this
+                # batch so the root can be recomputed against bundle events.
+                self._batch_claimed_ids[batch_id] = [
+                    str(eid) for eid in raw.get("event_ids", [])
+                ]
                 token_hex = raw.get("tsa_token")
                 if token_hex:
-                    raw_tokens[raw.get("batch_id", "unknown")] = bytes.fromhex(token_hex)
+                    raw_tokens[batch_id] = bytes.fromhex(token_hex)
 
         uncovered = exported_ids - covered_ids
         if uncovered:
@@ -806,29 +864,51 @@ class Verifier:
     def _verify_timestamp_signatures(
         self,
         raw_tokens: dict[str, bytes],
+        events: list[Event],
         report: VerificationReport,
     ) -> None:
-        """Verify CMS signatures on TSA timestamp tokens (BC-229).
+        """Verify TSA tokens against a Merkle root recomputed from bundle events.
 
-        When a trust anchor (``_tsa_cert_path``) is configured, this method
-        calls ``regista.verify_tsa_token_full()`` to verify the CMS
-        signature on each confirmed timestamp batch.  Without a trust
-        anchor, the ``verified`` field stays ``None`` (not checked).
+        BC-015: the TSA token must be bound to the *actual* event content in the
+        bundle, not to a bundle-supplied ``merkle_root`` an operator can copy
+        from an unrelated honest batch.  For each confirmed batch we:
+
+        1. Recompute the Merkle root from the UUIDs of the batch's claimed
+           events that are present in the bundle (``compute_merkle_root`` — the
+           same construction regista's timestamping uses).
+        2. Reject the batch if the recomputed root differs from the bundle's
+           stated ``merkle_root`` (the operator altered/added/removed events
+           but kept an old root and token).
+        3. When a trust anchor is configured, verify the TSA token's CMS
+           signature and message imprint against the **recomputed** root.
+
+        Without a trust anchor (no ``--tsa-cert``) the CMS signature cannot be
+        checked, but the recomputed-vs-stated root binding (step 2) is still
+        enforced so a copied token over a different root is caught.
         """
-        if not self._tsa_cert_path or not raw_tokens:
+        if not raw_tokens:
             return
 
         try:
-            from regista._timestamping import TSAConfig, verify_tsa_token_full
+            from regista._timestamping import (
+                TSAConfig,
+                compute_merkle_root,
+                verify_tsa_token_full,
+            )
         except ImportError:
             log.warn("cairn.tsa_verify_import_failed")
             return
 
-        config = TSAConfig(tsa_url="", tsa_cert_path=self._tsa_cert_path)
+        import uuid as _uuid
 
-        # We need to recompute the Merkle root data for each batch.
-        # The raw_tokens dict maps batch_id → token bytes.  We verify
-        # the token against the merkle_root from the report entry.
+        config = (
+            TSAConfig(tsa_url="", tsa_cert_path=self._tsa_cert_path)
+            if self._tsa_cert_path
+            else None
+        )
+
+        events_by_id = {str(ev.event_id): ev for ev in events}
+
         updated: list[TimestampBatchEntry] = []
         for entry in report.timestamp_batches:
             token = raw_tokens.get(entry.batch_id)
@@ -836,10 +916,59 @@ class Verifier:
                 updated.append(entry)
                 continue
 
-            # The merkle_root in the bundle is hex-encoded.  We verify
-            # the token's message imprint against those bytes.
-            merkle_bytes = bytes.fromhex(entry.merkle_root) if entry.merkle_root else b""
-            ok, detail = verify_tsa_token_full(token, merkle_bytes, config)
+            # (1) Recompute the Merkle root from the bundle's own events.
+            claimed_ids = self._batch_claimed_ids.get(entry.batch_id, [])
+            present_uuids: list[_uuid.UUID] = []
+            for eid in claimed_ids:
+                if eid in events_by_id:
+                    try:
+                        present_uuids.append(_uuid.UUID(eid))
+                    except ValueError:
+                        pass
+
+            verified: bool | None
+            detail: str
+            if not present_uuids:
+                # The batch claims to cover events, none of which are in the
+                # bundle.  The token proves nothing about this bundle.
+                verified = False
+                detail = (
+                    "Timestamp batch covers no events present in the bundle; "
+                    "the TSA token is not bound to any bundle event (BC-015)."
+                )
+            else:
+                recomputed = compute_merkle_root(present_uuids)
+                recomputed_hex = recomputed.hex()
+                stated_hex = (entry.merkle_root or "").lower()
+
+                if stated_hex and recomputed_hex != stated_hex:
+                    # (2) Root recomputed from bundle events disagrees with the
+                    # bundle-stated root: the events were altered/reordered or
+                    # the token belongs to a different batch.
+                    verified = False
+                    detail = (
+                        "Recomputed Merkle root over bundle events "
+                        f"({recomputed_hex[:16]}...) does not match the "
+                        f"bundle-stated merkle_root ({stated_hex[:16]}...). "
+                        "The TSA token is not bound to the events in this "
+                        "bundle (BC-015 — backdating / token-reuse defense)."
+                    )
+                elif config is None:
+                    # No trust anchor: cannot check the CMS signature, but the
+                    # recomputed root matched the stated root.  Leave the
+                    # signature unverified (None) as before, without claiming
+                    # cryptographic verification.
+                    verified = None
+                    detail = (
+                        "Recomputed Merkle root matches stated root; CMS "
+                        "signature NOT checked (no --tsa-cert)."
+                    )
+                else:
+                    # (3) Verify the token against the recomputed root.
+                    ok, sig_detail = verify_tsa_token_full(token, recomputed, config)
+                    verified = ok
+                    detail = sig_detail
+
             updated.append(
                 TimestampBatchEntry(
                     batch_id=entry.batch_id,
@@ -849,14 +978,18 @@ class Verifier:
                     event_count=entry.event_count,
                     status=entry.status,
                     tsa_timestamp=entry.tsa_timestamp,
-                    verified=ok,
+                    verified=verified,
                     verification_detail=detail,
                 )
             )
-            if ok:
+            if verified is True:
                 log.info("cairn.tsa_signature_verified", batch_id=entry.batch_id[:8])
-            else:
-                log.warn("cairn.tsa_signature_failed", batch_id=entry.batch_id[:8], detail=detail)
+            elif verified is False:
+                log.warn(
+                    "cairn.tsa_signature_failed",
+                    batch_id=entry.batch_id[:8],
+                    detail=detail,
+                )
 
         # Replace the list contents in-place
         report.timestamp_batches.clear()
@@ -953,8 +1086,10 @@ class Verifier:
             by_wi[str(ev.work_item_id)].append(ev)
 
         for wi_id, wi_events in by_wi.items():
-            if len(wi_events) < 2:
-                continue
+            # NOTE: single-event work items are intentionally NOT skipped here
+            # (BC-010).  A lone event still has its ordering examined, and
+            # cross-work-item deletion of single-event work items is caught by
+            # _check_chain_contiguity via the global_seq gap check.
 
             # Sort by event_seq to detect gaps
             sorted_events = sorted(wi_events, key=lambda e: e.event_seq)
@@ -1003,6 +1138,248 @@ class Verifier:
                         )
                     )
                 prev_ts = ev.timestamp
+
+    def _check_chain_contiguity(
+        self, events: list[Event], report: VerificationReport
+    ) -> None:
+        """Verify the event-level hash chain and global ordering (BC-010).
+
+        regista binds two independent ordering structures into every event's
+        signed envelope:
+
+        * ``global_seq`` — the cross-work-item total order of the log.
+        * ``prev_event_hash`` — ``sha256(prev.canonical_envelope + prev.signature)``
+          of the event at ``(work_item_id, event_seq - 1)`` (a per-work-item
+          hash chain; see ``regista._events`` / ``_in_memory_replay``).
+
+        The signature merely binds these fields; it does not prove the chain is
+        *contiguous*.  Without an independent walk an operator can delete whole
+        work items, truncate the genesis prefix, or splice in foreign events and
+        every remaining per-event signature still verifies.  This method closes
+        that gap:
+
+        1. Sort events by ``global_seq`` and flag any gap in the total order.
+        2. For every event carrying ``prev_event_hash`` (event_seq > 1), locate
+           the predecessor at ``event_seq - 1`` in the same work item; recompute
+           ``sha256(envelope + signature)`` and require it to equal the stored
+           ``prev_event_hash``.  A missing predecessor (deletion/truncation) or a
+           mismatch (splice) is a violation.
+        3. Refuse a downgraded envelope: if an event carries ``global_seq`` it is
+           a v3-chained event and must also carry ``prev_event_hash`` for
+           event_seq > 1 (a v2 envelope that drops the chain field is rejected).
+        """
+        # --- (1) global_seq contiguity across the whole bundle ---
+        seq_events = [ev for ev in events if ev.global_seq is not None]
+        if seq_events:
+            ordered = sorted(seq_events, key=lambda e: e.global_seq)
+            prev: Event | None = None
+            for ev in ordered:
+                if prev is not None:
+                    gap = ev.global_seq - prev.global_seq
+                    if gap == 0:
+                        report.chain_contiguity_violations.append(
+                            ChainContiguityViolation(
+                                kind="global_seq_gap",
+                                detail=(
+                                    f"Duplicate global_seq {ev.global_seq}: events "
+                                    f"{prev.event_id} and {ev.event_id} share the same "
+                                    "total-order position."
+                                ),
+                                event_id=str(ev.event_id),
+                                work_item_id=str(ev.work_item_id),
+                                expected=str(prev.global_seq + 1),
+                                actual=str(ev.global_seq),
+                            )
+                        )
+                    elif gap > 1:
+                        report.chain_contiguity_violations.append(
+                            ChainContiguityViolation(
+                                kind="global_seq_gap",
+                                detail=(
+                                    f"global_seq jumps from {prev.global_seq} to "
+                                    f"{ev.global_seq} ({gap - 1} event(s) missing). "
+                                    "Events may have been deleted or truncated from "
+                                    "the log."
+                                ),
+                                event_id=str(ev.event_id),
+                                work_item_id=str(ev.work_item_id),
+                                expected=str(prev.global_seq + 1),
+                                actual=str(ev.global_seq),
+                            )
+                        )
+                prev = ev
+
+        # --- (2)/(3) prev_event_hash chain walk + downgrade refusal ---
+        # Index events by (work_item_id, event_seq) for predecessor lookup.
+        by_wi_seq: dict[tuple[str, int], Event] = {}
+        for ev in events:
+            by_wi_seq[(str(ev.work_item_id), ev.event_seq)] = ev
+
+        for ev in events:
+            # An event with global_seq set is a v3-chained event.  For
+            # event_seq > 1 it MUST carry prev_event_hash; a v2 envelope that
+            # drops the chain field is a downgrade and is refused.
+            is_chained = ev.global_seq is not None
+            if (
+                is_chained
+                and ev.event_seq > 1
+                and ev.prev_event_hash is None
+            ):
+                report.chain_contiguity_violations.append(
+                    ChainContiguityViolation(
+                        kind="v2_downgrade",
+                        detail=(
+                            f"Event {ev.event_id} carries global_seq "
+                            f"{ev.global_seq} (v3-chained) but no prev_event_hash. "
+                            "A v3-chained event presented without its chain field "
+                            "is a downgraded (v2) envelope and is rejected."
+                        ),
+                        event_id=str(ev.event_id),
+                        work_item_id=str(ev.work_item_id),
+                    )
+                )
+
+            if ev.prev_event_hash is None:
+                continue
+
+            predecessor = by_wi_seq.get((str(ev.work_item_id), ev.event_seq - 1))
+            if predecessor is None:
+                report.chain_contiguity_violations.append(
+                    ChainContiguityViolation(
+                        kind="missing_predecessor",
+                        detail=(
+                            f"Event {ev.event_id} (seq {ev.event_seq}) carries "
+                            "prev_event_hash but its predecessor (seq "
+                            f"{ev.event_seq - 1}) is absent from the bundle. "
+                            "The preceding event was deleted or the log was "
+                            "truncated."
+                        ),
+                        event_id=str(ev.event_id),
+                        work_item_id=str(ev.work_item_id),
+                    )
+                )
+                continue
+
+            prev_env = predecessor.canonical_envelope
+            prev_sig = predecessor.signature
+            if not prev_env or not prev_sig:
+                report.chain_contiguity_violations.append(
+                    ChainContiguityViolation(
+                        kind="prev_hash_mismatch",
+                        detail=(
+                            f"Predecessor of event {ev.event_id} is missing its "
+                            "canonical_envelope or signature; the hash chain "
+                            "cannot be verified."
+                        ),
+                        event_id=str(ev.event_id),
+                        work_item_id=str(ev.work_item_id),
+                    )
+                )
+                continue
+
+            computed = hashlib.sha256(bytes(prev_env) + bytes(prev_sig)).digest()
+            if computed != bytes(ev.prev_event_hash):
+                report.chain_contiguity_violations.append(
+                    ChainContiguityViolation(
+                        kind="prev_hash_mismatch",
+                        detail=(
+                            f"Event {ev.event_id} prev_event_hash does not match "
+                            "the canonical hash of its predecessor. The preceding "
+                            "event was altered or substituted (splice)."
+                        ),
+                        event_id=str(ev.event_id),
+                        work_item_id=str(ev.work_item_id),
+                        expected=bytes(ev.prev_event_hash).hex(),
+                        actual=computed.hex(),
+                    )
+                )
+
+    def _check_principal_binding(
+        self, events: list[Event], report: VerificationReport
+    ) -> None:
+        """Require every tool call to be bound to an authenticated principal (BC-013).
+
+        README §1 names the in-scope guarantee as a record of every tool call
+        "bound to an authenticated human principal."  This method enforces it:
+
+        1. Every ``tool_call`` event must carry ``on_behalf_of.principal_id``;
+           absence is a ``missing_principal`` violation.
+        2. When an active scope attestation exists for the event, the tool
+           call's ``principal_id`` must match the scope attestation's declared
+           ``principal_id``; a mismatch is a ``principal_mismatch`` violation.
+
+        The active scope attestation for an event is the latest attestation with
+        ``attested_at <= event.timestamp`` (same selection rule as
+        ``_check_scope_coverage``).
+
+        "Tool call" here means an adapter-emitted audited action: a
+        ``tool_call`` transition whose payload carries a ``harness`` field — the
+        same boundary ``_check_scope_coverage`` uses.  Key-lifecycle events
+        (rotation, revocation, scope attestation) ride the same transition names
+        but are not principal-attributed actions and are excluded.
+        """
+        tool_calls = [
+            ev
+            for ev in events
+            if (ev.transition or "").startswith("tool_call")
+            and (ev.payload or {}).get("harness")
+        ]
+        if not tool_calls:
+            return
+
+        sorted_scopes = sorted(
+            report.scope_attestations, key=lambda s: s.attested_at
+        )
+
+        def active_principal(ev_ts: str) -> str | None:
+            chosen: ScopeAttestationEntry | None = None
+            for sa in sorted_scopes:
+                if sa.attested_at <= ev_ts:
+                    chosen = sa
+                else:
+                    break
+            if chosen is None:
+                return None
+            return chosen.principal_id or None
+
+        for ev in tool_calls:
+            principal_id = None
+            if ev.on_behalf_of is not None:
+                principal_id = ev.on_behalf_of.get("principal_id") or None
+
+            if not principal_id:
+                report.principal_binding_violations.append(
+                    PrincipalBindingViolation(
+                        kind="missing_principal",
+                        event_id=str(ev.event_id),
+                        work_item_id=str(ev.work_item_id),
+                        transition=ev.transition,
+                        detail=(
+                            f"Tool call {ev.event_id} ({ev.transition}) has no "
+                            "on_behalf_of.principal_id. Every tool call must be "
+                            "bound to an authenticated principal (README §1)."
+                        ),
+                    )
+                )
+                continue
+
+            expected = active_principal(ev.timestamp.isoformat())
+            if expected is not None and expected != principal_id:
+                report.principal_binding_violations.append(
+                    PrincipalBindingViolation(
+                        kind="principal_mismatch",
+                        event_id=str(ev.event_id),
+                        work_item_id=str(ev.work_item_id),
+                        transition=ev.transition,
+                        detail=(
+                            f"Tool call {ev.event_id} is attributed to principal "
+                            f"'{principal_id}' but the active scope attestation "
+                            f"declares principal '{expected}'."
+                        ),
+                        principal_id=principal_id,
+                        expected_principal_id=expected,
+                    )
+                )
 
     def _accumulate_key_revocations(self, report: VerificationReport, ev: Event) -> None:
         """Detect key_revocation events and flag events signed after revocation.
@@ -1317,6 +1694,16 @@ class Verifier:
             merged.file_provenance.extend(r.file_provenance)
             merged.scope_attestations.extend(r.scope_attestations)
             merged.sequence_gaps.extend(r.sequence_gaps)
+            merged.scope_violations.extend(r.scope_violations)
+            merged.temporal_violations.extend(r.temporal_violations)
+            merged.role_gate_violations.extend(r.role_gate_violations)
+            merged.chain_contiguity_violations.extend(r.chain_contiguity_violations)
+            merged.principal_binding_violations.extend(r.principal_binding_violations)
+            merged.key_revocations.extend(r.key_revocations)
+            merged.delegation_chains.extend(r.delegation_chains)
+            merged.key_rotations.extend(r.key_rotations)
+            merged.timestamp_batches.extend(r.timestamp_batches)
+            merged.witness_coverage_violations.extend(r.witness_coverage_violations)
             merged.key_chain.update(r.key_chain)
             if r.bundle_hash_ok is False:
                 merged.bundle_hash_ok = False
@@ -1706,6 +2093,23 @@ class Verifier:
                 lines.append(f"    -> {rv.detail}")
             lines.append("")
 
+        if report.chain_contiguity_violations:
+            lines.append("CHAIN CONTIGUITY VIOLATIONS")
+            lines.append("-" * 40)
+            for cv in report.chain_contiguity_violations:
+                loc = f" event {cv.event_id}" if cv.event_id else ""
+                lines.append(f"  [{cv.kind}]{loc}")
+                lines.append(f"    -> {cv.detail}")
+            lines.append("")
+
+        if report.principal_binding_violations:
+            lines.append("PRINCIPAL BINDING VIOLATIONS")
+            lines.append("-" * 40)
+            for pv in report.principal_binding_violations:
+                lines.append(f"  event {pv.event_id} ({pv.transition}) [{pv.kind}]")
+                lines.append(f"    -> {pv.detail}")
+            lines.append("")
+
         lines.append("VERIFICATION NOTE")
         lines.append("-" * 40)
         has_ed25519 = "ed25519" in report.scheme_counts
@@ -1903,6 +2307,29 @@ class Verifier:
                     "detail": rv.detail,
                 }
                 for rv in report.role_gate_violations
+            ],
+            "chain_contiguity_violations": [
+                {
+                    "kind": cv.kind,
+                    "detail": cv.detail,
+                    "event_id": cv.event_id,
+                    "work_item_id": cv.work_item_id,
+                    "expected": cv.expected,
+                    "actual": cv.actual,
+                }
+                for cv in report.chain_contiguity_violations
+            ],
+            "principal_binding_violations": [
+                {
+                    "kind": pv.kind,
+                    "event_id": pv.event_id,
+                    "work_item_id": pv.work_item_id,
+                    "transition": pv.transition,
+                    "detail": pv.detail,
+                    "principal_id": pv.principal_id,
+                    "expected_principal_id": pv.expected_principal_id,
+                }
+                for pv in report.principal_binding_violations
             ],
             "scheme_counts": report.scheme_counts,
             "verification_note": (
