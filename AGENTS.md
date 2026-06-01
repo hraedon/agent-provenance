@@ -101,18 +101,23 @@ In rough order. Do not assume any of these are done; check on entry.
    an auditor-ready report.
    **Done: `src/cairn/verifier.py` + CLI `cairn verify`.**
 
-## Current status (last updated 2026-05-28)
+## Current status (last updated 2026-06-01)
 
-- **Tests**: 132 passing (CI depends on Postgres).
-- **Lint**: ruff clean.
-- **Gaps closed**: scope attestation as signed first-class event (README §2);
+- **Tests**: 140 passing (CI depends on Postgres).
+- **Lint**: ruff clean on changed files; pre-existing RUF012/N806 in verifier.py.
+- **Gaps closed this session**: BC-012 (malformed attested_at timestamp);
+  BC-011 (uncaught exceptions on malformed bundles); BC-014 (chain integrity
+  over-claiming for single bundles); AP-009 (single source of truth for version);
+  AP-011 (HTML report missing key rotations and key revocations);
+  scheme_counts + witness fields merge in verify_bundle_chain.
+- **Gaps closed previously**: scope attestation as signed first-class event (README §2);
   opencode plugin + bridge end-to-end functional; bundle export/verify with
   control narrative; Claude Code hooks (Plan 004); session_id passthrough
   from harness to bridge (fixes audit grouping bug); `cairn diff` command
   (AP-008); self-contained HTML verification report (AP-006); FIM-class
   positioning technical report published (AP-007); SDK wrapper (`CairnClient`);
   `cairn extract-control` CLI command; key rotation event support in verifier
-  (partial AP-001 — structural verification, not yet Ed25519);
+  (AP-001 completed, Ed25519);
   streaming file digest (hashlib chunked reads for large files);
   key file permission checker (`check_key_file_permissions`);
   Claude Code hook degradation logging (`_mark_degraded`);
@@ -125,16 +130,19 @@ In rough order. Do not assume any of these are done; check on entry.
   **`cairn timestamp` CLI command** (AP-004 partial, regista Plan 012);
   **Scheme-aware verifier** (dispatches HMAC/Ed25519 per event `scheme_id`);
   **Scheme-aware reports** (text/JSON/HTML show scheme usage and delegation chains);
-  **Ed25519 signing support** (regista BC-196, verifier + CLI);
-  **Delegation chain validation** (regista BC-197, verifier);
-  **`cairn timestamp` CLI command** (regista Plan 012);
   **TSA signature verification against trust anchor** (BC-229 completed);
   **Witness federation coverage check** (bundle export + verifier);
   **OpenCode plugin live end-to-end** (Node.js bridge, UUID v5 session IDs).
 - **Open gaps**: project not registered with agent-notes yet; live
   opencode dogfood bundle not yet committed to repo; Claude Code hooks not
   yet tested in a live Claude Code session (mock tests only);
-  real IdP integration for principal_id.
+  real IdP integration for principal_id; BC-016 (witness signatures not
+  cryptographically verified — blocked on regista asymmetric witness signing);
+  BC-005 (scope attestation uses tool_call transitions — blocked on regista
+  Plan 016); BC-018 (global_seq gap check — documented as non-issue);
+  temporal ordering check flags all events not just batch-covered (new BC);
+  CLI export silently swallows timestamp/witness errors (new BC);
+  OpenCode plugin loses end events on bridge failure (new BC).
 
 ## What not to do
 
