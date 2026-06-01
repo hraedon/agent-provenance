@@ -72,6 +72,34 @@ def _load_key_set(keys_path: Path) -> dict[str, bytes]:
     return key_set
 
 
+def _load_key_metadata(keys_path: Path) -> dict[str, dict[str, Any]]:
+    """Build per-key metadata (``role``, ``revoked_at``) from the key file.
+
+    BC-017: ``_check_role_gate`` and the post-revocation enforcement in
+    ``_accumulate_key_revocations`` both short-circuit when there is no
+    metadata for a key.  The CLI is the only documented auditor entry point,
+    so without this the role-gate and revocation-timestamp checks are dead
+    code through ``cairn verify``.  Here we surface the optional ``role`` and
+    ``revoked_at`` fields from each key entry so those checks actually run.
+
+    Only keys that declare at least one lifecycle field produce metadata; keys
+    with neither field are omitted, preserving the backward-compatible
+    "no metadata → check skipped" behavior for legacy key files.
+    """
+    key_data = json.loads(keys_path.read_text())
+    key_metadata: dict[str, dict[str, Any]] = {}
+    for entry in key_data["keys"]:
+        key_id: str = entry["key_id"]
+        meta: dict[str, Any] = {}
+        if "role" in entry and entry["role"] is not None:
+            meta["role"] = entry["role"]
+        if "revoked_at" in entry and entry["revoked_at"] is not None:
+            meta["revoked_at"] = entry["revoked_at"]
+        if meta:
+            key_metadata[key_id] = meta
+    return key_metadata
+
+
 _SECTION_RE = re.compile(r"^#+\s+(\d+(?:\.\d+)?)")
 
 
@@ -138,8 +166,13 @@ def verify(
         click.echo(f"WARNING: {w}", err=True)
 
     key_set = _load_key_set(keys)
+    key_metadata = _load_key_metadata(keys)
 
-    verifier = Verifier(key_set, tsa_cert_path=str(tsa_cert) if tsa_cert else None)
+    verifier = Verifier(
+        key_set,
+        key_metadata=key_metadata,
+        tsa_cert_path=str(tsa_cert) if tsa_cert else None,
+    )
     report = verifier.verify_bundle(bundle_path)
 
     if fmt == "json":
@@ -187,8 +220,9 @@ def verify_chain(
         click.echo(f"WARNING: {w}", err=True)
 
     key_set = _load_key_set(keys)
+    key_metadata = _load_key_metadata(keys)
 
-    verifier = Verifier(key_set)
+    verifier = Verifier(key_set, key_metadata=key_metadata)
     report = verifier.verify_bundle_chain(list(bundles))
 
     if fmt == "json":
