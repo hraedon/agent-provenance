@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -486,8 +486,25 @@ class Verifier:
             }
         """
         path = Path(bundle_path)
-        raw = json.loads(path.read_text())
+        try:
+            raw = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            report = VerificationReport()
+            report.bundle_hash_ok = False
+            report.bundle_hash_detail = f"Malformed bundle: {exc}"
+            return report
+
+        if not isinstance(raw, dict) or not isinstance(raw.get("events"), list):
+            report = VerificationReport()
+            report.bundle_hash_ok = False
+            report.bundle_hash_detail = (
+                "Malformed bundle: expected a JSON object with an 'events' list"
+            )
+            return report
+
         manifest = raw.get("manifest", {})
+        if not isinstance(manifest, dict):
+            manifest = {}
 
         hash_verified = self._verify_bundle_hash(raw, manifest)
         if hash_verified is False:
@@ -497,7 +514,14 @@ class Verifier:
             report.key_chain["bundle"] = manifest
             return report
 
-        events = [Event.from_dict(e) for e in raw["events"]]
+        try:
+            events = [Event.from_dict(e) for e in raw["events"]]
+        except (KeyError, TypeError, ValueError) as exc:
+            report = VerificationReport()
+            report.bundle_hash_ok = hash_verified
+            report.bundle_hash_detail = f"Malformed event in bundle: {exc}"
+            return report
+
         report = self.verify_events(events)
         report.bundle_hash_ok = True if hash_verified else None
         report.key_chain["bundle"] = manifest
@@ -505,8 +529,12 @@ class Verifier:
         prev_hash = manifest.get("previous_bundle_hash")
         if prev_hash:
             report.previous_bundle_hash = prev_hash
-            report.chain_integrity_ok = True
-            log.info("cairn.chain_link_present", previous=prev_hash)
+            report.chain_integrity_ok = None
+            log.info(
+                "cairn.chain_link_present_unverified",
+                previous=prev_hash,
+                note="Link present but not validated — run verify-chain",
+            )
         else:
             report.chain_integrity_ok = None
             log.warn("cairn.chain_link_missing")
@@ -1328,13 +1356,14 @@ class Verifier:
             return
 
         sorted_scopes = sorted(
-            report.scope_attestations, key=lambda s: s.attested_at
+            report.scope_attestations, key=lambda s: _parse_iso(s.attested_at)
         )
 
-        def active_principal(ev_ts: str) -> str | None:
+        def active_principal(ev_dt: datetime) -> str | None:
             chosen: ScopeAttestationEntry | None = None
             for sa in sorted_scopes:
-                if sa.attested_at <= ev_ts:
+                sa_dt = _parse_iso(sa.attested_at)
+                if sa_dt is not None and sa_dt <= ev_dt:
                     chosen = sa
                 else:
                     break
@@ -1363,7 +1392,7 @@ class Verifier:
                 )
                 continue
 
-            expected = active_principal(ev.timestamp.isoformat())
+            expected = active_principal(ev.timestamp)
             if expected is not None and expected != principal_id:
                 report.principal_binding_violations.append(
                     PrincipalBindingViolation(
@@ -1469,22 +1498,21 @@ class Verifier:
                 )
             return
 
-        # Sort scope attestations by attested_at for efficient lookup
         sorted_scopes = sorted(
             report.scope_attestations,
-            key=lambda s: s.attested_at,
+            key=lambda s: _parse_iso(s.attested_at),
         )
 
         for ev in tool_calls:
             payload = ev.payload or {}
             harness_raw = payload.get("harness", "")
             harness = harness_raw.get("name", "") if isinstance(harness_raw, dict) else harness_raw
-            ev_ts = ev.timestamp.isoformat()
+            ev_dt = ev.timestamp
 
-            # Find the latest scope attestation that predates this event
             active_scope = None
             for sa in sorted_scopes:
-                if sa.attested_at <= ev_ts:
+                sa_dt = _parse_iso(sa.attested_at)
+                if sa_dt is not None and sa_dt <= ev_dt:
                     active_scope = sa
                 else:
                     break
@@ -1497,7 +1525,7 @@ class Verifier:
                         transition=ev.transition,
                         harness=harness,
                         detail=(
-                            f"No scope attestation predates event at {ev_ts}. "
+                            f"No scope attestation predates event at {ev_dt.isoformat()}. "
                             f"Tool call from harness '{harness}' has no covering scope."
                         ),
                     )
@@ -1705,6 +1733,10 @@ class Verifier:
             merged.timestamp_batches.extend(r.timestamp_batches)
             merged.witness_coverage_violations.extend(r.witness_coverage_violations)
             merged.key_chain.update(r.key_chain)
+            for scheme, count in r.scheme_counts.items():
+                merged.scheme_counts[scheme] = merged.scheme_counts.get(scheme, 0) + count
+            merged.witness_registrations.extend(r.witness_registrations)
+            merged.witness_receipts.extend(r.witness_receipts)
             if r.bundle_hash_ok is False:
                 merged.bundle_hash_ok = False
                 merged.bundle_hash_detail = r.bundle_hash_detail
@@ -1884,6 +1916,11 @@ class Verifier:
             lines.append(f"  Chain integrity         : {chain_status}")
             if report.previous_bundle_hash:
                 lines.append(f"    previous_bundle_hash  : {report.previous_bundle_hash[:24]}...")
+        elif report.previous_bundle_hash:
+            lines.append(
+                "  Chain integrity         : PRESENT (link not validated — run verify-chain)"
+            )
+            lines.append(f"    previous_bundle_hash  : {report.previous_bundle_hash[:24]}...")
         else:
             lines.append("  Chain integrity         : NOT VERIFIED (no previous hash)")
         if report.key_rotations:
@@ -2698,6 +2735,73 @@ class Verifier:
                 f"{hdr}<tbody>{rows}</tbody></table></div>"
             )
 
+        # Key rotations
+        if report.key_rotations:
+            rows = ""
+            cell = "padding:4px 8px"
+            mono = f"{cell};font-family:monospace;font-size:12px"
+            for kr in report.key_rotations:
+                sig_html = (
+                    '<span style="color:#16a34a;font-weight:bold">OK</span>'
+                    if kr.signature_valid
+                    else '<span style="color:#dc2626;font-weight:bold">FAILED</span>'
+                )
+                detail = _esc(kr.detail or "")
+                rows += (
+                    f"<tr>"
+                    f'<td style="{mono}">{_esc(kr.event_id[:16])}...</td>'
+                    f'<td style="{mono}">{_esc(kr.predecessor_key_id[:16])}...</td>'
+                    f'<td style="{mono}">{_esc(kr.successor_key_id[:16])}...</td>'
+                    f'<td style="{cell};text-align:center">{sig_html}</td>'
+                    f'<td style="{cell};font-size:12px">{detail}</td>'
+                    f"</tr>"
+                )
+            th_style = f"{cell};text-align:left"
+            hdr = (
+                '<thead><tr style="background:#f1f5f9">'
+                f'<th style="{th_style}">Event</th>'
+                f'<th style="{th_style}">From Key</th>'
+                f'<th style="{th_style}">To Key</th>'
+                f'<th style="{th_style};text-align:center">Signature</th>'
+                f'<th style="{th_style}">Detail</th>'
+                "</tr></thead>"
+            )
+            sections.append(
+                '<div class="section"><h2>Key Rotations</h2>'
+                '<table style="border-collapse:collapse;width:100%">'
+                f"{hdr}<tbody>{rows}</tbody></table></div>"
+            )
+
+        # Key revocations
+        if report.key_revocations:
+            rows = ""
+            cell = "padding:4px 8px"
+            mono = f"{cell};font-family:monospace;font-size:12px"
+            for kr in report.key_revocations:
+                detail = _esc(kr.detail or "")
+                rows += (
+                    f"<tr>"
+                    f'<td style="{mono}">{_esc(kr.event_id[:16])}...</td>'
+                    f'<td style="{mono}">{_esc(kr.key_id[:16])}...</td>'
+                    f'<td style="{cell}">{_esc(kr.revoked_at or "")}</td>'
+                    f'<td style="{cell};font-size:12px">{detail}</td>'
+                    f"</tr>"
+                )
+            th_style = f"{cell};text-align:left"
+            hdr = (
+                '<thead><tr style="background:#f1f5f9">'
+                f'<th style="{th_style}">Event</th>'
+                f'<th style="{th_style}">Key ID</th>'
+                f'<th style="{th_style}">Revoked At</th>'
+                f'<th style="{th_style}">Detail</th>'
+                "</tr></thead>"
+            )
+            sections.append(
+                '<div class="section"><h2>Key Revocations</h2>'
+                '<table style="border-collapse:collapse;width:100%">'
+                f"{hdr}<tbody>{rows}</tbody></table></div>"
+            )
+
         # Timestamp batches
         if report.timestamp_batches:
             rows = ""
@@ -2849,6 +2953,7 @@ class Verifier:
             " border-top: 1px solid #e2e8f0; font-size: 12px;"
             " color: #94a3b8; text-align: center; }"
         )
+        version = __import__("cairn", fromlist=["__version__"]).__version__
         return (
             "<!DOCTYPE html>\n"
             '<html lang="en">\n<head>\n'
@@ -2863,7 +2968,7 @@ class Verifier:
             f"Generated {_esc(now)}</p>\n"
             f"  {body}\n"
             '  <div class="footer">\n'
-            "    Cairn v0.1.0 &mdash; Cryptographic provenance "
+            f"    Cairn v{_esc(version)} &mdash; Cryptographic provenance "
             "for agentic workflows\n"
             "  </div>\n</body>\n</html>"
         )
@@ -2882,4 +2987,21 @@ def _chain_status(ok: bool | None, prev_hash: str | None) -> str:
         return f"OK ({prev_hash[:24]}...)" if prev_hash else "OK"
     if ok is False:
         return "BROKEN"
+    if prev_hash:
+        return "PRESENT (not validated — run verify-chain)"
     return "NOT VERIFIED (no previous hash)"
+
+
+def _parse_iso(ts: str) -> datetime | None:
+    """Parse an ISO-8601 timestamp string to a timezone-aware datetime.
+
+    Handles both trailing-Z and +00:00 forms, with or without microseconds.
+    Returns None on parse failure.
+    """
+    try:
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+    except (ValueError, TypeError):
+        return None

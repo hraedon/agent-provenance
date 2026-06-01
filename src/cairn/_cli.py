@@ -19,6 +19,7 @@ from typing import Any
 
 import click
 
+from . import __version__ as _cairn_version
 from .schema import check_key_file_permissions
 from .verifier import Verifier
 
@@ -132,7 +133,7 @@ def _extract_readme_sections(readme_text: str) -> tuple[str | None, str | None]:
 
 
 @click.group()
-@click.version_option(version="0.1.0", prog_name="cairn")
+@click.version_option(version=_cairn_version, prog_name="cairn")
 def main() -> None:
     """Cairn — Cryptographic provenance for agentic workflows."""
 

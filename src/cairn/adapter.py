@@ -131,7 +131,7 @@ class CairnAdapter:
             The :class:`~regista.Event` that records the attestation.
         """
         actor = actor_id or self._actor_id
-        ts = attested_at or datetime.datetime.now(datetime.UTC).isoformat().replace("+", "Z")
+        ts = attested_at or datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
         payload = ScopeAttestationPayload(
             version="1",
             principal_id=principal_id,
