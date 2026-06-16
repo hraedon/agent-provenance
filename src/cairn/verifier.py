@@ -12,6 +12,7 @@ bytes (not the signing secret).
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -1186,7 +1187,13 @@ class Verifier:
         every remaining per-event signature still verifies.  This method closes
         that gap:
 
-        1. Sort events by ``global_seq`` and flag any gap in the total order.
+        1. Walk the global hash chain (``prev_global_event_hash``, migration 030):
+           every event chains to ``sha256(prev.canonical_envelope +
+           prev.signature)`` of the event appended immediately before it across
+           all work items. This is the only signal that detects deletion of a
+           whole work item or truncation of the genesis prefix. It is gap-immune;
+           ``global_seq`` is ``CACHE 100`` and non-contiguous by design (AP-012),
+           so numeric contiguity is NOT used (legacy pre-030 bundles excepted).
         2. For every event carrying ``prev_event_hash`` (event_seq > 1), locate
            the predecessor at ``event_seq - 1`` in the same work item; recompute
            ``sha256(envelope + signature)`` and require it to equal the stored
@@ -1196,46 +1203,125 @@ class Verifier:
            a v3-chained event and must also carry ``prev_event_hash`` for
            event_seq > 1 (a v2 envelope that drops the chain field is rejected).
         """
-        # --- (1) global_seq contiguity across the whole bundle ---
+        # --- (1) global completeness across work items ---
+        # regista binds prev_global_event_hash = sha256(prev.canonical_envelope +
+        # prev.signature) of the immediately preceding event in append order
+        # (migration 030). global_seq is declared CACHE 100 and is therefore
+        # non-contiguous by design under a connection pool, so numeric contiguity
+        # is NOT a completeness signal (AP-012). We walk the signed hash links
+        # instead: gap-immune, and global_seq sort order need not equal chain
+        # order (cross-connection cache blocks), so we follow hashes, not numbers.
+        #
+        # Duplicate global_seq is still anomalous (the UNIQUE constraint should
+        # make it impossible) and is reported regardless.
         seq_events = [ev for ev in events if ev.global_seq is not None]
-        if seq_events:
+        seen_seq: dict[int, Event] = {}
+        for ev in seq_events:
+            dup = seen_seq.get(ev.global_seq)
+            if dup is not None:
+                report.chain_contiguity_violations.append(
+                    ChainContiguityViolation(
+                        kind="global_seq_gap",
+                        detail=(
+                            f"Duplicate global_seq {ev.global_seq}: events "
+                            f"{dup.event_id} and {ev.event_id} share the same "
+                            "total-order position."
+                        ),
+                        event_id=str(ev.event_id),
+                        work_item_id=str(ev.work_item_id),
+                        actual=str(ev.global_seq),
+                    )
+                )
+            else:
+                seen_seq[ev.global_seq] = ev
+
+        use_global_chain = any(
+            ev.prev_global_event_hash is not None for ev in events
+        )
+        if use_global_chain:
+            own_hash: dict[bytes, Event] = {}
+            for ev in events:
+                if ev.canonical_envelope and ev.signature:
+                    h = hashlib.sha256(
+                        bytes(ev.canonical_envelope) + bytes(ev.signature)
+                    ).digest()
+                    own_hash[h] = ev
+
+            # A "root" is an event whose global predecessor is absent from the
+            # bundle: either the true genesis (prev is None) or the first event of
+            # a windowed export (prev points outside the window). Exactly one root
+            # is expected. Additional roots mean the event that linked back into
+            # the chain was deleted — an interior break across work items, which
+            # the per-work-item prev_event_hash walk cannot see.
+            roots = [
+                ev
+                for ev in events
+                if ev.prev_global_event_hash is None
+                or bytes(ev.prev_global_event_hash) not in own_hash
+            ]
+            roots.sort(key=lambda e: e.global_seq if e.global_seq is not None else 0)
+            for extra in roots[1:]:
+                report.chain_contiguity_violations.append(
+                    ChainContiguityViolation(
+                        kind="global_seq_gap",
+                        detail=(
+                            f"Global hash chain broken: event {extra.event_id} "
+                            "chains to a global predecessor absent from the bundle, "
+                            "but it is not the bundle's first event. An event was "
+                            "deleted or the log truncated between work items."
+                        ),
+                        event_id=str(extra.event_id),
+                        work_item_id=str(extra.work_item_id),
+                    )
+                )
+
+            # A fork — two events chaining to the same in-bundle predecessor —
+            # means an event was spliced in or duplicated.
+            successor_of: dict[bytes, str] = {}
+            for ev in events:
+                if ev.prev_global_event_hash is None:
+                    continue
+                pb = bytes(ev.prev_global_event_hash)
+                if pb not in own_hash:
+                    continue
+                if pb in successor_of:
+                    report.chain_contiguity_violations.append(
+                        ChainContiguityViolation(
+                            kind="prev_hash_mismatch",
+                            detail=(
+                                "Global hash chain fork: events "
+                                f"{successor_of[pb]} and {ev.event_id} both chain to "
+                                "the same predecessor — an event was spliced in or "
+                                "duplicated."
+                            ),
+                            event_id=str(ev.event_id),
+                            work_item_id=str(ev.work_item_id),
+                        )
+                    )
+                else:
+                    successor_of[pb] = str(ev.event_id)
+        elif seq_events:
+            # Legacy bundles predating the global chain (migration 030) carry no
+            # prev_global_event_hash; fall back to numeric global_seq contiguity.
             ordered = sorted(seq_events, key=lambda e: e.global_seq)
-            prev: Event | None = None
-            for ev in ordered:
-                if prev is not None:
-                    gap = ev.global_seq - prev.global_seq
-                    if gap == 0:
-                        report.chain_contiguity_violations.append(
-                            ChainContiguityViolation(
-                                kind="global_seq_gap",
-                                detail=(
-                                    f"Duplicate global_seq {ev.global_seq}: events "
-                                    f"{prev.event_id} and {ev.event_id} share the same "
-                                    "total-order position."
-                                ),
-                                event_id=str(ev.event_id),
-                                work_item_id=str(ev.work_item_id),
-                                expected=str(prev.global_seq + 1),
-                                actual=str(ev.global_seq),
-                            )
+            for prev, ev in itertools.pairwise(ordered):
+                gap = ev.global_seq - prev.global_seq
+                if gap > 1:
+                    report.chain_contiguity_violations.append(
+                        ChainContiguityViolation(
+                            kind="global_seq_gap",
+                            detail=(
+                                f"global_seq jumps from {prev.global_seq} to "
+                                f"{ev.global_seq} ({gap - 1} event(s) missing). "
+                                "Events may have been deleted or truncated from "
+                                "the log."
+                            ),
+                            event_id=str(ev.event_id),
+                            work_item_id=str(ev.work_item_id),
+                            expected=str(prev.global_seq + 1),
+                            actual=str(ev.global_seq),
                         )
-                    elif gap > 1:
-                        report.chain_contiguity_violations.append(
-                            ChainContiguityViolation(
-                                kind="global_seq_gap",
-                                detail=(
-                                    f"global_seq jumps from {prev.global_seq} to "
-                                    f"{ev.global_seq} ({gap - 1} event(s) missing). "
-                                    "Events may have been deleted or truncated from "
-                                    "the log."
-                                ),
-                                event_id=str(ev.event_id),
-                                work_item_id=str(ev.work_item_id),
-                                expected=str(prev.global_seq + 1),
-                                actual=str(ev.global_seq),
-                            )
-                        )
-                prev = ev
+                    )
 
         # --- (2)/(3) prev_event_hash chain walk + downgrade refusal ---
         # Index events by (work_item_id, event_seq) for predecessor lookup.
