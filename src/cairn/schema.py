@@ -263,13 +263,21 @@ def check_key_file_permissions(path: str) -> list[str]:
     """Check that a key file has restrictive permissions.
 
     Returns a list of warning strings (empty if permissions are acceptable).
-    Warns if the file is readable by group or others.
+    Warns if the file is readable by group or others, or if it is a symlink
+    (which could point to an attacker-controlled target).
     """
     import os
     import stat
 
     warnings: list[str] = []
     try:
+        # Check for symlinks first (lstat does not follow them).
+        lst = os.lstat(path)
+        if stat.S_ISLNK(lst.st_mode):
+            warnings.append(
+                f"Key file {path} is a symlink — resolve the real path "
+                "before using for signing"
+            )
         st = os.stat(path)
         mode = stat.S_IMODE(st.st_mode)
         if mode & stat.S_IRGRP:

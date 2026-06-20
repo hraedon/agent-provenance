@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -1153,7 +1154,7 @@ def test_format_report_html_shows_scope_attestation() -> None:
             version="1",
             principal_id="human:test",
             attested_at="2026-05-24T12:00:00Z",
-            harnesses=[{"name": "opencode", "version": "0.1.0"}],
+            harnesses=({"name": "opencode", "version": "0.1.0"},),
             scope_statement="In scope: opencode.",
         )
     )
@@ -2298,6 +2299,83 @@ def test_temporal_ordering_authenticated_after_event(hmac_keys: Path) -> None:
     assert "authenticated_at" in tvs[0].detail
 
 
+def test_tsa_temporal_ordering_only_checks_covered_events(
+    hmac_keys: Path, tmp_path: Path
+) -> None:
+    """BC-020: TSA temporal ordering only flags events covered by the batch.
+
+    Events whose ``event_id`` is in the batch's ``event_ids`` list are checked
+    against the TSA timestamp + tolerance.  Events NOT in the list are skipped,
+    even if their timestamp exceeds the deadline.
+    """
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime, timedelta
+
+    # TSA timestamp is at 12:00; tolerance is 5 minutes → deadline 12:05.
+    tsa_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    # Both events are at 12:10 — well past the 5-minute tolerance.
+    ev_time = tsa_time + timedelta(minutes=10)
+
+    ev_covered = _make_signed_event(
+        key_bytes,
+        event_seq=0,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        timestamp=ev_time,
+    )
+    ev_uncovered = _make_signed_event(
+        key_bytes,
+        event_seq=1,
+        transition="tool_call_end",
+        payload={"tool": "Read"},
+        timestamp=ev_time,
+    )
+
+    ts_batch_id = str(uuid.uuid4())
+    bundle: dict = {
+        "manifest": {"events_count": 2},
+        "events": [ev_covered.to_dict(), ev_uncovered.to_dict()],
+        "timestamp_batches": [
+            {
+                "batch_id": ts_batch_id,
+                # Only ev_covered is in the batch's coverage.
+                "event_ids": [str(ev_covered.event_id)],
+                "merkle_root": "a" * 64,
+                "status": "confirmed",
+                "tsa_timestamp": tsa_time.isoformat(),
+            }
+        ],
+    }
+    manifest = bundle["manifest"]
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    manifest["bundle_hash"] = digest
+
+    bundle_path = tmp_path / "bundle_bc020.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+
+    tsa_violations = [
+        t for t in report.temporal_violations if t.kind == "event_after_tsa"
+    ]
+    # Exactly one violation — for the covered event only.
+    assert len(tsa_violations) == 1, (
+        f"Expected 1 TSA temporal violation (for covered event), "
+        f"got {len(tsa_violations)}: {[(v.event_id, v.detail) for v in tsa_violations]}"
+    )
+    assert tsa_violations[0].event_id == str(ev_covered.event_id)
+    # The uncovered event must NOT appear in any TSA violation.
+    assert tsa_violations[0].event_id != str(ev_uncovered.event_id)
+
+    # Verify event_ids are populated on the batch entry.
+    assert report.timestamp_batches[0].event_ids == (str(ev_covered.event_id),)
+
+
 def test_role_gate_actor_signs_auditor_transition(hmac_keys: Path) -> None:
     """Actor key signing an auditor-only transition is flagged."""
     key_data = json.loads(hmac_keys.read_text())
@@ -2388,8 +2466,6 @@ def test_all_ok_includes_new_checks(hmac_keys: Path) -> None:
     key_id = key_data["keys"][0]["key_id"]
     key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
     key_set = {key_id: key_bytes}
-    key_meta = {key_id: {"role": "actor"}}
-
     # Auditor signing actor transition — role violation
     ev = _make_signed_event(
         key_bytes,
@@ -2412,7 +2488,8 @@ def _build_signed_tsa_token(merkle_root: bytes, cert, private_key) -> bytes:
     """Build a minimal CMS-signed TSA token for testing."""
     import hashlib
 
-    from asn1crypto import algos, cms, core, tsp as asn1tsp
+    from asn1crypto import cms, core
+    from asn1crypto import tsp as asn1tsp
     from cryptography.hazmat.primitives import hashes as crypto_hashes
     from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -2479,7 +2556,7 @@ def _generate_test_cert():
     import datetime
 
     from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.x509.oid import NameOID
 
@@ -2755,7 +2832,10 @@ def test_witness_coverage_check(tmp_path: Path) -> None:
         separators=(",", ":"), sort_keys=True,
     ).encode("utf-8")
     # Include manifest without bundle_hash
-    redacted_manifest = {k: v for k, v in manifest.items() if k not in ("bundle_hash", "bundle_hash_covers")}
+    redacted_manifest = {
+        k: v for k, v in manifest.items()
+        if k not in ("bundle_hash", "bundle_hash_covers")
+    }
     full_canonical = json.dumps(
         {"manifest": redacted_manifest, **{k: v for k, v in bundle.items() if k != "manifest"}},
         separators=(",", ":"), sort_keys=True,
@@ -3274,3 +3354,761 @@ def test_bc017_cli_enforces_role_gate(tmp_path: Path) -> None:
     )
     assert result.exit_code == 1, result.output
     assert "ROLE GATE VIOLATIONS" in result.output
+
+
+# ----------------------------------------------------------------------
+# BC-003: bundle chain linking via cairn export
+# ----------------------------------------------------------------------
+
+
+_fake_regista_events: list = []
+
+
+class _FakeTimestamping:
+    def list_batches(self, status=None) -> list:
+        return []
+
+
+class _FakeWitnesses:
+    def list(self, status=None) -> list:
+        return []
+
+    def receipts(self, **kwargs) -> list:
+        return []
+
+
+class _FakeRegista:
+    def __init__(self, *args, **kwargs) -> None:
+        self.connection_info = type("ConnectionInfo", (), {"host": "fake-host"})()
+        self.timestamping = _FakeTimestamping()
+        self.witnesses = _FakeWitnesses()
+
+    def read_events(self, **kwargs) -> list:
+        return list(_fake_regista_events)
+
+    def close(self) -> None:
+        pass
+
+
+def _make_exportable_event(key_bytes: bytes, seq: int = 0):
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=seq,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+    return Event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        event_seq=seq,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+
+def test_export_with_previous_bundle_includes_chain_link(
+    hmac_keys: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """BC-003: export --previous-bundle writes previous_bundle_hash into manifest."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    global _fake_regista_events
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    os.chmod(hmac_keys, 0o600)
+
+    runner = CliRunner()
+    monkeypatch.setattr("regista.Regista", _FakeRegista)
+
+    # First export
+    _fake_regista_events = [_make_exportable_event(key_bytes)]
+    bundle1 = tmp_path / "bundle1.json"
+    result1 = runner.invoke(
+        main,
+        [
+            "export",
+            "--dsn",
+            "postgresql://fake",
+            "--project",
+            "p",
+            "--keys",
+            str(hmac_keys),
+            "--output",
+            str(bundle1),
+        ],
+    )
+    assert result1.exit_code == 0, result1.output
+    manifest1 = json.loads(bundle1.read_text())["manifest"]
+    assert "bundle_hash" in manifest1
+    assert "previous_bundle_hash" not in manifest1
+
+    # Second export, explicitly linked to the first bundle
+    _fake_regista_events = [_make_exportable_event(key_bytes, seq=1)]
+    bundle2 = tmp_path / "bundle2.json"
+    result2 = runner.invoke(
+        main,
+        [
+            "export",
+            "--dsn",
+            "postgresql://fake",
+            "--project",
+            "p",
+            "--keys",
+            str(hmac_keys),
+            "--output",
+            str(bundle2),
+            "--previous-bundle",
+            str(bundle1),
+        ],
+    )
+    assert result2.exit_code == 0, result2.output
+    manifest2 = json.loads(bundle2.read_text())["manifest"]
+    assert manifest2.get("previous_bundle_hash") == manifest1["bundle_hash"]
+
+    # State file is also updated for the next export
+    state_file = tmp_path / ".cairn_last_bundle_hash"
+    assert state_file.exists()
+    assert state_file.read_text().strip() == manifest2["bundle_hash"]
+
+
+def test_export_chain_link_verify_chain_accepts(
+    hmac_keys: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """BC-003: verifier.verify_bundle_chain accepts two cairn export outputs."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    global _fake_regista_events
+    key_data = json.loads(hmac_keys.read_text())
+    key_id = key_data["keys"][0]["key_id"]
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    os.chmod(hmac_keys, 0o600)
+
+    runner = CliRunner()
+    monkeypatch.setattr("regista.Regista", _FakeRegista)
+
+    _fake_regista_events = [_make_exportable_event(key_bytes)]
+    bundle1 = tmp_path / "bundle1.json"
+    runner.invoke(
+        main,
+        [
+            "export",
+            "--dsn",
+            "postgresql://fake",
+            "--project",
+            "p",
+            "--keys",
+            str(hmac_keys),
+            "--output",
+            str(bundle1),
+        ],
+    )
+
+    _fake_regista_events = [_make_exportable_event(key_bytes, seq=1)]
+    bundle2 = tmp_path / "bundle2.json"
+    runner.invoke(
+        main,
+        [
+            "export",
+            "--dsn",
+            "postgresql://fake",
+            "--project",
+            "p",
+            "--keys",
+            str(hmac_keys),
+            "--output",
+            str(bundle2),
+            "--previous-bundle",
+            str(bundle1),
+        ],
+    )
+
+    verifier = Verifier({key_id: key_bytes})
+    report = verifier.verify_bundle_chain([bundle1, bundle2])
+    assert report.total_events == 2
+    assert report.ok == 2
+    assert report.all_ok
+
+
+# ----------------------------------------------------------------------
+# BC-021: export warns on timestamp/witness load failures
+# ----------------------------------------------------------------------
+
+
+class _FailingTimestamping:
+    """Fake timestamping sub-object that raises on list_batches."""
+
+    def list_batches(self, status=None):
+        raise RuntimeError("timestamp DB connection lost")
+
+
+class _FailingWitnesses:
+    """Fake witnesses sub-object that raises on list."""
+
+    def list(self, status=None):
+        raise RuntimeError("witness service unavailable")
+
+    def receipts(self, **kwargs):
+        return []
+
+
+def test_bc021_export_warns_on_timestamp_load_failure(
+    hmac_keys: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """BC-021: export emits a stderr warning when timestamp batch loading fails."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    global _fake_regista_events
+    os.chmod(hmac_keys, 0o600)
+
+    class _FakeRegistaTsFail(_FakeRegista):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.timestamping = _FailingTimestamping()
+
+    monkeypatch.setattr("regista.Regista", _FakeRegistaTsFail)
+    _fake_regista_events = []
+
+    runner = CliRunner()
+    output_path = tmp_path / "bundle.json"
+    result = runner.invoke(
+        main,
+        [
+            "export",
+            "--dsn", "postgresql://fake",
+            "--project", "p",
+            "--keys", str(hmac_keys),
+            "--output", str(output_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "failed to load timestamp batches" in result.output
+    assert "bundle will not contain timestamp data" in result.output
+    assert "timestamp DB connection lost" in result.output
+
+
+def test_bc021_export_warns_on_witness_load_failure(
+    hmac_keys: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """BC-021: export emits a stderr warning when witness data loading fails."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    global _fake_regista_events
+    os.chmod(hmac_keys, 0o600)
+
+    class _FakeRegistaWitnessFail(_FakeRegista):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.witnesses = _FailingWitnesses()
+
+    monkeypatch.setattr("regista.Regista", _FakeRegistaWitnessFail)
+    _fake_regista_events = []
+
+    runner = CliRunner()
+    output_path = tmp_path / "bundle.json"
+    result = runner.invoke(
+        main,
+        [
+            "export",
+            "--dsn", "postgresql://fake",
+            "--project", "p",
+            "--keys", str(hmac_keys),
+            "--output", str(output_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "failed to load witness data" in result.output
+    assert "bundle will not contain witness registrations or receipts" in result.output
+    assert "witness service unavailable" in result.output
+
+
+# ---------------------------------------------------------------------------
+# AP-010: CLI command coverage
+# ---------------------------------------------------------------------------
+
+
+def _make_cli_bundle(
+    key_bytes: bytes,
+    key_id: str,
+    tmp_path: Path,
+    payload: dict | None = None,
+) -> Path:
+    """Create a bundle file with a single HMAC-signed event for CLI tests."""
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    now = datetime.now(UTC)
+    ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id=key_id,
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload=payload or {"tool": "Read"},
+        key=key_bytes,
+    )
+    event = Event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id=key_id,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload=payload or {"tool": "Read"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    manifest: dict = {"events_count": 1}
+    bundle: dict = {"manifest": manifest, "events": [event.to_dict()]}
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    manifest["bundle_hash"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+    return bundle_path
+
+
+def _make_ed25519_cli_bundle(tmp_path: Path) -> tuple[Path, Path]:
+    """Create an Ed25519-signed bundle and matching key file for CLI tests."""
+    pytest.importorskip("nacl.signing")
+    from datetime import UTC, datetime
+
+    from nacl.signing import SigningKey
+    from regista._signing import sign_event
+    from regista._signing_scheme import get_scheme
+    from regista._types import Event
+
+    signing_key = SigningKey.generate()
+    verify_key = signing_key.verify_key
+    key_id = "ed25519-test-001"
+
+    keys_path = tmp_path / "ed25519_keys.json"
+    keys_path.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {
+                        "key_id": key_id,
+                        "scheme": "ed25519",
+                        "public_key": base64.b64encode(bytes(verify_key)).decode("utf-8"),
+                        "encoding": "base64",
+                    }
+                ]
+            }
+        )
+    )
+    os.chmod(keys_path, 0o600)
+
+    now = datetime.now(UTC)
+    ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id=key_id,
+        event_seq=0,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Edit", "tool_args_hash": "sha256:abc"},
+        key=bytes(signing_key),
+        scheme=get_scheme("ed25519"),
+    )
+    event = Event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id=key_id,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={"tool": "Edit", "tool_args_hash": "sha256:abc"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+        scheme_id="ed25519",
+    )
+
+    manifest: dict = {"events_count": 1}
+    bundle: dict = {"manifest": manifest, "events": [event.to_dict()]}
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    manifest["bundle_hash"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+    return bundle_path, keys_path
+
+
+def test_verify_json_format(hmac_keys: Path, tmp_path: Path) -> None:
+    """cairn verify --format json emits valid JSON with expected fields."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    key_data = json.loads(hmac_keys.read_text())
+    key_id = key_data["keys"][0]["key_id"]
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    os.chmod(hmac_keys, 0o600)
+
+    bundle_path = _make_cli_bundle(key_bytes, key_id, tmp_path)
+    output_path = tmp_path / "report.json"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "verify",
+            "--bundle-path", str(bundle_path),
+            "--keys", str(hmac_keys),
+            "--format", "json",
+            "--output", str(output_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(output_path.read_text())
+    assert "summary" in data
+    assert "entries" in data
+    assert data["summary"]["all_ok"] is True
+
+
+def test_verify_html_format(hmac_keys: Path, tmp_path: Path) -> None:
+    """cairn verify --format html emits self-contained HTML."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    key_data = json.loads(hmac_keys.read_text())
+    key_id = key_data["keys"][0]["key_id"]
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    os.chmod(hmac_keys, 0o600)
+
+    bundle_path = _make_cli_bundle(key_bytes, key_id, tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "verify",
+            "--bundle-path", str(bundle_path),
+            "--keys", str(hmac_keys),
+            "--format", "html",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    output = result.output.lower()
+    assert "<html" in output
+    assert "</html>" in output
+    assert "cairn verification report" in output
+
+
+def test_verify_chain_valid(hmac_keys: Path, tmp_path: Path) -> None:
+    """cairn verify-chain accepts two correctly linked bundles."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    key_data = json.loads(hmac_keys.read_text())
+    key_id = key_data["keys"][0]["key_id"]
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    os.chmod(hmac_keys, 0o600)
+
+    def make_bundle(seq: int, previous_bundle_hash: str | None) -> Path:
+        manifest: dict = {"events_count": 1}
+        if previous_bundle_hash:
+            manifest["previous_bundle_hash"] = previous_bundle_hash
+        bundle: dict = {
+            "manifest": manifest,
+            "events": [],
+        }
+        bundle_path = tmp_path / f"bundle_{seq}.json"
+
+        from datetime import UTC, datetime
+
+        from regista._signing import sign_event
+        from regista._types import Event
+
+        now = datetime.now(UTC)
+        ev_id = uuid.uuid4()
+        wi_id = uuid.uuid4()
+        sig, c_hash, env = sign_event(
+            event_id=ev_id,
+            work_item_id=wi_id,
+            actor_id="agent-1",
+            key_id=key_id,
+            event_seq=seq,
+            workflow_name="cairn_agent_actions",
+            workflow_version=1,
+            timestamp=now,
+            transition="tool_call_begin",
+            payload={"tool": "Read"},
+            key=key_bytes,
+        )
+        event = Event(
+            event_id=ev_id,
+            work_item_id=wi_id,
+            event_seq=seq,
+            actor_id="agent-1",
+            actor_kind="agent",
+            actor_metadata=None,
+            key_id=key_id,
+            workflow_name="cairn_agent_actions",
+            workflow_version=1,
+            timestamp=now,
+            transition="tool_call_begin",
+            payload={"tool": "Read"},
+            payload_canonical_hash=c_hash,
+            signature=sig,
+            canonical_envelope=env,
+        )
+        bundle["events"].append(event.to_dict())
+
+        canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        manifest["bundle_hash"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+        bundle_path.write_text(json.dumps(bundle, indent=2))
+        return bundle_path
+
+    bundle1 = make_bundle(0, None)
+    hash1 = json.loads(bundle1.read_text())["manifest"]["bundle_hash"]
+    bundle2 = make_bundle(1, hash1)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "verify-chain",
+            "--bundles", str(bundle1),
+            "--bundles", str(bundle2),
+            "--keys", str(hmac_keys),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "ALL CHECKS PASSED" in result.output
+
+
+def test_diff_bundles_cli(hmac_keys: Path, tmp_path: Path) -> None:
+    """cairn diff reports events added between two bundles."""
+    from datetime import UTC, datetime
+    from typing import Any
+
+    from click.testing import CliRunner
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    from cairn._cli import main
+
+    key_data = json.loads(hmac_keys.read_text())
+    key_id = key_data["keys"][0]["key_id"]
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+
+    def make_event(seq: int) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        ev_id = uuid.uuid4()
+        wi_id = uuid.uuid4()
+        sig, c_hash, env = sign_event(
+            event_id=ev_id,
+            work_item_id=wi_id,
+            actor_id="agent-1",
+            key_id=key_id,
+            event_seq=seq,
+            workflow_name="cairn_agent_actions",
+            workflow_version=1,
+            timestamp=now,
+            transition="tool_call_begin",
+            payload={"tool": "Read", "tool_args_hash": f"sha256:{seq}"},
+            key=key_bytes,
+        )
+        return Event(
+            event_id=ev_id,
+            work_item_id=wi_id,
+            event_seq=seq,
+            actor_id="agent-1",
+            actor_kind="agent",
+            actor_metadata=None,
+            key_id=key_id,
+            workflow_name="cairn_agent_actions",
+            workflow_version=1,
+            timestamp=now,
+            transition="tool_call_begin",
+            payload={"tool": "Read", "tool_args_hash": f"sha256:{seq}"},
+            payload_canonical_hash=c_hash,
+            signature=sig,
+            canonical_envelope=env,
+        ).to_dict()
+
+    ev0 = make_event(0)
+    ev1 = make_event(1)
+
+    older = tmp_path / "older.json"
+    newer = tmp_path / "newer.json"
+    older.write_text(json.dumps({"manifest": {"events_count": 1}, "events": [ev0]}))
+    newer.write_text(json.dumps({"manifest": {"events_count": 2}, "events": [ev0, ev1]}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["diff", "--older", str(older), "--newer", str(newer)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "New event" in result.output
+    assert ev1["event_id"] in result.output
+
+
+def test_extract_control(tmp_path: Path) -> None:
+    """cairn extract-control emits the control description from README §4.2."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["extract-control"])
+    assert result.exit_code == 0, result.output
+    output_lower = result.output.lower()
+    assert "cairn" in output_lower or "provenance" in output_lower
+    assert "control description" in output_lower
+
+
+def test_verify_missing_bundle(hmac_keys: Path, tmp_path: Path) -> None:
+    """cairn verify reports an error for a missing bundle file."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    os.chmod(hmac_keys, 0o600)
+    missing_bundle = tmp_path / "missing.json"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "verify",
+            "--bundle-path", str(missing_bundle),
+            "--keys", str(hmac_keys),
+        ],
+    )
+    assert result.exit_code != 0, result.output
+    assert "does not exist" in result.output.lower() or "invalid value" in result.output.lower()
+
+
+def test_verify_bad_keys_path(tmp_path: Path) -> None:
+    """cairn verify reports an error for a missing keys file."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text(json.dumps({"manifest": {}, "events": []}))
+    missing_keys = tmp_path / "missing_keys.json"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "verify",
+            "--bundle-path", str(bundle_path),
+            "--keys", str(missing_keys),
+        ],
+    )
+    assert result.exit_code != 0, result.output
+    assert "does not exist" in result.output.lower() or "invalid value" in result.output.lower()
+
+
+def test_export_missing_dsn(hmac_keys: Path, tmp_path: Path) -> None:
+    """cairn export without --dsn exits with a usage error."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    os.chmod(hmac_keys, 0o600)
+    output_path = tmp_path / "bundle.json"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "export",
+            "--project", "p",
+            "--keys", str(hmac_keys),
+            "--output", str(output_path),
+        ],
+    )
+    assert result.exit_code != 0, result.output
+    assert "missing option" in result.output.lower() and "dsn" in result.output.lower()
+
+
+def test_load_key_set_ed25519(tmp_path: Path) -> None:
+    """CLI verify path loads Ed25519 public keys and verifies a signature."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    bundle_path, keys_path = _make_ed25519_cli_bundle(tmp_path)
+    output_path = tmp_path / "report.json"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "verify",
+            "--bundle-path", str(bundle_path),
+            "--keys", str(keys_path),
+            "--format", "json",
+            "--output", str(output_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(output_path.read_text())
+    assert data["summary"]["all_ok"] is True
+    assert data["scheme_counts"].get("ed25519") == 1

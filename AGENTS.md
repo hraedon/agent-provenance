@@ -101,16 +101,29 @@ In rough order. Do not assume any of these are done; check on entry.
    an auditor-ready report.
    **Done: `src/cairn/verifier.py` + CLI `cairn verify`.**
 
-## Current status (last updated 2026-06-01)
+## Current status (last updated 2026-06-20)
 
-- **Tests**: 140 passing (CI depends on Postgres).
-- **Lint**: ruff clean on changed files; pre-existing RUF012/N806 in verifier.py.
-- **Gaps closed this session**: BC-012 (malformed attested_at timestamp);
+- **Tests**: 154 passing (CI runs without Postgres; Postgres-dependent tests skip gracefully).
+- **Lint**: ruff clean; 2 pre-existing RUF012 in verifier.py (class-level mutable sets).
+- **CI**: `.github/workflows/ci.yml` (ruff + mypy + pytest) + `Makefile`.
+- **Gaps closed this session**: BC-020 (temporal ordering only checks TSA-covered
+  events); BC-021 (export warns on timestamp/witness load failure); BC-003
+  (bundle chain-linking via `--previous-bundle` + auto-linking state file);
+  AP-010 (CLI test coverage: 9 new tests for verify, verify-chain, diff,
+  extract-control, error paths, Ed25519 key loading);
+  WI-001 partial (CI pipeline added, but Postgres-dependent tests still skip);
+  verifier.py split into verifier_types.py (339 lines), verifier_report.py
+  (1126 lines), verifier.py (1749 lines);
+  frozen dataclass mutable fields changed to tuples;
+  verify_bundle_chain TOCTOU fixed (single file read);
+  symlink detection + fail-closed key permission enforcement;
+  atomic state file writes; encoding validation; log.warn→warning.
+- **Gaps closed previously**: BC-012 (malformed attested_at timestamp);
   BC-011 (uncaught exceptions on malformed bundles); BC-014 (chain integrity
   over-claiming for single bundles); AP-009 (single source of truth for version);
   AP-011 (HTML report missing key rotations and key revocations);
   scheme_counts + witness fields merge in verify_bundle_chain.
-- **Gaps closed previously**: scope attestation as signed first-class event (README §2);
+- **Gaps closed earlier**: scope attestation as signed first-class event (README §2);
   opencode plugin + bridge end-to-end functional; bundle export/verify with
   control narrative; Claude Code hooks (Plan 004); session_id passthrough
   from harness to bridge (fixes audit grouping bug); `cairn diff` command
@@ -140,9 +153,10 @@ In rough order. Do not assume any of these are done; check on entry.
   cryptographically verified — blocked on regista asymmetric witness signing);
   BC-005 (scope attestation uses tool_call transitions — blocked on regista
   Plan 016); BC-018 (global_seq gap check — documented as non-issue);
-  temporal ordering check flags all events not just batch-covered (new BC);
-  CLI export silently swallows timestamp/witness errors (new BC);
-  OpenCode plugin loses end events on bridge failure (new BC).
+  BC-019 (verify_bundle_chain does not merge scheme_counts);
+  BC-022 (OpenCode plugin loses end events on bridge failure);
+  WI-001 remaining (Postgres service container for CI);
+  WI-002 (cross-component meaning contracts as conformance-tested artifacts).
 
 ## What not to do
 

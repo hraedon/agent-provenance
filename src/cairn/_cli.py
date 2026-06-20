@@ -12,6 +12,7 @@ import base64
 import datetime
 import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -30,6 +31,20 @@ TRUST_MODEL_CAVEAT = (
 )
 
 README_PATH = Path(__file__).resolve().parent.parent.parent / "README.md"
+
+
+def _check_key_permissions_strict(keys_path: Path) -> None:
+    """Warn about readable permissions and refuse writable permissions.
+
+    Signing operations should not proceed if the key file can be modified by
+    group or others, if it is a symlink, or if permissions cannot be checked.
+    Verification may continue to warn because auditors may not control the
+    filesystem where keys are stored.
+    """
+    for w in check_key_file_permissions(str(keys_path)):
+        if "writable" in w or "symlink" in w or "stat failed" in w:
+            raise click.ClickException(f"Refusing to use signing key: {w}")
+        click.echo(f"WARNING: {w}", err=True)
 
 
 def _load_key_set(keys_path: Path) -> dict[str, bytes]:
@@ -57,17 +72,50 @@ def _load_key_set(keys_path: Path) -> dict[str, bytes]:
                 continue
             encoding = entry.get("encoding", "base64")
             if encoding == "base64":
-                key_set[key_id] = base64.b64decode(public_key_raw)
+                public_key = base64.b64decode(public_key_raw)
+            elif encoding == "utf8":
+                public_key = public_key_raw.encode("utf-8")
             else:
-                key_set[key_id] = public_key_raw.encode("utf-8")
+                raise click.BadParameter(
+                    f"Ed25519 key {key_id!r}: unsupported encoding {encoding!r}"
+                )
+            if len(public_key) != 32:
+                raise click.BadParameter(
+                    f"Ed25519 public key {key_id!r} must be 32 bytes, got {len(public_key)}"
+                )
+            if "secret" in entry:
+                secret_raw = entry["secret"]
+                if encoding == "base64":
+                    secret = base64.b64decode(secret_raw)
+                elif encoding == "utf8":
+                    secret = secret_raw.encode("utf-8")
+                else:
+                    raise click.BadParameter(
+                        f"Ed25519 key {key_id!r}: unsupported encoding {encoding!r}"
+                    )
+                if len(secret) not in (32, 64):
+                    raise click.BadParameter(
+                        f"Ed25519 secret {key_id!r} must be 32 or 64 bytes, got {len(secret)}"
+                    )
+            key_set[key_id] = public_key
         else:
             # HMAC-SHA256: use the secret
             secret_raw = entry["secret"]
             encoding = entry.get("encoding", "utf8")
             if encoding == "base64":
                 secret: bytes = base64.b64decode(secret_raw)
-            else:
+            elif encoding == "utf8":
                 secret = secret_raw.encode("utf-8")
+            else:
+                raise click.BadParameter(
+                    f"HMAC key {key_id!r}: unsupported encoding {encoding!r}"
+                )
+            if len(secret) < 32:
+                click.echo(
+                    f"WARNING: HMAC-SHA256 key {key_id!r} is {len(secret)} bytes; "
+                    "regista recommends at least 32 bytes.",
+                    err=True,
+                )
             key_set[key_id] = secret
 
     return key_set
@@ -99,6 +147,57 @@ def _load_key_metadata(keys_path: Path) -> dict[str, dict[str, Any]]:
         if meta:
             key_metadata[key_id] = meta
     return key_metadata
+
+
+_LAST_BUNDLE_HASH_FILE = ".cairn_last_bundle_hash"
+
+
+def _read_previous_bundle_hash(path: Path) -> str:
+    """Extract the bundle hash from a previous bundle file for chain linking."""
+    try:
+        raw = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        raise click.ClickException(f"Cannot read previous bundle {path}: {exc}")
+    manifest = raw.get("manifest", {})
+    h = manifest.get("bundle_hash")
+    if not h:
+        raise click.ClickException(
+            f"Previous bundle {path} has no manifest.bundle_hash"
+        )
+    return h
+
+
+def _load_last_bundle_hash(directory: Path) -> str | None:
+    """Read the cached hash of the most recently exported bundle in a directory."""
+    path = directory / _LAST_BUNDLE_HASH_FILE
+    if not path.exists():
+        return None
+    return path.read_text().strip() or None
+
+
+def _save_last_bundle_hash(directory: Path, bundle_hash: str) -> None:
+    """Cache the hash of the just-exported bundle for the next export.
+
+    Uses an atomic write (write to temp, then rename) to prevent partial
+    reads if the process is interrupted.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / _LAST_BUNDLE_HASH_FILE
+    tmp = target.with_suffix(".tmp")
+    try:
+        tmp.write_text(bundle_hash)
+        os.replace(str(tmp), str(target))
+    except OSError:
+        # Best-effort: if the state file can't be written, the next export
+        # simply won't have auto-linking.  Clean up the temp file.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        click.echo(
+            f"Warning: could not write bundle hash state file {target}",
+            err=True,
+        )
 
 
 _SECTION_RE = re.compile(r"^#+\s+(\d+(?:\.\d+)?)")
@@ -255,6 +354,15 @@ def verify_chain(
     default=None,
     help="sha256:... hash of the preceding bundle for chain integrity",
 )
+@click.option(
+    "--previous-bundle",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help=(
+        "Path to the previous bundle file; its manifest.bundle_hash is used as "
+        "previous_bundle_hash."
+    ),
+)
 def export(
     dsn: str,
     project: str,
@@ -263,110 +371,129 @@ def export(
     since: str | None,
     until: str | None,
     previous_bundle_hash: str | None,
+    previous_bundle: Path | None,
 ) -> None:
     """Export events from regista into a signed bundle for offline verification."""
-    for w in check_key_file_permissions(str(keys)):
-        click.echo(f"WARNING: {w}", err=True)
+    _check_key_permissions_strict(keys)
 
     from regista import Regista
 
     sub = Regista(dsn=dsn, project=project, hmac_key_path=str(keys))
+    try:
+        start = datetime.datetime.fromisoformat(since) if since else None
+        end = datetime.datetime.fromisoformat(until) if until else None
 
-    start = datetime.datetime.fromisoformat(since) if since else None
-    end = datetime.datetime.fromisoformat(until) if until else None
-
-    events = sub.read_events(
-        start=start,
-        end=end,
-        limit=10_000,
-    )
-
-    readme_text = ""
-    if README_PATH.exists():
-        readme_text = README_PATH.read_text()
-    control_description, trust_model_caveat = _extract_readme_sections(readme_text)
-
-    source_host = getattr(getattr(sub, "connection_info", None), "host", None) or "unknown"
-
-    manifest: dict[str, Any] = {
-        "events_count": len(events),
-        "exported_at": datetime.datetime.now(datetime.UTC).isoformat(),
-        "source_project": project,
-        "source_dsn_host": source_host,
-    }
-
-    if previous_bundle_hash:
-        manifest["previous_bundle_hash"] = previous_bundle_hash
-
-    if control_description:
-        manifest["control_description"] = control_description
-        manifest["control_description_source_digest"] = (
-            "sha256:" + hashlib.sha256(readme_text.encode("utf-8")).hexdigest()
+        events = sub.read_events(
+            start=start,
+            end=end,
+            limit=10_000,
         )
-    manifest["trust_model_caveat"] = trust_model_caveat
 
-    bundle: dict[str, Any] = {
-        "manifest": manifest,
-        "events": [ev.to_dict() for ev in events],
-    }
+        readme_text = ""
+        if README_PATH.exists():
+            readme_text = README_PATH.read_text()
+        control_description, trust_model_caveat = _extract_readme_sections(readme_text)
 
-    exported_event_ids = {str(ev.event_id) for ev in events}
-    try:
-        confirmed_batches = sub.timestamping.list_batches(status="confirmed")
-        covering_batches = []
-        for batch in confirmed_batches:
-            batch_event_ids = {str(eid) for eid in batch.event_ids}
-            if batch_event_ids & exported_event_ids:
-                covering_batches.append(batch.to_dict())
-        if covering_batches:
-            bundle["timestamp_batches"] = covering_batches
-    except Exception:
-        pass
+        source_host = getattr(getattr(sub, "connection_info", None), "host", None) or "unknown"
 
-    # Include witness registrations and confirmed receipts
-    try:
-        witnesses = sub.witnesses.list(status="active")
-        if witnesses:
-            safe_witnesses = []
-            for w in witnesses:
-                sw = {k: v for k, v in w.items() if k != "sign_secret"}
-                safe_witnesses.append(sw)
-            bundle["witness_registrations"] = safe_witnesses
+        manifest: dict[str, Any] = {
+            "events_count": len(events),
+            "exported_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "source_project": project,
+            "source_dsn_host": source_host,
+        }
 
-            witness_receipts = []
-            for ev_id in exported_event_ids:
-                receipts = sub.witnesses.receipts(event_id=ev_id, status="confirmed")
-                for r in receipts:
-                    witness_receipts.append({
-                        "event_id": str(r.get("event_id", "")),
-                        "witness_id": str(r.get("witness_id", "")),
-                        "status": r.get("status"),
-                        "confirmed_at": r.get("confirmed_at").isoformat()
-                        if r.get("confirmed_at")
-                        else None,
-                        "witness_signature": r.get("witness_signature").hex()
-                        if r.get("witness_signature")
-                        else None,
-                    })
-            if witness_receipts:
-                bundle["witness_receipts"] = witness_receipts
-    except Exception:
-        pass
+        effective_prev_hash: str | None = None
+        if previous_bundle is not None:
+            effective_prev_hash = _read_previous_bundle_hash(previous_bundle)
+        elif previous_bundle_hash:
+            effective_prev_hash = previous_bundle_hash
+        else:
+            effective_prev_hash = _load_last_bundle_hash(output.parent)
 
-    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+        if effective_prev_hash:
+            manifest["previous_bundle_hash"] = effective_prev_hash
 
-    bundle["manifest"]["bundle_hash"] = digest
-    bundle["manifest"]["bundle_hash_covers"] = (
-        "manifest (minus bundle_hash) + events + timestamp_batches (if present) "
-        "+ witness_registrations + witness_receipts, canonical JSON"
-    )
+        if control_description:
+            manifest["control_description"] = control_description
+            manifest["control_description_source_digest"] = (
+                "sha256:" + hashlib.sha256(readme_text.encode("utf-8")).hexdigest()
+            )
+        manifest["trust_model_caveat"] = trust_model_caveat
 
-    ts_count = len(bundle.get("timestamp_batches", []))
-    ts_note = f", {ts_count} TSA timestamp batches" if ts_count else ""
-    output.write_text(json.dumps(bundle, indent=2))
-    click.echo(f"Exported {len(events)} events{ts_note} to {output}")
-    sub.close()
+        bundle: dict[str, Any] = {
+            "manifest": manifest,
+            "events": [ev.to_dict() for ev in events],
+        }
+
+        exported_event_ids = {str(ev.event_id) for ev in events}
+        try:
+            confirmed_batches = sub.timestamping.list_batches(status="confirmed")
+            covering_batches = []
+            for batch in confirmed_batches:
+                batch_event_ids = {str(eid) for eid in batch.event_ids}
+                if batch_event_ids & exported_event_ids:
+                    covering_batches.append(batch.to_dict())
+            if covering_batches:
+                bundle["timestamp_batches"] = covering_batches
+        except Exception as exc:
+            click.echo(
+                f"Warning: failed to load timestamp batches — "
+                f"bundle will not contain timestamp data: {exc}",
+                err=True,
+            )
+
+        # Include witness registrations and confirmed receipts
+        try:
+            witnesses = sub.witnesses.list(status="active")
+            if witnesses:
+                safe_witnesses = []
+                for w in witnesses:
+                    sw = {k: v for k, v in w.items() if k != "sign_secret"}
+                    safe_witnesses.append(sw)
+                bundle["witness_registrations"] = safe_witnesses
+
+                witness_receipts = []
+                for ev_id in exported_event_ids:
+                    receipts = sub.witnesses.receipts(event_id=ev_id, status="confirmed")
+                    for r in receipts:
+                        witness_receipts.append({
+                            "event_id": str(r.get("event_id", "")),
+                            "witness_id": str(r.get("witness_id", "")),
+                            "status": r.get("status"),
+                            "confirmed_at": r.get("confirmed_at").isoformat()
+                            if r.get("confirmed_at")
+                            else None,
+                            "witness_signature": r.get("witness_signature").hex()
+                            if r.get("witness_signature")
+                            else None,
+                        })
+                if witness_receipts:
+                    bundle["witness_receipts"] = witness_receipts
+        except Exception as exc:
+            click.echo(
+                f"Warning: failed to load witness data — "
+                f"bundle will not contain witness registrations or receipts: {exc}",
+                err=True,
+            )
+
+        canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+        bundle["manifest"]["bundle_hash"] = digest
+        bundle["manifest"]["bundle_hash_covers"] = (
+            "manifest (minus bundle_hash) + events + timestamp_batches (if present) "
+            "+ witness_registrations + witness_receipts, canonical JSON"
+        )
+
+        ts_count = len(bundle.get("timestamp_batches", []))
+        ts_note = f", {ts_count} TSA timestamp batches" if ts_count else ""
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(bundle, indent=2))
+        click.echo(f"Exported {len(events)} events{ts_note} to {output}")
+        _save_last_bundle_hash(output.parent, digest)
+    finally:
+        sub.close()
 
 
 @main.command("extract-control")
@@ -499,8 +626,7 @@ def timestamp(
     submits it to the configured TSA, and stores the resulting token.
     Requires asn1crypto: pip install regista[timestamping]
     """
-    for w in check_key_file_permissions(str(keys)):
-        click.echo(f"WARNING: {w}", err=True)
+    _check_key_permissions_strict(keys)
 
     from regista import Regista
     from regista._timestamping import TSAConfig
