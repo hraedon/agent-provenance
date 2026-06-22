@@ -1,6 +1,6 @@
 # Plan 005 — Consumer migration: substrate → regista
 
-**Status:** Phase 2 of the cross-project rename. **Blocked until regista Plan 018 completes** and `v0.4.0` is tagged.
+**Status:** Phase 2 of the cross-project rename. **Complete (2026-06-22)** — regista `v0.4.0` tagged; broad grep found two live refs the original narrow `*.py`/`*.md`/`*.toml`/`*.yaml` grep missed — `substrate_test` DSN names in `integrations/opencode/examples/{test-plugin,dogfood-session}.mjs`, now renamed to `regista_test`. Residual `substrate` occurrences are intentional historical record (breadcrumbs AP-001..005, `reflections/`, skeleton plans) or the genuinely-distinct `compliance-substrate` ancestor project (not a rename target).
 **Scope:** agent-provenance specifically. See `/projects/RENAME-substrate-to-regista.md` for orchestration.
 **Regista refs in this repo:** 31.
 

@@ -20,7 +20,7 @@ writeFileSync(
   })
 );
 
-process.env.CAIRN_DSN = "postgresql://substrate_test:substrate_test@localhost/substrate_test";
+process.env.CAIRN_DSN = "postgresql://regista_test:regista_test@localhost/regista_test";
 process.env.CAIRN_PROJECT = "cairn_dogfood_test";
 process.env.CAIRN_KEY_PATH = keyFile;
 process.env.PRINCIPAL_ID = "human:owner";
