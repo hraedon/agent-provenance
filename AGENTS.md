@@ -103,10 +103,34 @@ In rough order. Do not assume any of these are done; check on entry.
 
 ## Current status (last updated 2026-06-20)
 
-- **Tests**: 154 passing (CI runs without Postgres; Postgres-dependent tests skip gracefully).
-- **Lint**: ruff clean; 2 pre-existing RUF012 in verifier.py (class-level mutable sets).
-- **CI**: `.github/workflows/ci.yml` (ruff + mypy + pytest) + `Makefile`.
-- **Gaps closed this session**: BC-020 (temporal ordering only checks TSA-covered
+- **Tests**: 154 Python passing (CI runs without Postgres; Postgres-dependent tests skip gracefully)
+  + 24 Bun tests for the OpenCode plugin (helpers + BC-022 integration coverage).
+- **Lint**: ruff clean on changed code; 2 pre-existing RUF012 in verifier.py (class-level mutable sets).
+- **CI**: `.github/workflows/ci.yml` — Python job (ruff + mypy + pytest) and a Bun job
+  (`bun test` in `integrations/opencode`) + `Makefile` (`make test-js`, `make all`).
+- **Gaps closed this session**: BC-022 (OpenCode plugin no longer silently loses tool-call end
+  events on bridge failure — durable per-session `degradation.log` mirroring the Claude Code
+  hook's `_mark_degraded`; bounded FIFO session map with eviction-recorded orphans; begin
+  failures also recorded; 24 Bun tests incl. two integration tests that drive the real plugin
+  through a fake bridge; CI now gates the JS suite). Verified-stale this session: BC-019
+  (scheme_counts merge across `verify_bundle_chain` — already implemented at
+  `verifier.py:1597`); WI-001 (tests-hang — 154 Python tests pass). Verified-still-blocked:
+  BC-016 (witness signature verification — regista registers no witness public key, so there is
+  nothing to verify against; blocked on regista asymmetric witness signing).
+- **Gaps closed this session**: WI-004 (PostgresEventStore allocate_seq race
+  for non-work-item entities — advisory lock with signed int64 key);
+  WI-005/WI-006 (_events.py append_event diverges from _events_api.py —
+  entity_kind parameter, global chain head wired through EventStore);
+  WI-007 (verifier chain/sequence checks group by (entity_kind, entity_id));
+  WI-008 (verify_event_with_public_key omits global_seq);
+  WI-009 (OpenCode plugin calls attest_session on session start);
+  WI-003 (duplicate of WI-004, closed);
+  InMemory _entity_seqs keyed by (entity_kind, entity_id) instead of UUID only;
+  advisory lock signed int64 conversion (prevents bigint overflow);
+  global hash chain head management moved into PostgresEventStore.append and
+  InMemoryEventStore.append (closes the tamper-evidence gap for non-work-item
+  entities); OpenCode plugin session-start degradation uses real session ID.
+- **Gaps closed previously**: BC-020 (temporal ordering only checks TSA-covered
   events); BC-021 (export warns on timestamp/witness load failure); BC-003
   (bundle chain-linking via `--previous-bundle` + auto-linking state file);
   AP-010 (CLI test coverage: 9 new tests for verify, verify-chain, diff,
@@ -153,10 +177,15 @@ In rough order. Do not assume any of these are done; check on entry.
   cryptographically verified — blocked on regista asymmetric witness signing);
   BC-005 (scope attestation uses tool_call transitions — blocked on regista
   Plan 016); BC-018 (global_seq gap check — documented as non-issue);
-  BC-019 (verify_bundle_chain does not merge scheme_counts);
-  BC-022 (OpenCode plugin loses end events on bridge failure);
+  BC-019 (verify_bundle_chain scheme_counts merge — verified already
+  implemented at verifier.py:1597, stale);
   WI-001 remaining (Postgres service container for CI);
-  WI-002 (cross-component meaning contracts as conformance-tested artifacts).
+  WI-002 (cross-component meaning contracts as conformance-tested artifacts);
+  WI-010 (PostgresEventStore.append returns Event without DB-assigned
+  global_seq/prev_global_event_hash — pre-existing, exposed by session work);
+  WI-011 (missing test coverage for session entity paths: concurrency,
+  event handler, mixed entity kinds);
+  WI-012 (CAIRN_ATTEST_ON_START env check treats any non-empty string as true).
 
 ## What not to do
 

@@ -86,7 +86,7 @@ def main() -> None:
     action = msg.get("action")
     files = [f for f in (msg.get("files") or []) if isinstance(f, str)]
 
-    if action not in ("attest_scope", "begin", "end"):
+    if action not in ("attest_scope", "attest_session", "begin", "end"):
         sys.stderr.write(f"cairn_bridge: unknown action {action!r}\n")
         sys.exit(1)
 
@@ -143,6 +143,19 @@ def _dispatch(
     if action == "attest_scope":
         event = adapter.attest_scope(
             principal_id=principal_id,
+            harnesses=msg.get(
+                "harnesses",
+                [{"name": harness_name, "version": harness_version}],
+            ),
+            scope_statement=msg.get("scope_statement", f"In scope: {harness_name}."),
+            harness_config_digests=msg.get("harness_config_digests"),
+        )
+        return {"status": "ok", "event_id": str(event.event_id)}
+
+    if action == "attest_session":
+        event = adapter.attest_session(
+            principal_id=principal_id,
+            session_id=session_id,
             harnesses=msg.get(
                 "harnesses",
                 [{"name": harness_name, "version": harness_version}],

@@ -48,6 +48,7 @@ from cairn.verifier_types import (
     ScopeAttestationEntry,
     ScopeViolation,
     SequenceGap,
+    SessionAttestationEntry,
     TemporalOrderingViolation,
     TimestampBatchEntry,
     VerificationEntry,
@@ -76,6 +77,7 @@ __all__ = [
     "ScopeAttestationEntry",
     "ScopeViolation",
     "SequenceGap",
+    "SessionAttestationEntry",
     "TemporalOrderingViolation",
     "TimestampBatchEntry",
     "VerificationEntry",
@@ -183,6 +185,9 @@ class Verifier:
 
             # Collect scope attestations
             self._accumulate_scope_attestations(report, ev)
+
+            # Collect session attestations
+            self._accumulate_session_attestations(report, ev)
 
             # Detect and verify key rotation events
             self._accumulate_key_rotations(report, ev)
@@ -388,6 +393,8 @@ class Verifier:
             scheme=scheme,
             prev_event_hash=ev.prev_event_hash,
             global_seq=ev.global_seq,
+            entity_kind=getattr(ev, "entity_kind", "work_item"),
+            hash_alg=getattr(ev, "hash_alg", "sha-256"),
         )
 
         if ok:
@@ -456,6 +463,9 @@ class Verifier:
 
     def _accumulate_scope_attestations(self, report: VerificationReport, ev: Event) -> None:
         """Collect scope-attestation payloads from scope events."""
+        entity_kind = getattr(ev, "entity_kind", "work_item")
+        if entity_kind != "work_item":
+            return
         payload = ev.payload or {}
         if "harnesses" not in payload or "scope_statement" not in payload:
             return
@@ -465,6 +475,28 @@ class Verifier:
                 work_item_id=str(ev.work_item_id),
                 version=payload.get("version", "?"),
                 principal_id=payload.get("principal_id", "?"),
+                attested_at=payload.get("attested_at", "?"),
+                harnesses=tuple(payload.get("harnesses", [])),
+                scope_statement=payload.get("scope_statement", ""),
+                harness_config_digests=payload.get("harness_config_digests"),
+            )
+        )
+
+    def _accumulate_session_attestations(self, report: VerificationReport, ev: Event) -> None:
+        """Collect session-attestation payloads from session-entity events."""
+        entity_kind = getattr(ev, "entity_kind", "work_item")
+        if entity_kind != "session":
+            return
+        payload = ev.payload or {}
+        if "harnesses" not in payload or "scope_statement" not in payload:
+            return
+        report.session_attestations.append(
+            SessionAttestationEntry(
+                event_id=str(ev.event_id),
+                entity_id=str(getattr(ev, "effective_entity_id", ev.work_item_id)),
+                version=payload.get("version", "?"),
+                principal_id=payload.get("principal_id", "?"),
+                session_id=payload.get("session_id", "?"),
                 attested_at=payload.get("attested_at", "?"),
                 harnesses=tuple(payload.get("harnesses", [])),
                 scope_statement=payload.get("scope_statement", ""),
@@ -869,23 +901,26 @@ class Verifier:
     def _check_event_sequence(self, events: list[Event], report: VerificationReport) -> None:
         """Detect gaps and ordering violations in event sequences.
 
-        Groups events by work_item_id, checks that event_seq values are
-        contiguous within each work item and that timestamps are non-decreasing.
+        Groups events by (entity_kind, entity_id), checks that event_seq
+        values are contiguous within each entity and that timestamps are
+        non-decreasing.
         """
         from collections import defaultdict
 
-        by_wi: dict[str, list[Event]] = defaultdict(list)
+        by_entity: dict[tuple[str, str], list[Event]] = defaultdict(list)
         for ev in events:
-            by_wi[str(ev.work_item_id)].append(ev)
+            ek = getattr(ev, "entity_kind", "work_item")
+            eid = str(ev.effective_entity_id)
+            by_entity[(ek, eid)].append(ev)
 
-        for wi_id, wi_events in by_wi.items():
-            # NOTE: single-event work items are intentionally NOT skipped here
+        for (ek, eid), entity_events in by_entity.items():
+            # NOTE: single-event entities are intentionally NOT skipped here
             # (BC-010).  A lone event still has its ordering examined, and
-            # cross-work-item deletion of single-event work items is caught by
+            # cross-entity deletion of single-event entities is caught by
             # _check_chain_contiguity via the global_seq gap check.
 
             # Sort by event_seq to detect gaps
-            sorted_events = sorted(wi_events, key=lambda e: e.event_seq)
+            sorted_events = sorted(entity_events, key=lambda e: e.event_seq)
             expected_seq = sorted_events[0].event_seq
             prev_ts = None
             for ev in sorted_events:
@@ -893,7 +928,7 @@ class Verifier:
                     if ev.event_seq > expected_seq:
                         report.sequence_gaps.append(
                             SequenceGap(
-                                work_item_id=wi_id,
+                                work_item_id=eid,
                                 kind="missing_seq",
                                 detail=(
                                     f"Expected seq {expected_seq}, got {ev.event_seq}. "
@@ -906,7 +941,7 @@ class Verifier:
                     else:
                         report.sequence_gaps.append(
                             SequenceGap(
-                                work_item_id=wi_id,
+                                work_item_id=eid,
                                 kind="duplicate_seq",
                                 detail=(
                                     f"Duplicate seq {ev.event_seq} (expected {expected_seq}). "
@@ -921,7 +956,7 @@ class Verifier:
                 if prev_ts is not None and ev.timestamp < prev_ts:
                     report.sequence_gaps.append(
                         SequenceGap(
-                            work_item_id=wi_id,
+                            work_item_id=eid,
                             kind="timestamp_regression",
                             detail=(
                                 f"Event {ev.event_id} seq {ev.event_seq} timestamp "
@@ -1088,10 +1123,12 @@ class Verifier:
                     )
 
         # --- (2)/(3) prev_event_hash chain walk + downgrade refusal ---
-        # Index events by (work_item_id, event_seq) for predecessor lookup.
-        by_wi_seq: dict[tuple[str, int], Event] = {}
+        # Index events by (entity_kind, entity_id, event_seq) for predecessor lookup.
+        by_entity_seq: dict[tuple[str, str, int], Event] = {}
         for ev in events:
-            by_wi_seq[(str(ev.work_item_id), ev.event_seq)] = ev
+            ek = getattr(ev, "entity_kind", "work_item")
+            eid = str(ev.effective_entity_id)
+            by_entity_seq[(ek, eid, ev.event_seq)] = ev
 
         for ev in events:
             # An event with global_seq set is a v3-chained event.  For
@@ -1120,7 +1157,9 @@ class Verifier:
             if ev.prev_event_hash is None:
                 continue
 
-            predecessor = by_wi_seq.get((str(ev.work_item_id), ev.event_seq - 1))
+            ek = getattr(ev, "entity_kind", "work_item")
+            eid = str(ev.effective_entity_id)
+            predecessor = by_entity_seq.get((ek, eid, ev.event_seq - 1))
             if predecessor is None:
                 report.chain_contiguity_violations.append(
                     ChainContiguityViolation(
@@ -1172,6 +1211,24 @@ class Verifier:
                     )
                 )
 
+    def _collect_attestations(
+        self, report: VerificationReport
+    ) -> list[tuple[str, str, tuple[dict[str, Any], ...], str]]:
+        """Build a unified, time-sorted list of attestation entries.
+
+        Combines scope_attestations and session_attestations into a single
+        list of (attested_at, principal_id, harnesses, event_id) tuples so
+        that _check_principal_binding and _check_scope_coverage can consult
+        both sources.
+        """
+        entries: list[tuple[str, str, tuple[dict[str, Any], ...], str]] = []
+        for sa in report.scope_attestations:
+            entries.append((sa.attested_at, sa.principal_id, sa.harnesses, sa.event_id))
+        for sa in report.session_attestations:
+            entries.append((sa.attested_at, sa.principal_id, sa.harnesses, sa.event_id))
+        entries.sort(key=lambda e: _parse_iso(e[0]) or datetime.min.replace(tzinfo=UTC))
+        return entries
+
     def _check_principal_binding(
         self, events: list[Event], report: VerificationReport
     ) -> None:
@@ -1205,21 +1262,17 @@ class Verifier:
         if not tool_calls:
             return
 
-        sorted_scopes = sorted(
-            report.scope_attestations, key=lambda s: _parse_iso(s.attested_at)
-        )
+        sorted_attestations = self._collect_attestations(report)
 
         def active_principal(ev_dt: datetime) -> str | None:
-            chosen: ScopeAttestationEntry | None = None
-            for sa in sorted_scopes:
-                sa_dt = _parse_iso(sa.attested_at)
+            chosen_pid: str | None = None
+            for attested_at, pid, _harnesses, _eid in sorted_attestations:
+                sa_dt = _parse_iso(attested_at)
                 if sa_dt is not None and sa_dt <= ev_dt:
-                    chosen = sa
+                    chosen_pid = pid
                 else:
                     break
-            if chosen is None:
-                return None
-            return chosen.principal_id or None
+            return chosen_pid
 
         for ev in tool_calls:
             principal_id = None
@@ -1327,8 +1380,8 @@ class Verifier:
         if not tool_calls:
             return
 
-        if not report.scope_attestations:
-            # No scope attestations at all — flag every tool call
+        if not report.scope_attestations and not report.session_attestations:
+            # No attestations at all — flag every tool call
             for ev in tool_calls:
                 payload = ev.payload or {}
                 h_raw = payload.get("harness", "")
@@ -1340,7 +1393,7 @@ class Verifier:
                         transition=ev.transition,
                         harness=h_name,
                         detail=(
-                            "No scope attestation found in the log. "
+                            "No attestation found in the log. "
                             f"Tool call from harness '{h_name}' "
                             "has no covering scope."
                         ),
@@ -1348,10 +1401,7 @@ class Verifier:
                 )
             return
 
-        sorted_scopes = sorted(
-            report.scope_attestations,
-            key=lambda s: _parse_iso(s.attested_at),
-        )
+        sorted_attestations = self._collect_attestations(report)
 
         for ev in tool_calls:
             payload = ev.payload or {}
@@ -1359,15 +1409,17 @@ class Verifier:
             harness = harness_raw.get("name", "") if isinstance(harness_raw, dict) else harness_raw
             ev_dt = ev.timestamp
 
-            active_scope = None
-            for sa in sorted_scopes:
-                sa_dt = _parse_iso(sa.attested_at)
+            active_harnesses: tuple[dict[str, Any], ...] = ()
+            active_event_id = ""
+            for attested_at, _pid, harnesses, eid in sorted_attestations:
+                sa_dt = _parse_iso(attested_at)
                 if sa_dt is not None and sa_dt <= ev_dt:
-                    active_scope = sa
+                    active_harnesses = harnesses
+                    active_event_id = eid
                 else:
                     break
 
-            if active_scope is None:
+            if not active_harnesses:
                 report.scope_violations.append(
                     ScopeViolation(
                         event_id=str(ev.event_id),
@@ -1375,15 +1427,15 @@ class Verifier:
                         transition=ev.transition,
                         harness=harness,
                         detail=(
-                            f"No scope attestation predates event at {ev_dt.isoformat()}. "
+                            f"No attestation predates event at {ev_dt.isoformat()}. "
                             f"Tool call from harness '{harness}' has no covering scope."
                         ),
                     )
                 )
                 continue
 
-            # Check if the harness is listed in the active scope
-            harness_names = {h.get("name", "") for h in active_scope.harnesses}
+            # Check if the harness is listed in the active attestation
+            harness_names = {h.get("name", "") for h in active_harnesses}
             if harness not in harness_names:
                 report.scope_violations.append(
                     ScopeViolation(
@@ -1392,8 +1444,8 @@ class Verifier:
                         transition=ev.transition,
                         harness=harness,
                         detail=(
-                            f"Harness '{harness}' not in active scope attestation "
-                            f"(event {active_scope.event_id}). "
+                            f"Harness '{harness}' not in active attestation "
+                            f"(event {active_event_id}). "
                             f"Covered harnesses: {sorted(harness_names)}"
                         ),
                     )
@@ -1582,6 +1634,7 @@ class Verifier:
             merged.entries.extend(r.entries)
             merged.file_provenance.extend(r.file_provenance)
             merged.scope_attestations.extend(r.scope_attestations)
+            merged.session_attestations.extend(r.session_attestations)
             merged.sequence_gaps.extend(r.sequence_gaps)
             merged.scope_violations.extend(r.scope_violations)
             merged.temporal_violations.extend(r.temporal_violations)
