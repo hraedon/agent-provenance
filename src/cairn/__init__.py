@@ -12,11 +12,13 @@ from .schema import (
     FileDigest,
     ResultSummary,
     ScopeAttestationPayload,
+    SessionAttestationPayload,
     ToolCallBegin,
     ToolCallEnd,
     ToolCallEvent,
     check_key_file_permissions,
 )
+from .verifier import SessionAttestationEntry
 
 
 def _get_version() -> str:
@@ -35,6 +37,8 @@ __all__ = [
     "FileDigest",
     "ResultSummary",
     "ScopeAttestationPayload",
+    "SessionAttestationEntry",
+    "SessionAttestationPayload",
     "ToolCallBegin",
     "ToolCallContext",
     "ToolCallEnd",

@@ -252,6 +252,42 @@ class ScopeAttestationPayload:
         )
 
 
+@dataclass(frozen=True)
+class SessionAttestationPayload:
+    version: str
+    principal_id: str
+    session_id: str
+    attested_at: str
+    harnesses: list[dict[str, Any]]
+    scope_statement: str
+    harness_config_digests: dict[str, str] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "version": self.version,
+            "principal_id": self.principal_id,
+            "session_id": self.session_id,
+            "attested_at": self.attested_at,
+            "harnesses": self.harnesses,
+            "scope_statement": self.scope_statement,
+        }
+        if self.harness_config_digests is not None:
+            d["harness_config_digests"] = self.harness_config_digests
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SessionAttestationPayload:
+        return cls(
+            version=data["version"],
+            principal_id=data["principal_id"],
+            session_id=data["session_id"],
+            attested_at=data["attested_at"],
+            harnesses=data["harnesses"],
+            scope_statement=data["scope_statement"],
+            harness_config_digests=data.get("harness_config_digests"),
+        )
+
+
 def digest_string(text: str | None) -> str | None:
     """Return SHA-256 hex digest of a string, or None if input is None."""
     if text is None:

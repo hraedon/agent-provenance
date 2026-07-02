@@ -249,7 +249,7 @@ def test_handle_session_start(mock_bridge: MagicMock) -> None:
 
     mock_bridge.assert_called_once()
     call_args = mock_bridge.call_args[0][0]
-    assert call_args["action"] == "attest_scope"
+    assert call_args["action"] == "attest_session"
     assert call_args["session_id"] == "my-session"
     assert any(h["name"] == "claude-code" for h in call_args["harnesses"])
 

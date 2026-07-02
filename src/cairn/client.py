@@ -253,6 +253,39 @@ class CairnClient:
             harness_config_digests=harness_config_digests,
         )
 
+    def attest_session(
+        self,
+        harnesses: list[dict[str, Any]] | None = None,
+        scope_statement: str | None = None,
+        harness_config_digests: dict[str, str] | None = None,
+    ) -> Any:
+        """Record a session-level attestation event.
+
+        Uses entity_kind="session" for structural distinctness from tool calls.
+
+        Args:
+            harnesses: List of harness dicts with ``name`` and ``version``.
+                Defaults to the client's own harness.
+            scope_statement: Human-readable scope statement. Defaults to
+                ``"In scope: {harness_name}."``.
+            harness_config_digests: Map of harness name to config digest.
+
+        Returns:
+            The regista event recording the attestation.
+        """
+        adapter = self._ensure_connected()
+        if harnesses is None:
+            harnesses = [{"name": self._harness_name, "version": self._harness_version}]
+        if scope_statement is None:
+            scope_statement = f"In scope: {self._harness_name}."
+        return adapter.attest_session(
+            principal_id=self._principal_id,
+            session_id=self._session_id,
+            harnesses=harnesses,
+            scope_statement=scope_statement,
+            harness_config_digests=harness_config_digests,
+        )
+
     # ------------------------------------------------------------------
     # Tool call logging
     # ------------------------------------------------------------------

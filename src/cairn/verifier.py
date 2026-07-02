@@ -18,9 +18,10 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import structlog
 from regista._errors import RegistaError
@@ -36,6 +37,8 @@ from cairn.verifier_report import (
     format_report_json,
 )
 from cairn.verifier_types import (
+    AssuranceEntry,
+    AssuranceLevel,
     BundleDiff,
     BundleDiffEntry,
     ChainContiguityViolation,
@@ -65,6 +68,8 @@ log = structlog.get_logger()
 
 
 __all__ = [
+    "AssuranceEntry",
+    "AssuranceLevel",
     "BundleDiff",
     "BundleDiffEntry",
     "ChainContiguityViolation",
@@ -114,7 +119,7 @@ class Verifier:
     """
 
     # Transition types that require role="actor" to sign.
-    _ACTOR_ONLY_TRANSITIONS: set[str] = {
+    _ACTOR_ONLY_TRANSITIONS: ClassVar[set[str]] = {
         "tool_call",
         "scope_attestation",
         "key_declaration",
@@ -124,7 +129,7 @@ class Verifier:
     }
 
     # Transition types that require role="auditor" to sign.
-    _AUDITOR_ONLY_TRANSITIONS: set[str] = {
+    _AUDITOR_ONLY_TRANSITIONS: ClassVar[set[str]] = {
         "auditor_attestation",
     }
 
@@ -133,6 +138,7 @@ class Verifier:
         key_set: dict[str, bytes],
         key_metadata: dict[str, dict[str, Any]] | None = None,
         tsa_cert_path: str | None = None,
+        witness_keys: dict[str, bytes] | None = None,
     ) -> None:
         """
         Args:
@@ -146,13 +152,24 @@ class Verifier:
             tsa_cert_path: Path to a trusted TSA certificate (PEM or DER).
                 When provided, the verifier will verify CMS signatures on
                 TSA timestamp tokens against this trust anchor (BC-229).
+            witness_keys: Optional mapping ``witness_id → Ed25519 public
+                key bytes`` for verifying witness receipt signatures
+                (BC-016).  When provided, witness receipt signatures are
+                cryptographically verified; receipts with invalid
+                signatures do not count toward witness coverage.  When
+                omitted, receipt signatures are not checked (a warning is
+                emitted if any receipts have signatures).
         """
         self._keys = key_set
         self._key_meta = key_metadata or {}
         self._tsa_cert_path = tsa_cert_path
+        self._witness_keys = witness_keys or {}
         # Per-batch claimed event_ids, captured during _accumulate_timestamp_batches
         # so _verify_timestamp_signatures can recompute Merkle roots (BC-015).
         self._batch_claimed_ids: dict[str, list[str]] = {}
+        # Raw witness signatures from the bundle, keyed by (event_id, witness_id).
+        # Populated in _accumulate_witness_data, consumed in _verify_witness_signatures.
+        self._witness_sig_cache: dict[tuple[str, str], bytes | None] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -206,6 +223,7 @@ class Verifier:
         self._check_scope_coverage(events, report)
         self._check_principal_binding(events, report)
         self._check_temporal_ordering(events, report)
+        self._compute_assurance_levels(events, report)
 
         return report
 
@@ -311,6 +329,7 @@ class Verifier:
         self._verify_timestamp_signatures(raw_tokens, events, report)
 
         self._accumulate_witness_data(raw, events, report)
+        self._verify_witness_signatures(events, report)
         self._check_witness_coverage(events, report)
 
         # TSA temporal ordering must run after timestamp batches are loaded
@@ -826,29 +845,189 @@ class Verifier:
         events: list[Event],
         report: VerificationReport,
     ) -> None:
-        """Load witness registrations and receipts from the bundle."""
+        """Load witness registrations and receipts from the bundle.
+
+        Also collects witness public keys from registrations when present,
+        so that _verify_witness_signatures can cryptographically verify
+        receipt signatures (BC-016).
+        """
         raw_witnesses = raw_bundle.get("witness_registrations")
         if raw_witnesses:
             for w in raw_witnesses:
+                pubkey_hex = w.get("public_key")
+                key_scheme = w.get("key_scheme")
                 report.witness_registrations.append(
                     WitnessRegistrationEntry(
                         witness_id=str(w.get("witness_id", "")),
                         url=w.get("url", ""),
                         status=w.get("status", "active"),
                         mode=w.get("mode", "witness"),
+                        public_key=pubkey_hex if isinstance(pubkey_hex, str) else None,
+                        key_scheme=key_scheme if isinstance(key_scheme, str) else None,
                     )
                 )
+                # Collect Ed25519 public keys from registrations
+                if pubkey_hex and key_scheme == "ed25519":
+                    try:
+                        wid = str(w.get("witness_id", ""))
+                        self._witness_keys.setdefault(
+                            wid, bytes.fromhex(pubkey_hex)
+                        )
+                    except (ValueError, TypeError):
+                        pass
 
         raw_receipts = raw_bundle.get("witness_receipts")
         if raw_receipts:
             for r in raw_receipts:
+                sig_hex = r.get("witness_signature")
+                ev_id = str(r.get("event_id", ""))
+                wid = str(r.get("witness_id", ""))
+                sig_bytes = None
+                if sig_hex:
+                    try:
+                        sig_bytes = bytes.fromhex(sig_hex)
+                    except (ValueError, TypeError):
+                        pass
+                self._witness_sig_cache[(ev_id, wid)] = sig_bytes
                 report.witness_receipts.append(
                     WitnessReceiptEntry(
-                        event_id=str(r.get("event_id", "")),
-                        witness_id=str(r.get("witness_id", "")),
+                        event_id=ev_id,
+                        witness_id=wid,
                         confirmed_at=r.get("confirmed_at"),
-                        has_signature=r.get("witness_signature") is not None,
+                        has_signature=sig_hex is not None,
                     )
+                )
+
+    def _verify_witness_signatures(
+        self, events: list[Event], report: VerificationReport
+    ) -> None:
+        """Cryptographically verify witness receipt signatures (BC-016).
+
+        For each witness receipt:
+        - If the witness has an Ed25519 public key (from ``witness_keys``
+          parameter or bundle registrations), verify the receipt's
+          signature against the event's canonical envelope.
+        - If the witness key scheme is ``hmac-sha256`` (or unknown and no
+          key is available), the receipt is accepted without cryptographic
+          verification (backward-compatible — regista's own delivery layer
+          already verified HMAC witnesses).
+
+        Receipts with invalid Ed25519 signatures are marked
+        ``signature_valid=False`` and will not count toward witness
+        coverage in ``_check_witness_coverage``.
+        """
+        if not report.witness_receipts:
+            return
+
+        # Build event lookup: event_id → canonical_envelope bytes
+        env_by_event: dict[str, bytes] = {}
+        for ev in events:
+            if ev.canonical_envelope is not None:
+                env_by_event[str(ev.event_id)] = ev.canonical_envelope
+
+        # Build witness_id → key_scheme lookup from registrations
+        scheme_by_witness: dict[str, str] = {}
+        for reg in report.witness_registrations:
+            if reg.key_scheme:
+                scheme_by_witness[reg.witness_id] = reg.key_scheme
+
+        has_any_keys = bool(self._witness_keys)
+        updated_receipts: list[WitnessReceiptEntry] = []
+
+        for receipt in report.witness_receipts:
+            wid = receipt.witness_id
+            ev_id = receipt.event_id
+            key_scheme = scheme_by_witness.get(wid)
+
+            # Determine if this witness requires Ed25519 signature verification
+            needs_ed25519 = key_scheme == "ed25519" or (
+                key_scheme is None and wid in self._witness_keys
+            )
+
+            if needs_ed25519:
+                pub_key = self._witness_keys.get(wid)
+                sig_bytes = self._witness_sig_cache.get((ev_id, wid))
+
+                if pub_key is None:
+                    updated_receipts.append(replace(
+                        receipt,
+                        signature_valid=None,
+                        verification_detail=(
+                            "Witness uses Ed25519 but no public key "
+                            "available — signature NOT verified"
+                        ),
+                    ))
+                elif sig_bytes is None:
+                    updated_receipts.append(replace(
+                        receipt,
+                        signature_valid=False,
+                        verification_detail="Missing witness signature",
+                    ))
+                else:
+                    envelope = env_by_event.get(ev_id)
+                    if envelope is None:
+                        updated_receipts.append(replace(
+                            receipt,
+                            signature_valid=None,
+                            verification_detail=(
+                                "Event canonical envelope not available "
+                                "in bundle — cannot verify"
+                            ),
+                        ))
+                    else:
+                        try:
+                            from regista._signing_scheme import Ed25519Scheme
+
+                            verified = Ed25519Scheme().verify(
+                                envelope, sig_bytes,
+                                hashlib.sha256(envelope).digest(),
+                                pub_key,
+                            )
+                            updated_receipts.append(replace(
+                                receipt,
+                                signature_valid=verified,
+                                verification_detail=(
+                                    "Ed25519 signature verified"
+                                    if verified
+                                    else "Ed25519 signature verification FAILED"
+                                ),
+                            ))
+                        except Exception as exc:
+                            updated_receipts.append(replace(
+                                receipt,
+                                signature_valid=False,
+                                verification_detail=f"Verification error: {exc}",
+                            ))
+            else:
+                # HMAC witness or legacy — no signature verification needed
+                updated_receipts.append(replace(
+                    receipt,
+                    signature_valid=None,
+                    verification_detail=(
+                        "HMAC witness — signature not checked"
+                        if key_scheme == "hmac-sha256"
+                        else "No key scheme — signature not checked"
+                    ),
+                ))
+
+        report.witness_receipts = updated_receipts
+
+        if has_any_keys:
+            failed = sum(1 for r in updated_receipts if r.signature_valid is False)
+            if failed:
+                log.warning(
+                    "cairn.witness_signature_failed",
+                    failed_count=failed,
+                    total_receipts=len(updated_receipts),
+                )
+        else:
+            sig_receipts = sum(1 for r in updated_receipts if r.has_signature)
+            if sig_receipts:
+                log.warning(
+                    "cairn.witness_signatures_not_checked",
+                    signed_receipts=sig_receipts,
+                    note="No witness public keys provided — "
+                    "receipt signatures not verified",
                 )
 
     def _check_witness_coverage(
@@ -858,6 +1037,9 @@ class Verifier:
 
         Only checks witnesses whose ``event_filter`` matches the event.
         When no witnesses are registered, this is a no-op.
+
+        BC-016: receipts with ``signature_valid=False`` do not count as
+        confirmed — a forged receipt is not coverage.
         """
         if not report.witness_registrations:
             return
@@ -868,9 +1050,14 @@ class Verifier:
         if not active_witnesses:
             return
 
-        # Build lookup: event_id → set of witness_ids with confirmed receipts
+        # Build lookup: event_id → set of witness_ids with confirmed receipts.
+        # A receipt counts as confirmed only if its signature was verified
+        # (signature_valid is True or None — None means "not checked" which
+        # is backward-compatible for HMAC witnesses and pre-BC-016 bundles).
         receipts_by_event: dict[str, set[str]] = {}
         for r in report.witness_receipts:
+            if r.signature_valid is False:
+                continue
             if r.event_id not in receipts_by_event:
                 receipts_by_event[r.event_id] = set()
             receipts_by_event[r.event_id].add(r.witness_id)
@@ -1224,8 +1411,11 @@ class Verifier:
         entries: list[tuple[str, str, tuple[dict[str, Any], ...], str]] = []
         for sa in report.scope_attestations:
             entries.append((sa.attested_at, sa.principal_id, sa.harnesses, sa.event_id))
-        for sa in report.session_attestations:
-            entries.append((sa.attested_at, sa.principal_id, sa.harnesses, sa.event_id))
+        for sess_sa in report.session_attestations:
+            entries.append((
+                sess_sa.attested_at, sess_sa.principal_id,
+                sess_sa.harnesses, sess_sa.event_id,
+            ))
         entries.sort(key=lambda e: _parse_iso(e[0]) or datetime.min.replace(tzinfo=UTC))
         return entries
 
@@ -1583,6 +1773,152 @@ class Verifier:
                 )
             )
 
+    def _compute_assurance_levels(
+        self, events: list[Event], report: VerificationReport
+    ) -> None:
+        """Compute review assurance levels from the signed event log.
+
+        Implements regista Plan 027 WI-1.2 — the ``AssuranceLevel`` closed
+        set as a derived property of the item's signed events.  The level is
+        surfaced, never stored mutably, so it can never disagree with the
+        record.
+
+        For each work item with review-related transitions, this method:
+        1.  Extracts author lineages from ``actor_metadata["model_lineage"]``
+            on authoring events (mirrors regista's ``derive_authors``).
+        2.  Extracts the reviewer lineage from the ``adversarial_pass`` event.
+        3.  Computes ``same_lineage`` — a pure comparison of signed values.
+        4.  Determines the ``AssuranceLevel`` from the combination of
+            same/cross-lineage review and human accept.
+
+        Lineage source is ``"asserted"`` in the HMAC-era interim posture.
+        When per-actor Ed25519 lands (regista Plan 026), the verifier will
+        check the actor↔signer binding and flip the source to ``"verified"``
+        — no schema migration required.
+        """
+        from collections import defaultdict
+
+        review_verdicts = frozenset(
+            {"accept", "request_changes", "adversarial_pass", "reject"}
+        )
+        non_author = review_verdicts | {"comment"}
+        review_transitions = review_verdicts | {
+            "close_from_open",
+            "submit_for_review",
+        }
+
+        by_wi: dict[str, list[Event]] = defaultdict(list)
+        for ev in events:
+            ek = getattr(ev, "entity_kind", "work_item")
+            if ek != "work_item":
+                continue
+            by_wi[str(ev.work_item_id)].append(ev)
+
+        for wi_id, wi_events in by_wi.items():
+            wi_events.sort(key=lambda e: e.event_seq)
+            transitions_seen = {ev.transition for ev in wi_events if ev.transition}
+            if not (transitions_seen & review_transitions):
+                continue
+
+            has_adversarial_pass = "adversarial_pass" in transitions_seen
+            has_accept = "accept" in transitions_seen
+            has_close_from_open = "close_from_open" in transitions_seen
+
+            author_lineages: set[str] = set()
+            for ev in wi_events:
+                if ev.transition in non_author:
+                    continue
+                meta = ev.actor_metadata or {}
+                lineage = meta.get("model_lineage")
+                if lineage:
+                    author_lineages.add(str(lineage))
+                delegation = ev.on_behalf_of
+                if isinstance(delegation, dict):
+                    p_lineage = delegation.get("principal_lineage")
+                    if p_lineage:
+                        author_lineages.add(str(p_lineage))
+
+            reviewer_lineage: str | None = None
+            if has_adversarial_pass:
+                for ev in wi_events:
+                    if ev.transition == "adversarial_pass":
+                        meta = ev.actor_metadata or {}
+                        lineage = meta.get("model_lineage")
+                        if lineage:
+                            reviewer_lineage = str(lineage)
+                        break
+
+            if reviewer_lineage and author_lineages:
+                same_lineage = reviewer_lineage in author_lineages
+            else:
+                same_lineage = None
+
+            if has_close_from_open and not has_adversarial_pass:
+                level = AssuranceLevel.NONE
+                detail = "Closed without review (close_from_open)."
+            elif has_adversarial_pass:
+                if same_lineage is False:
+                    if has_accept:
+                        level = AssuranceLevel.INDEPENDENT_AND_ACCEPTED
+                        detail = (
+                            "Cross-lineage adversarial review followed by "
+                            "human accept — highest assurance."
+                        )
+                    else:
+                        level = AssuranceLevel.INDEPENDENTLY_REVIEWED
+                        detail = (
+                            "Cross-lineage adversarial review — independent "
+                            "reviewer model."
+                        )
+                elif same_lineage is True:
+                    if has_accept:
+                        level = AssuranceLevel.HUMAN_ACCEPTED
+                        detail = (
+                            "Same-lineage review compensated by human accept "
+                            "(degraded review, compensating control applied)."
+                        )
+                    else:
+                        level = AssuranceLevel.SELF_REVIEWED
+                        detail = (
+                            "Same-lineage review without human accept — "
+                            "degraded assurance. Under the strict gate "
+                            "profile this item cannot reach done without "
+                            "a human accept."
+                        )
+                else:
+                    if has_accept:
+                        level = AssuranceLevel.HUMAN_ACCEPTED
+                        detail = (
+                            "Human accept (lineage comparison unavailable — "
+                            "undeclared lineage)."
+                        )
+                    else:
+                        level = AssuranceLevel.SELF_REVIEWED
+                        detail = (
+                            "Review without lineage declaration — assurance "
+                            "unverifiable from the signed record."
+                        )
+            elif has_accept:
+                level = AssuranceLevel.HUMAN_ACCEPTED
+                detail = "Human accept without adversarial review."
+            else:
+                level = AssuranceLevel.NONE
+                detail = "No review transitions."
+
+            report.assurance_entries.append(
+                AssuranceEntry(
+                    work_item_id=wi_id,
+                    assurance_level=level,
+                    author_lineages=tuple(sorted(author_lineages)),
+                    reviewer_lineage=reviewer_lineage,
+                    same_lineage=same_lineage,
+                    has_adversarial_pass=has_adversarial_pass,
+                    has_human_accept=has_accept,
+                    lineage_source="asserted",
+                    detail=detail,
+                )
+            )
+
     def verify_bundle_chain(self, bundle_paths: list[str | Path]) -> VerificationReport:
         """Verify a chain of bundles linked by previous_bundle_hash.
 
@@ -1641,6 +1977,7 @@ class Verifier:
             merged.role_gate_violations.extend(r.role_gate_violations)
             merged.chain_contiguity_violations.extend(r.chain_contiguity_violations)
             merged.principal_binding_violations.extend(r.principal_binding_violations)
+            merged.assurance_entries.extend(r.assurance_entries)
             merged.key_revocations.extend(r.key_revocations)
             merged.delegation_chains.extend(r.delegation_chains)
             merged.key_rotations.extend(r.key_rotations)

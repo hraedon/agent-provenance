@@ -86,16 +86,17 @@ def _load_key_set(keys_path: Path) -> dict[str, bytes]:
             if "secret" in entry:
                 secret_raw = entry["secret"]
                 if encoding == "base64":
-                    secret = base64.b64decode(secret_raw)
+                    ed25519_secret = base64.b64decode(secret_raw)
                 elif encoding == "utf8":
-                    secret = secret_raw.encode("utf-8")
+                    ed25519_secret = secret_raw.encode("utf-8")
                 else:
                     raise click.BadParameter(
                         f"Ed25519 key {key_id!r}: unsupported encoding {encoding!r}"
                     )
-                if len(secret) not in (32, 64):
+                if len(ed25519_secret) not in (32, 64):
                     raise click.BadParameter(
-                        f"Ed25519 secret {key_id!r} must be 32 or 64 bytes, got {len(secret)}"
+                        f"Ed25519 secret {key_id!r} must be 32 or 64 bytes, "
+                        f"got {len(ed25519_secret)}"
                     )
             key_set[key_id] = public_key
         else:
@@ -152,6 +153,56 @@ def _load_key_metadata(keys_path: Path) -> dict[str, dict[str, Any]]:
 _LAST_BUNDLE_HASH_FILE = ".cairn_last_bundle_hash"
 
 
+def _load_witness_keys(path: Path) -> dict[str, bytes]:
+    """Load witness public keys from a JSON file (BC-016).
+
+    Expected format::
+
+        {
+          "witness-001": {
+            "public_key": "<hex-encoded Ed25519 public key>",
+            "key_scheme": "ed25519"
+          },
+          ...
+        }
+
+    Only Ed25519 keys are supported for witness signature verification.
+    """
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        raise click.ClickException(f"Cannot read witness keys {path}: {exc}")
+
+    if not isinstance(data, dict):
+        raise click.ClickException(
+            f"Witness keys file {path} must be a JSON object"
+        )
+
+    result: dict[str, bytes] = {}
+    for wid, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        scheme = entry.get("key_scheme", "ed25519")
+        if scheme != "ed25519":
+            continue
+        pk_hex = entry.get("public_key")
+        if not pk_hex:
+            continue
+        try:
+            result[wid] = bytes.fromhex(pk_hex)
+        except (ValueError, TypeError):
+            raise click.BadParameter(
+                f"Witness {wid!r}: invalid hex public_key"
+            )
+        if len(result[wid]) != 32:
+            raise click.BadParameter(
+                f"Witness {wid!r}: Ed25519 public key must be 32 bytes, "
+                f"got {len(result[wid])}"
+            )
+
+    return result
+
+
 def _read_previous_bundle_hash(path: Path) -> str:
     """Extract the bundle hash from a previous bundle file for chain linking."""
     try:
@@ -159,7 +210,7 @@ def _read_previous_bundle_hash(path: Path) -> str:
     except (json.JSONDecodeError, OSError) as exc:
         raise click.ClickException(f"Cannot read previous bundle {path}: {exc}")
     manifest = raw.get("manifest", {})
-    h = manifest.get("bundle_hash")
+    h: str = manifest.get("bundle_hash")
     if not h:
         raise click.ClickException(
             f"Previous bundle {path} has no manifest.bundle_hash"
@@ -254,12 +305,21 @@ def main() -> None:
     default=None,
     help="Trusted TSA certificate (PEM or DER) for timestamp signature verification (BC-229).",
 )
+@click.option(
+    "--witness-keys",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="JSON file mapping witness_id → {public_key (hex), key_scheme} "
+    "for verifying witness receipt signatures (BC-016). "
+    "When omitted, witness keys from bundle registrations are used.",
+)
 def verify(
     bundle_path: Path,
     keys: Path,
     output: Path | None,
     fmt: str,
     tsa_cert: Path | None,
+    witness_keys: Path | None,
 ) -> None:
     """Verify a signed Cairn bundle and emit an auditor-ready report."""
     for w in check_key_file_permissions(str(keys)):
@@ -268,10 +328,15 @@ def verify(
     key_set = _load_key_set(keys)
     key_metadata = _load_key_metadata(keys)
 
+    witness_key_set: dict[str, bytes] | None = None
+    if witness_keys:
+        witness_key_set = _load_witness_keys(witness_keys)
+
     verifier = Verifier(
         key_set,
         key_metadata=key_metadata,
         tsa_cert_path=str(tsa_cert) if tsa_cert else None,
+        witness_keys=witness_key_set,
     )
     report = verifier.verify_bundle(bundle_path)
 
@@ -450,6 +515,10 @@ def export(
                 safe_witnesses = []
                 for w in witnesses:
                     sw = {k: v for k, v in w.items() if k != "sign_secret"}
+                    if sw.get("public_key") is not None:
+                        pk = sw["public_key"]
+                        if isinstance(pk, (bytes, bytearray, memoryview)):
+                            sw["public_key"] = bytes(pk).hex()
                     safe_witnesses.append(sw)
                 bundle["witness_registrations"] = safe_witnesses
 

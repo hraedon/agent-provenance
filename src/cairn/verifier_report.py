@@ -152,6 +152,20 @@ def format_report(report: VerificationReport) -> str:
                     lines.append(f"      {name}: {digest[:16]}...")
         lines.append("")
 
+    if report.session_attestations:
+        lines.append("SESSION ATTESTATIONS")
+        lines.append("-" * 40)
+        for sess_sa in report.session_attestations:
+            lines.append(f"  event {sess_sa.event_id}")
+            lines.append(f"    entity_id   : {sess_sa.entity_id}")
+            lines.append(f"    principal_id : {sess_sa.principal_id}")
+            lines.append(f"    session_id  : {sess_sa.session_id}")
+            lines.append(f"    attested_at : {sess_sa.attested_at}")
+            lines.append(f"    scope       : {sess_sa.scope_statement}")
+            harness_names = ", ".join(h.get("name", "?") for h in sess_sa.harnesses)
+            lines.append(f"    harnesses   : {harness_names}")
+        lines.append("")
+
     if report.key_rotations:
         lines.append("KEY ROTATIONS")
         lines.append("-" * 40)
@@ -219,15 +233,44 @@ def format_report(report: VerificationReport) -> str:
         w_count = len(report.witness_registrations)
         r_count = len(report.witness_receipts)
         v_count = len(report.witness_coverage_violations)
-        lines.append(
-            f"WITNESS FEDERATION ({w_count} witnesses, {r_count} receipts, {v_count} violations)"
+        sig_failed = sum(
+            1 for r in report.witness_receipts if r.signature_valid is False
         )
+        sig_unchecked = sum(
+            1 for r in report.witness_receipts if r.signature_valid is None
+        )
+        header = (
+            f"WITNESS FEDERATION ({w_count} witnesses, {r_count} receipts, "
+            f"{v_count} violations"
+        )
+        if sig_failed:
+            header += f", {sig_failed} signature failures"
+        if sig_unchecked:
+            header += f", {sig_unchecked} signatures unchecked"
+        header += ")"
+        lines.append(header)
         lines.append("-" * 40)
         for w in report.witness_registrations:
             lines.append(f"  witness {w.witness_id[:8]}...")
             lines.append(f"    url     : {w.url}")
             lines.append(f"    status  : {w.status}")
             lines.append(f"    mode    : {w.mode}")
+            if w.key_scheme:
+                lines.append(f"    scheme  : {w.key_scheme}")
+        if report.witness_receipts:
+            lines.append("")
+            for r in report.witness_receipts:
+                sig_status = "UNCHECKED"
+                if r.signature_valid is True:
+                    sig_status = "VERIFIED"
+                elif r.signature_valid is False:
+                    sig_status = "FAILED"
+                lines.append(
+                    f"  receipt event {r.event_id[:8]}.. "
+                    f"witness {r.witness_id[:8]}.. sig: {sig_status}"
+                )
+                if r.verification_detail:
+                    lines.append(f"    -> {r.verification_detail}")
         if report.witness_coverage_violations:
             lines.append("")
             for v in report.witness_coverage_violations:
@@ -250,13 +293,13 @@ def format_report(report: VerificationReport) -> str:
             f"KEY REVOCATIONS ({len(report.key_revocations)} total, {rev_failures} violations)"
         )
         lines.append("-" * 40)
-        for kr in report.key_revocations:
-            lines.append(f"  event {kr.event_id}")
-            lines.append(f"    key_id    : {kr.key_id}")
-            if kr.revoked_at:
-                lines.append(f"    revoked_at: {kr.revoked_at}")
-            if kr.detail:
-                lines.append(f"    -> {kr.detail}")
+        for kr_rev in report.key_revocations:
+            lines.append(f"  event {kr_rev.event_id}")
+            lines.append(f"    key_id    : {kr_rev.key_id}")
+            if kr_rev.revoked_at:
+                lines.append(f"    revoked_at: {kr_rev.revoked_at}")
+            if kr_rev.detail:
+                lines.append(f"    -> {kr_rev.detail}")
         lines.append("")
 
     if report.temporal_violations:
@@ -293,6 +336,24 @@ def format_report(report: VerificationReport) -> str:
         for pv in report.principal_binding_violations:
             lines.append(f"  event {pv.event_id} ({pv.transition}) [{pv.kind}]")
             lines.append(f"    -> {pv.detail}")
+        lines.append("")
+
+    if report.assurance_entries:
+        lines.append("REVIEW ASSURANCE LEVELS")
+        lines.append("-" * 40)
+        for ae in report.assurance_entries:
+            lines.append(f"  work_item {ae.work_item_id}")
+            lines.append(f"    level            : {ae.assurance_level}")
+            lines.append(f"    adversarial_pass : {ae.has_adversarial_pass}")
+            lines.append(f"    human_accept     : {ae.has_human_accept}")
+            if ae.reviewer_lineage:
+                lines.append(f"    reviewer_lineage : {ae.reviewer_lineage}")
+            if ae.author_lineages:
+                lines.append(f"    author_lineages  : {', '.join(ae.author_lineages)}")
+            if ae.same_lineage is not None:
+                lines.append(f"    same_lineage     : {ae.same_lineage}")
+            lines.append(f"    lineage_source   : {ae.lineage_source}")
+            lines.append(f"    -> {ae.detail}")
         lines.append("")
 
     lines.append("VERIFICATION NOTE")
@@ -390,6 +451,20 @@ def format_report_json(report: VerificationReport) -> dict[str, Any]:
             }
             for s in report.scope_attestations
         ],
+        "session_attestations": [
+            {
+                "event_id": s.event_id,
+                "entity_id": s.entity_id,
+                "version": s.version,
+                "principal_id": s.principal_id,
+                "session_id": s.session_id,
+                "attested_at": s.attested_at,
+                "harnesses": list(s.harnesses),
+                "scope_statement": s.scope_statement,
+                "harness_config_digests": s.harness_config_digests,
+            }
+            for s in report.session_attestations
+        ],
         "key_rotations": [
             {
                 "event_id": kr.event_id,
@@ -442,8 +517,21 @@ def format_report_json(report: VerificationReport) -> dict[str, Any]:
                 "url": w.url,
                 "status": w.status,
                 "mode": w.mode,
+                "public_key": w.public_key,
+                "key_scheme": w.key_scheme,
             }
             for w in report.witness_registrations
+        ],
+        "witness_receipts": [
+            {
+                "event_id": r.event_id,
+                "witness_id": r.witness_id,
+                "confirmed_at": r.confirmed_at,
+                "has_signature": r.has_signature,
+                "signature_valid": r.signature_valid,
+                "verification_detail": r.verification_detail,
+            }
+            for r in report.witness_receipts
         ],
         "witness_coverage_violations": [
             {
@@ -516,6 +604,20 @@ def format_report_json(report: VerificationReport) -> dict[str, Any]:
                 "expected_principal_id": pv.expected_principal_id,
             }
             for pv in report.principal_binding_violations
+        ],
+        "assurance_entries": [
+            {
+                "work_item_id": ae.work_item_id,
+                "assurance_level": ae.assurance_level,
+                "author_lineages": list(ae.author_lineages),
+                "reviewer_lineage": ae.reviewer_lineage,
+                "same_lineage": ae.same_lineage,
+                "has_adversarial_pass": ae.has_adversarial_pass,
+                "has_human_accept": ae.has_human_accept,
+                "lineage_source": ae.lineage_source,
+                "detail": ae.detail,
+            }
+            for ae in report.assurance_entries
         ],
         "scheme_counts": report.scheme_counts,
         "verification_note": (
@@ -843,6 +945,32 @@ def format_report_html(report: VerificationReport) -> str:
                 "</div></div>"
             )
 
+    # Session attestations
+    if report.session_attestations:
+        for sess_sa in report.session_attestations:
+            names = ", ".join(_esc(h.get("name", "?")) for h in sess_sa.harnesses)
+            box_style = (
+                "background:#f0fdf4;padding:12px;border-radius:4px;border:1px solid #bbf7d0"
+            )
+            sections.append(
+                '<div class="section"><h2>Session Attestation</h2>'
+                f'<div style="{box_style}">'
+                f"<p><strong>Event:</strong> "
+                f"<code>{_esc(sess_sa.event_id)}</code></p>"
+                f"<p><strong>Entity ID:</strong> "
+                f"<code>{_esc(sess_sa.entity_id)}</code></p>"
+                f"<p><strong>Principal:</strong> "
+                f"{_esc(sess_sa.principal_id)}</p>"
+                f"<p><strong>Session:</strong> "
+                f"<code>{_esc(sess_sa.session_id)}</code></p>"
+                f"<p><strong>Attested:</strong> "
+                f"{_esc(sess_sa.attested_at)}</p>"
+                f"<p><strong>Scope:</strong> "
+                f"{_esc(sess_sa.scope_statement)}</p>"
+                f"<p><strong>Harnesses:</strong> {names}</p>"
+                "</div></div>"
+            )
+
     # Delegation chains
     if report.delegation_chains:
         dc_failures = report.delegation_chain_failures
@@ -926,13 +1054,13 @@ def format_report_html(report: VerificationReport) -> str:
         rows = ""
         cell = "padding:4px 8px"
         mono = f"{cell};font-family:monospace;font-size:12px"
-        for kr in report.key_revocations:
-            detail = _esc(kr.detail or "")
+        for kr_rev in report.key_revocations:
+            detail = _esc(kr_rev.detail or "")
             rows += (
                 f"<tr>"
-                f'<td style="{mono}">{_esc(kr.event_id[:16])}...</td>'
-                f'<td style="{mono}">{_esc(kr.key_id[:16])}...</td>'
-                f'<td style="{cell}">{_esc(kr.revoked_at or "")}</td>'
+                f'<td style="{mono}">{_esc(kr_rev.event_id[:16])}...</td>'
+                f'<td style="{mono}">{_esc(kr_rev.key_id[:16])}...</td>'
+                f'<td style="{cell}">{_esc(kr_rev.revoked_at or "")}</td>'
                 f'<td style="{cell};font-size:12px">{detail}</td>'
                 f"</tr>"
             )
@@ -999,9 +1127,18 @@ def format_report_html(report: VerificationReport) -> str:
         w_count = len(report.witness_registrations)
         r_count = len(report.witness_receipts)
         v_count = len(report.witness_coverage_violations)
+        sig_failed = sum(
+            1 for r in report.witness_receipts if r.signature_valid is False
+        )
+        sig_unchecked = sum(
+            1 for r in report.witness_receipts if r.signature_valid is None
+        )
         w_header = (
             f"Witness Federation ({w_count} witnesses, "
-            f"{r_count} receipts, {v_count} violations)"
+            f"{r_count} receipts, {v_count} violations"
+            + (f", {sig_failed} signature failures" if sig_failed else "")
+            + (f", {sig_unchecked} unchecked" if sig_unchecked else "")
+            + ")"
         )
         rows = ""
         cell = "padding:4px 8px"
@@ -1013,6 +1150,7 @@ def format_report_html(report: VerificationReport) -> str:
                 f'<td style="{cell}">{_esc(w.url)}</td>'
                 f'<td style="{cell}">{_esc(w.status)}</td>'
                 f'<td style="{cell}">{_esc(w.mode)}</td>'
+                f'<td style="{cell}">{_esc(w.key_scheme or "—")}</td>'
                 f"</tr>"
             )
         th_style = f"{cell};text-align:left"
@@ -1022,6 +1160,7 @@ def format_report_html(report: VerificationReport) -> str:
             f'<th style="{th_style}">URL</th>'
             f'<th style="{th_style}">Status</th>'
             f'<th style="{th_style}">Mode</th>'
+            f'<th style="{th_style}">Scheme</th>'
             "</tr></thead>"
         )
         w_html = (
@@ -1029,6 +1168,37 @@ def format_report_html(report: VerificationReport) -> str:
             '<table style="border-collapse:collapse;width:100%">'
             f"{hdr}<tbody>{rows}</tbody></table></div>"
         )
+        if report.witness_receipts:
+            r_rows = ""
+            for r in report.witness_receipts:
+                if r.signature_valid is True:
+                    sig_html = '<span style="color:#16a34a;font-weight:bold">VERIFIED</span>'
+                elif r.signature_valid is False:
+                    sig_html = '<span style="color:#dc2626;font-weight:bold">FAILED</span>'
+                else:
+                    sig_html = '<span style="color:#d97706">UNCHECKED</span>'
+                detail = _esc(r.verification_detail or "")
+                r_rows += (
+                    f"<tr>"
+                    f'<td style="{mono}">{_esc(r.event_id[:16])}...</td>'
+                    f'<td style="{mono}">{_esc(r.witness_id[:16])}...</td>'
+                    f'<td style="{cell};text-align:center">{sig_html}</td>'
+                    f'<td style="{cell};font-size:12px">{detail}</td>'
+                    f"</tr>"
+                )
+            r_hdr = (
+                '<thead><tr style="background:#f1f5f9">'
+                f'<th style="{th_style}">Event ID</th>'
+                f'<th style="{th_style}">Witness ID</th>'
+                f'<th style="{th_style};text-align:center">Signature</th>'
+                f'<th style="{th_style}">Detail</th>'
+                "</tr></thead>"
+            )
+            w_html += (
+                '<h3>Receipt Signatures (BC-016)</h3>'
+                '<table style="border-collapse:collapse;width:100%">'
+                f"{r_hdr}<tbody>{r_rows}</tbody></table>"
+            )
         if report.witness_coverage_violations:
             v_rows = ""
             for v in report.witness_coverage_violations:
@@ -1050,6 +1220,60 @@ def format_report_html(report: VerificationReport) -> str:
                 f"{v_hdr}<tbody>{v_rows}</tbody></table>"
             )
         sections.append(w_html)
+
+    # Assurance levels
+    if report.assurance_entries:
+        rows = ""
+        cell = "padding:4px 8px"
+        mono = f"{cell};font-family:monospace;font-size:12px"
+        for ae in report.assurance_entries:
+            if ae.assurance_level in ("independently_reviewed", "independently_and_accepted"):
+                lvl_color = "#16a34a"
+            elif ae.assurance_level in ("human_accepted",):
+                lvl_color = "#d97706"
+            elif ae.assurance_level == "self_reviewed":
+                lvl_color = "#dc2626"
+            else:
+                lvl_color = "#6b7280"
+            lvl_html = (
+                f'<span style="color:{lvl_color};font-weight:bold">'
+                f"{_esc(ae.assurance_level)}</span>"
+            )
+            same = (
+                '<span style="color:#dc2626">yes</span>'
+                if ae.same_lineage is True
+                else '<span style="color:#16a34a">no</span>'
+                if ae.same_lineage is False
+                else "&mdash;"
+            )
+            rows += (
+                f"<tr>"
+                f'<td style="{mono}">{_esc(ae.work_item_id[:16])}...</td>'
+                f'<td style="{cell}">{lvl_html}</td>'
+                f'<td style="{cell};text-align:center">{same}</td>'
+                f'<td style="{cell}">{_esc(ae.lineage_source)}</td>'
+                f'<td style="{cell};font-size:12px">{_esc(ae.detail)}</td>'
+                f"</tr>"
+            )
+        th_style = f"{cell};text-align:left"
+        hdr = (
+            '<thead><tr style="background:#f1f5f9">'
+            f'<th style="{th_style}">Work Item</th>'
+            f'<th style="{th_style}">Assurance Level</th>'
+            f'<th style="{th_style};text-align:center">Same Lineage</th>'
+            f'<th style="{th_style}">Lineage Source</th>'
+            f'<th style="{th_style}">Detail</th>'
+            "</tr></thead>"
+        )
+        sections.append(
+            '<div class="section"><h2>Review Assurance Levels</h2>'
+            '<p style="font-size:13px;color:#64748b">Plan 027: the assurance '
+            "level each item received, computed from the signed event log. "
+            "Self-reviewed items have degraded assurance and require a human "
+            "accept under the strict gate profile.</p>"
+            '<table style="border-collapse:collapse;width:100%">'
+            f"{hdr}<tbody>{rows}</tbody></table></div>"
+        )
 
     # Verification note
     note_style = (

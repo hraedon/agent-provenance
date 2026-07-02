@@ -44,6 +44,7 @@ from .schema import (
     FileDigest,
     ResultSummary,
     ScopeAttestationPayload,
+    SessionAttestationPayload,
     ToolCallBegin,
     ToolCallEnd,
     build_redacted_args,
@@ -174,6 +175,75 @@ class CairnAdapter:
         log.info(
             "cairn.scope_attestation",
             work_item_id=str(wi.work_item_id),
+            principal_id=principal_id,
+            actor=actor,
+        )
+        return event
+
+    def attest_session(
+        self,
+        principal_id: str,
+        session_id: str,
+        harnesses: list[dict[str, Any]],
+        scope_statement: str,
+        harness_config_digests: dict[str, str] | None = None,
+        *,
+        attested_at: str | None = None,
+        actor_id: str | None = None,
+        event_id: uuid.UUID | None = None,
+    ) -> Any:
+        """Record a session-level attestation as a non-work-item entity.
+
+        Uses entity_kind="session" so the attestation is structurally distinct
+        from tool-call events (BC-005). No work item is created.
+
+        Args:
+            principal_id: Human principal on whose behalf this session runs.
+            session_id: Session identifier (UUID string).
+            harnesses: List of harness dicts with name and version.
+            scope_statement: Human-readable scope statement.
+            harness_config_digests: Map harness_name → sha256 of config.
+            attested_at: ISO-8601 timestamp (defaults to now).
+            actor_id: Actor for this event (defaults to adapter default).
+            event_id: Explicit UUID for idempotency.
+
+        Returns:
+            The appended Event recording the attestation.
+        """
+        actor = actor_id or self._actor_id
+        ts = attested_at or datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+        payload = SessionAttestationPayload(
+            version="1",
+            principal_id=principal_id,
+            session_id=session_id,
+            attested_at=ts,
+            harnesses=harnesses,
+            scope_statement=scope_statement,
+            harness_config_digests=harness_config_digests,
+        ).to_dict()
+
+        try:
+            entity_id = uuid.UUID(session_id) if isinstance(session_id, str) else session_id
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"session_id must be a valid UUID string, got {session_id!r}: {exc}"
+            ) from exc
+
+        event = self._sub.append_event(
+            work_item_id=entity_id,
+            actor_id=actor,
+            actor_kind=self._actor_kind,
+            actor_metadata={"role": "agent", "phase": "session_attestation"},
+            transition="session_attestation",
+            payload=payload,
+            on_behalf_of={"principal_id": principal_id, "session_id": session_id},
+            entity_kind="session",
+            event_id=event_id,
+        )
+
+        log.info(
+            "cairn.session_attestation",
+            session_id=session_id,
             principal_id=principal_id,
             actor=actor,
         )

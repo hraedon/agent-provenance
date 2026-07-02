@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -2052,6 +2053,9 @@ def _make_signed_event(
     timestamp=None,
     work_item_id=None,
     on_behalf_of: dict | None = None,
+    actor_metadata: dict | None = None,
+    actor_kind: str = "agent",
+    actor_id: str = "agent-1",
 ):
     """Helper to create a signed event for verifier tests."""
     from datetime import UTC, datetime
@@ -2066,7 +2070,7 @@ def _make_signed_event(
     sig, c_hash, env = sign_event(
         event_id=ev_id,
         work_item_id=wi_id,
-        actor_id="agent-1",
+        actor_id=actor_id,
         key_id=key_id,
         event_seq=event_seq,
         workflow_name="cairn_agent_actions",
@@ -2081,9 +2085,9 @@ def _make_signed_event(
         event_id=ev_id,
         work_item_id=wi_id,
         event_seq=event_seq,
-        actor_id="agent-1",
-        actor_kind="agent",
-        actor_metadata=None,
+        actor_id=actor_id,
+        actor_kind=actor_kind,
+        actor_metadata=actor_metadata,
         key_id=key_id,
         workflow_name="cairn_agent_actions",
         workflow_version=1,
@@ -2184,7 +2188,7 @@ def test_scope_coverage_violation(hmac_keys: Path) -> None:
     report = verifier.verify_events([scope_ev, tool_ev])
     assert len(report.scope_violations) == 1
     assert report.scope_violations[0].harness == "opencode"
-    assert "not in active scope" in report.scope_violations[0].detail
+    assert "not in active attestation" in report.scope_violations[0].detail
     assert not report.all_ok
 
 
@@ -2203,7 +2207,7 @@ def test_scope_coverage_no_attestation(hmac_keys: Path) -> None:
     verifier = Verifier(key_set)
     report = verifier.verify_events([tool_ev])
     assert len(report.scope_violations) == 1
-    assert "No scope attestation" in report.scope_violations[0].detail
+    assert "No attestation" in report.scope_violations[0].detail
 
 
 def test_key_revocation_event_detected(hmac_keys: Path) -> None:
@@ -4112,3 +4116,1800 @@ def test_load_key_set_ed25519(tmp_path: Path) -> None:
     data = json.loads(output_path.read_text())
     assert data["summary"]["all_ok"] is True
     assert data["scheme_counts"].get("ed25519") == 1
+
+
+# ----------------------------------------------------------------------
+# Session attestation tests (entity_kind="session", BC-005 fix)
+# ----------------------------------------------------------------------
+
+
+def test_session_attestation_payload_roundtrip() -> None:
+    from cairn.schema import SessionAttestationPayload
+
+    sa = SessionAttestationPayload(
+        version="1",
+        principal_id="human:owner",
+        session_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        attested_at="2026-06-23T12:00:00Z",
+        harnesses=[{"name": "opencode", "version": "0.1.0"}],
+        scope_statement="In scope: opencode.",
+        harness_config_digests={"opencode": "sha256:abc"},
+    )
+    assert SessionAttestationPayload.from_dict(sa.to_dict()) == sa
+
+
+def test_session_attestation_payload_no_digests() -> None:
+    from cairn.schema import SessionAttestationPayload
+
+    sa = SessionAttestationPayload(
+        version="1",
+        principal_id="human:owner",
+        session_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        attested_at="2026-06-23T12:00:00Z",
+        harnesses=[{"name": "opencode", "version": "0.1.0"}],
+        scope_statement="In scope: opencode.",
+    )
+    d = sa.to_dict()
+    assert "harness_config_digests" not in d
+    assert SessionAttestationPayload.from_dict(d) == sa
+
+
+def test_verify_session_attestation_in_report() -> None:
+    """Verifier detects session-entity attestations and surfaces them in report."""
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    from cairn.verifier import Verifier
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    session_entity_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=session_entity_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": "2026-06-23T12:00:00Z",
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+            "harness_config_digests": {"opencode": "sha256:abc"},
+        },
+        key=key_bytes,
+        entity_kind="session",
+    )
+    event = Event(
+        event_id=ev_id,
+        work_item_id=session_entity_id,
+        entity_kind="session",
+        entity_id=session_entity_id,
+        hash_alg="sha-256",
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": "2026-06-23T12:00:00Z",
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+            "harness_config_digests": {"opencode": "sha256:abc"},
+        },
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([event])
+    assert len(report.session_attestations) == 1
+    sa = report.session_attestations[0]
+    assert sa.principal_id == "human:owner"
+    assert sa.session_id == str(session_entity_id)
+    assert sa.scope_statement == "In scope: opencode."
+    assert sa.entity_id == str(session_entity_id)
+
+
+def test_session_attestation_structurally_distinct_from_scope() -> None:
+    """Session attestations do NOT appear in scope_attestations (BC-005 fix)."""
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    from cairn.verifier import Verifier
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    session_entity_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=session_entity_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": "2026-06-23T12:00:00Z",
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+        },
+        key=key_bytes,
+        entity_kind="session",
+    )
+    event = Event(
+        event_id=ev_id,
+        work_item_id=session_entity_id,
+        entity_kind="session",
+        entity_id=session_entity_id,
+        hash_alg="sha-256",
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": "2026-06-23T12:00:00Z",
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+        },
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([event])
+    assert len(report.session_attestations) == 1
+    assert len(report.scope_attestations) == 0
+
+
+def test_session_attestation_in_text_report() -> None:
+    """Session attestations appear in the text report."""
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    from cairn.verifier import Verifier
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    session_entity_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=session_entity_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": "2026-06-23T12:00:00Z",
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+        },
+        key=key_bytes,
+        entity_kind="session",
+    )
+    event = Event(
+        event_id=ev_id,
+        work_item_id=session_entity_id,
+        entity_kind="session",
+        entity_id=session_entity_id,
+        hash_alg="sha-256",
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": "2026-06-23T12:00:00Z",
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+        },
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([event])
+    text = Verifier.format_report(report)
+    assert "SESSION ATTESTATIONS" in text
+    assert "human:owner" in text
+    assert str(session_entity_id) in text
+
+
+def test_session_attestation_in_json_report() -> None:
+    """Session attestations appear in the JSON report."""
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    from cairn.verifier import Verifier
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    session_entity_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=session_entity_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": "2026-06-23T12:00:00Z",
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+        },
+        key=key_bytes,
+        entity_kind="session",
+    )
+    event = Event(
+        event_id=ev_id,
+        work_item_id=session_entity_id,
+        entity_kind="session",
+        entity_id=session_entity_id,
+        hash_alg="sha-256",
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": "2026-06-23T12:00:00Z",
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+        },
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([event])
+    data = Verifier.format_report_json(report)
+    assert "session_attestations" in data
+    assert len(data["session_attestations"]) == 1
+    assert data["session_attestations"][0]["principal_id"] == "human:owner"
+
+
+def test_session_attestation_in_html_report() -> None:
+    """Session attestations appear in the HTML report."""
+    from datetime import UTC, datetime
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    from cairn.verifier import Verifier
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    session_entity_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=session_entity_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": "2026-06-23T12:00:00Z",
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+        },
+        key=key_bytes,
+        entity_kind="session",
+    )
+    event = Event(
+        event_id=ev_id,
+        work_item_id=session_entity_id,
+        entity_kind="session",
+        entity_id=session_entity_id,
+        hash_alg="sha-256",
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": "2026-06-23T12:00:00Z",
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+        },
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([event])
+    html = Verifier.format_report_html(report)
+    assert "Session Attestation" in html
+    assert "human:owner" in html
+
+
+def test_session_attestation_adapter_with_in_memory() -> None:
+    """Adapter.attest_session() creates a session-entity event via InMemoryRegista."""
+    from regista.testing import InMemoryRegista
+
+    from cairn import CairnAdapter, CairnConfig
+
+    sub = InMemoryRegista(project="cairn_test_session")
+    adapter = CairnAdapter(
+        sub,
+        config=CairnConfig("opencode", "0.1.0"),
+        on_behalf_of={
+            "principal_id": "human:test",
+            "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        },
+    )
+
+    session_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    event = adapter.attest_session(
+        principal_id="human:test",
+        session_id=session_id,
+        harnesses=[{"name": "opencode", "version": "0.1.0"}],
+        scope_statement="In scope: opencode.",
+        harness_config_digests={"opencode": "sha256:abc"},
+    )
+
+    assert event is not None
+    assert event.transition == "session_attestation"
+    assert event.entity_kind == "session"
+    payload = event.payload or {}
+    assert payload["version"] == "1"
+    assert payload["principal_id"] == "human:test"
+    assert payload["session_id"] == session_id
+    assert payload["scope_statement"] == "In scope: opencode."
+    assert event.entity_id == uuid.UUID(session_id)
+    assert event.workflow_name == ""
+
+
+def test_session_attestation_multiple_events_same_entity() -> None:
+    """Multiple session attestations on the same entity get incremental event_seq."""
+    from regista.testing import InMemoryRegista
+
+    from cairn import CairnAdapter, CairnConfig
+
+    sub = InMemoryRegista(project="cairn_test_multi")
+    adapter = CairnAdapter(
+        sub,
+        config=CairnConfig("opencode", "0.1.0"),
+        on_behalf_of={
+            "principal_id": "human:test",
+            "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        },
+    )
+
+    session_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    ev1 = adapter.attest_session(
+        principal_id="human:test",
+        session_id=session_id,
+        harnesses=[{"name": "opencode", "version": "0.1.0"}],
+        scope_statement="In scope: opencode.",
+    )
+    ev2 = adapter.attest_session(
+        principal_id="human:test",
+        session_id=session_id,
+        harnesses=[
+            {"name": "opencode", "version": "0.1.0"},
+            {"name": "claude-code", "version": "1.0"},
+        ],
+        scope_statement="In scope: opencode, claude-code.",
+    )
+
+    assert ev1.event_seq == 1
+    assert ev2.event_seq == 2
+    assert ev1.entity_kind == "session"
+    assert ev2.entity_kind == "session"
+    assert ev1.entity_id == ev2.entity_id == uuid.UUID(session_id)
+
+
+def test_session_attestation_provides_scope_coverage() -> None:
+    """A session attestation covers tool calls from the same harness."""
+    from datetime import UTC, datetime, timedelta
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    from cairn.verifier import Verifier
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+    now = datetime.now(UTC)
+    session_entity_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+
+    # Session attestation (entity_kind="session")
+    sa_id = uuid.uuid4()
+    sa_sig, sa_hash, sa_env = sign_event(
+        event_id=sa_id,
+        work_item_id=session_entity_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now - timedelta(seconds=10),
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": (now - timedelta(seconds=10)).isoformat(),
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+        },
+        key=key_bytes,
+        entity_kind="session",
+    )
+    sa_event = Event(
+        event_id=sa_id,
+        work_item_id=session_entity_id,
+        entity_kind="session",
+        entity_id=session_entity_id,
+        hash_alg="sha-256",
+        event_seq=1,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now - timedelta(seconds=10),
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": (now - timedelta(seconds=10)).isoformat(),
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+        },
+        payload_canonical_hash=sa_hash,
+        signature=sa_sig,
+        canonical_envelope=sa_env,
+    )
+
+    # Tool call from opencode (covered by the session attestation)
+    tc_id = uuid.uuid4()
+    tc_sig, tc_hash, tc_env = sign_event(
+        event_id=tc_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Edit",
+            "tool_args_hash": "sha256:abc",
+            "harness": {"name": "opencode", "version": "0.1.0"},
+        },
+        key=key_bytes,
+    )
+    tc_event = Event(
+        event_id=tc_id,
+        work_item_id=wi_id,
+        event_seq=1,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Edit",
+            "tool_args_hash": "sha256:abc",
+            "harness": {"name": "opencode", "version": "0.1.0"},
+        },
+        payload_canonical_hash=tc_hash,
+        signature=tc_sig,
+        canonical_envelope=tc_env,
+        on_behalf_of={"principal_id": "human:owner", "session_id": str(session_entity_id)},
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([sa_event, tc_event])
+    assert len(report.scope_violations) == 0, [v.detail for v in report.scope_violations]
+
+
+def test_session_attestation_provides_principal_binding() -> None:
+    """A session attestation's principal_id is used for principal binding check."""
+    from datetime import UTC, datetime, timedelta
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    from cairn.verifier import Verifier
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+    now = datetime.now(UTC)
+    session_entity_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+
+    sa_id = uuid.uuid4()
+    sa_sig, sa_hash, sa_env = sign_event(
+        event_id=sa_id,
+        work_item_id=session_entity_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now - timedelta(seconds=10),
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": (now - timedelta(seconds=10)).isoformat(),
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+        },
+        key=key_bytes,
+        entity_kind="session",
+    )
+    sa_event = Event(
+        event_id=sa_id,
+        work_item_id=session_entity_id,
+        entity_kind="session",
+        entity_id=session_entity_id,
+        hash_alg="sha-256",
+        event_seq=1,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now - timedelta(seconds=10),
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": (now - timedelta(seconds=10)).isoformat(),
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+        },
+        payload_canonical_hash=sa_hash,
+        signature=sa_sig,
+        canonical_envelope=sa_env,
+    )
+
+    tc_id = uuid.uuid4()
+    tc_sig, tc_hash, tc_env = sign_event(
+        event_id=tc_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Edit",
+            "tool_args_hash": "sha256:abc",
+            "harness": {"name": "opencode", "version": "0.1.0"},
+        },
+        key=key_bytes,
+    )
+    tc_event = Event(
+        event_id=tc_id,
+        work_item_id=wi_id,
+        event_seq=1,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Edit",
+            "tool_args_hash": "sha256:abc",
+            "harness": {"name": "opencode", "version": "0.1.0"},
+        },
+        payload_canonical_hash=tc_hash,
+        signature=tc_sig,
+        canonical_envelope=tc_env,
+        on_behalf_of={"principal_id": "human:owner", "session_id": str(session_entity_id)},
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([sa_event, tc_event])
+    assert len(report.principal_binding_violations) == 0, [
+        v.detail for v in report.principal_binding_violations
+    ]
+
+
+def test_session_attestation_principal_mismatch_detected() -> None:
+    """A session attestation with a different principal is flagged."""
+    from datetime import UTC, datetime, timedelta
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    from cairn.verifier import Verifier
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+    now = datetime.now(UTC)
+    session_entity_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+
+    sa_id = uuid.uuid4()
+    sa_sig, sa_hash, sa_env = sign_event(
+        event_id=sa_id,
+        work_item_id=session_entity_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now - timedelta(seconds=10),
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": (now - timedelta(seconds=10)).isoformat(),
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+        },
+        key=key_bytes,
+        entity_kind="session",
+    )
+    sa_event = Event(
+        event_id=sa_id,
+        work_item_id=session_entity_id,
+        entity_kind="session",
+        entity_id=session_entity_id,
+        hash_alg="sha-256",
+        event_seq=1,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now - timedelta(seconds=10),
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": str(session_entity_id),
+            "attested_at": (now - timedelta(seconds=10)).isoformat(),
+            "harnesses": [{"name": "opencode", "version": "0.1.0"}],
+            "scope_statement": "In scope: opencode.",
+        },
+        payload_canonical_hash=sa_hash,
+        signature=sa_sig,
+        canonical_envelope=sa_env,
+    )
+
+    tc_id = uuid.uuid4()
+    tc_sig, tc_hash, tc_env = sign_event(
+        event_id=tc_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Edit",
+            "tool_args_hash": "sha256:abc",
+            "harness": {"name": "opencode", "version": "0.1.0"},
+        },
+        key=key_bytes,
+    )
+    tc_event = Event(
+        event_id=tc_id,
+        work_item_id=wi_id,
+        event_seq=1,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Edit",
+            "tool_args_hash": "sha256:abc",
+            "harness": {"name": "opencode", "version": "0.1.0"},
+        },
+        payload_canonical_hash=tc_hash,
+        signature=tc_sig,
+        canonical_envelope=tc_env,
+        on_behalf_of={"principal_id": "human:other", "session_id": str(session_entity_id)},
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([sa_event, tc_event])
+    assert len(report.principal_binding_violations) == 1
+    assert report.principal_binding_violations[0].kind == "principal_mismatch"
+
+
+def test_session_attestation_rejects_invalid_entity_kind() -> None:
+    """Regista rejects unknown entity_kind values."""
+    from regista.testing import InMemoryRegista
+
+    from cairn import CairnAdapter, CairnConfig
+
+    sub = InMemoryRegista(project="cairn_test_entity_kind")
+    CairnAdapter(
+        sub,
+        config=CairnConfig("opencode", "0.1.0"),
+        on_behalf_of={
+            "principal_id": "human:test",
+            "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        },
+    )
+
+    session_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    with pytest.raises(Exception, match="entity_kind"):
+        sub.append_event(
+            work_item_id=uuid.UUID(session_id),
+            actor_id="agent",
+            transition="bad_attestation",
+            payload={},
+            entity_kind="sesion",
+        )
+
+
+# ---------------------------------------------------------------------------
+# BC-016: Witness receipt signature cryptographic verification
+# ---------------------------------------------------------------------------
+
+
+def _make_witness_bundle(
+    *,
+    ev_id: uuid.UUID,
+    env: bytes,
+    c_hash: bytes,
+    sig: bytes,
+    witness_id: str,
+    witness_pubkey_hex: str | None,
+    witness_sig_hex: str | None,
+    key_scheme: str = "ed25519",
+    include_registration: bool = True,
+) -> dict:
+    """Build a minimal bundle with one event and one witness receipt."""
+    from datetime import UTC, datetime
+
+    from regista._types import Event
+
+    ev = Event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        event_seq=1,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata={},
+        key_id="cairn-test-001",
+        workflow_name="",
+        workflow_version=0,
+        timestamp=datetime.now(UTC),
+        transition="tool_call",
+        payload={"tool": "Read"},
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+    bundle: dict = {
+        "manifest": {"events_count": 1},
+        "events": [ev.to_dict()],
+    }
+    if include_registration:
+        reg: dict = {
+            "witness_id": witness_id,
+            "url": "https://witness.example.com/receipt",
+            "status": "active",
+            "mode": "witness",
+            "key_scheme": key_scheme,
+        }
+        if witness_pubkey_hex is not None:
+            reg["public_key"] = witness_pubkey_hex
+        bundle["witness_registrations"] = [reg]
+    if witness_sig_hex is not None or True:
+        receipt: dict = {
+            "event_id": str(ev_id),
+            "witness_id": witness_id,
+            "status": "confirmed",
+            "confirmed_at": datetime.now(UTC).isoformat(),
+        }
+        if witness_sig_hex is not None:
+            receipt["witness_signature"] = witness_sig_hex
+        bundle["witness_receipts"] = [receipt]
+    return bundle
+
+
+def _finalize_bundle(bundle: dict, tmp_path: Path, name: str = "bundle.json") -> Path:
+    """Compute bundle_hash and write to disk."""
+    manifest = bundle["manifest"]
+    redacted_manifest = {
+        k: v for k, v in manifest.items() if k not in ("bundle_hash", "bundle_hash_covers")
+    }
+    full = {"manifest": redacted_manifest, **{k: v for k, v in bundle.items() if k != "manifest"}}
+    canonical = json.dumps(full, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    manifest["bundle_hash"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    p = tmp_path / name
+    p.write_text(json.dumps(bundle, indent=2))
+    return p
+
+
+def test_bc016_valid_witness_signature_verified(tmp_path: Path) -> None:
+    """A valid Ed25519 witness receipt signature is verified as True."""
+    import nacl.signing
+    from regista._signing import sign_event
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="tool_call",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+
+    witness_id = str(uuid.uuid4())
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_pk = witness_sk.verify_key.encode()
+    witness_sig = witness_sk.sign(env).signature
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=witness_id,
+        witness_pubkey_hex=witness_pk.hex(),
+        witness_sig_hex=witness_sig.hex(),
+    )
+    bundle_path = _finalize_bundle(bundle, tmp_path)
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+    assert len(report.witness_receipts) == 1
+    assert report.witness_receipts[0].signature_valid is True
+    assert report.witness_receipts[0].verification_detail is not None
+    assert "verified" in report.witness_receipts[0].verification_detail.lower()
+    assert report.witness_signature_failures == 0
+    assert len(report.witness_coverage_violations) == 0
+
+
+def test_bc016_invalid_witness_signature_detected(tmp_path: Path) -> None:
+    """A tampered Ed25519 witness signature is detected as FAILED."""
+    import nacl.signing
+    from regista._signing import sign_event
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="tool_call",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+
+    witness_id = str(uuid.uuid4())
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_pk = witness_sk.verify_key.encode()
+    bad_sig = bytes(64)  # all zeros — definitely invalid
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=witness_id,
+        witness_pubkey_hex=witness_pk.hex(),
+        witness_sig_hex=bad_sig.hex(),
+    )
+    bundle_path = _finalize_bundle(bundle, tmp_path)
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+    assert len(report.witness_receipts) == 1
+    assert report.witness_receipts[0].signature_valid is False
+    assert "FAILED" in (report.witness_receipts[0].verification_detail or "")
+    assert report.witness_signature_failures == 1
+    assert not report.all_ok
+
+
+def test_bc016_invalid_signature_does_not_count_as_coverage(tmp_path: Path) -> None:
+    """A receipt with a failed signature does not satisfy witness coverage."""
+    import nacl.signing
+    from regista._signing import sign_event
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="tool_call",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+
+    witness_id = str(uuid.uuid4())
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_pk = witness_sk.verify_key.encode()
+    bad_sig = bytes(64)
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=witness_id,
+        witness_pubkey_hex=witness_pk.hex(),
+        witness_sig_hex=bad_sig.hex(),
+    )
+    bundle_path = _finalize_bundle(bundle, tmp_path)
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+    assert report.witness_receipts[0].signature_valid is False
+    assert len(report.witness_coverage_violations) == 1
+    assert "missing confirmed receipts" in report.witness_coverage_violations[0].detail.lower()
+
+
+def test_bc016_missing_signature_for_ed25519_witness(tmp_path: Path) -> None:
+    """A receipt without a signature for an Ed25519 witness is FAILED."""
+    from regista._signing import sign_event
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="tool_call",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+
+    witness_id = str(uuid.uuid4())
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=witness_id,
+        witness_pubkey_hex=None,  # no public key in registration
+        witness_sig_hex=None,     # no signature in receipt
+        key_scheme="ed25519",
+    )
+    bundle_path = _finalize_bundle(bundle, tmp_path)
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+    assert len(report.witness_receipts) == 1
+    assert report.witness_receipts[0].signature_valid is None
+    assert "no public key" in (report.witness_receipts[0].verification_detail or "").lower()
+
+
+def test_bc016_external_witness_keys_via_constructor(tmp_path: Path) -> None:
+    """Witness keys passed to the Verifier constructor are used for verification."""
+    import nacl.signing
+    from regista._signing import sign_event
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="tool_call",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+
+    witness_id = str(uuid.uuid4())
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_pk = witness_sk.verify_key.encode()
+    witness_sig = witness_sk.sign(env).signature
+
+    # Bundle registration has key_scheme but NO public_key
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=witness_id,
+        witness_pubkey_hex=None,
+        witness_sig_hex=witness_sig.hex(),
+        key_scheme="ed25519",
+    )
+    bundle_path = _finalize_bundle(bundle, tmp_path)
+
+    # Pass witness key externally
+    verifier = Verifier(key_set, witness_keys={witness_id: witness_pk})
+    report = verifier.verify_bundle(bundle_path)
+    assert report.witness_receipts[0].signature_valid is True
+    assert len(report.witness_coverage_violations) == 0
+
+
+def test_bc016_backward_compat_no_key_scheme(tmp_path: Path) -> None:
+    """Legacy bundles without key_scheme accept receipts (signature_valid=None)."""
+    from regista._signing import sign_event
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="tool_call",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+
+    witness_id = str(uuid.uuid4())
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=witness_id,
+        witness_pubkey_hex=None,
+        witness_sig_hex=None,
+        key_scheme="hmac-sha256",
+    )
+    bundle_path = _finalize_bundle(bundle, tmp_path)
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+    assert len(report.witness_receipts) == 1
+    assert report.witness_receipts[0].signature_valid is None
+    assert "HMAC" in (report.witness_receipts[0].verification_detail or "")
+    assert len(report.witness_coverage_violations) == 0
+    assert report.all_ok
+
+
+def test_bc016_witness_signature_in_text_report(tmp_path: Path) -> None:
+    """Text report shows witness signature verification status."""
+    import nacl.signing
+    from regista._signing import sign_event
+
+    from cairn.verifier_report import format_report
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="tool_call",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+
+    witness_id = str(uuid.uuid4())
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_pk = witness_sk.verify_key.encode()
+    bad_sig = bytes(64)
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=witness_id,
+        witness_pubkey_hex=witness_pk.hex(),
+        witness_sig_hex=bad_sig.hex(),
+    )
+    bundle_path = _finalize_bundle(bundle, tmp_path)
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+    text = format_report(report)
+    assert "WITNESS FEDERATION" in text
+    assert "signature failures" in text
+    assert "FAILED" in text
+    assert "ed25519" in text.lower()
+
+
+def test_bc016_witness_signature_in_json_report(tmp_path: Path) -> None:
+    """JSON report includes witness signature verification fields."""
+    import nacl.signing
+    from regista._signing import sign_event
+
+    from cairn.verifier_report import format_report_json
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="tool_call",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+
+    witness_id = str(uuid.uuid4())
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_pk = witness_sk.verify_key.encode()
+    witness_sig = witness_sk.sign(env).signature
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=witness_id,
+        witness_pubkey_hex=witness_pk.hex(),
+        witness_sig_hex=witness_sig.hex(),
+    )
+    bundle_path = _finalize_bundle(bundle, tmp_path)
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+    data = format_report_json(report)
+    assert "witness_receipts" in data
+    assert len(data["witness_receipts"]) == 1
+    assert data["witness_receipts"][0]["signature_valid"] is True
+    assert data["witness_receipts"][0]["verification_detail"] is not None
+    assert "witness_registrations" in data
+    assert data["witness_registrations"][0]["key_scheme"] == "ed25519"
+
+
+def test_bc016_witness_signature_in_html_report(tmp_path: Path) -> None:
+    """HTML report shows witness signature verification status."""
+    import nacl.signing
+    from regista._signing import sign_event
+
+    from cairn.verifier_report import format_report_html
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="tool_call",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+
+    witness_id = str(uuid.uuid4())
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_pk = witness_sk.verify_key.encode()
+    bad_sig = bytes(64)
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=witness_id,
+        witness_pubkey_hex=witness_pk.hex(),
+        witness_sig_hex=bad_sig.hex(),
+    )
+    bundle_path = _finalize_bundle(bundle, tmp_path)
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+    html = format_report_html(report)
+    assert "Receipt Signatures" in html
+    assert "FAILED" in html
+    assert "BC-016" in html
+
+
+def test_bc016_export_hex_encodes_witness_public_key(tmp_path: Path) -> None:
+    """Bundle export hex-encodes witness public_key for JSON serialization."""
+    import nacl.signing
+
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_pk = witness_sk.verify_key.encode()
+    witness_pk_hex = witness_pk.hex()
+
+    # Simulate what the export does with bytes public_key
+    w = {
+        "witness_id": "test-witness",
+        "url": "https://witness.example.com",
+        "status": "active",
+        "mode": "witness",
+        "key_scheme": "ed25519",
+        "public_key": witness_pk,  # raw bytes, as from DB
+    }
+    sw = {k: v for k, v in w.items() if k != "sign_secret"}
+    if sw.get("public_key") is not None:
+        pk = sw["public_key"]
+        if isinstance(pk, (bytes, bytearray, memoryview)):
+            sw["public_key"] = bytes(pk).hex()
+
+    # Should survive JSON serialization
+    json.dumps(sw)
+    assert sw["public_key"] == witness_pk_hex
+
+
+# ----------------------------------------------------------------------
+# Plan 027: Review assurance level computation
+# ----------------------------------------------------------------------
+
+
+def test_assurance_no_review_transitions(hmac_keys: Path) -> None:
+    """Work item with only tool_call transitions gets no assurance entry."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    wi_id = uuid.uuid4()
+
+    ev1 = _make_signed_event(
+        key_bytes, event_seq=0, transition="tool_call_begin",
+        payload={"tool": "Edit", "harness": "claude-code"},
+        timestamp=now, work_item_id=wi_id,
+        on_behalf_of={"principal_id": "human:test"},
+    )
+    ev2 = _make_signed_event(
+        key_bytes, event_seq=1, transition="tool_call_end",
+        payload={"tool": "Edit", "harness": "claude-code"},
+        timestamp=now, work_item_id=wi_id,
+        on_behalf_of={"principal_id": "human:test"},
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([ev1, ev2])
+    assert len(report.assurance_entries) == 0
+
+
+def test_assurance_self_reviewed(hmac_keys: Path) -> None:
+    """Same-lineage adversarial_pass without human accept -> SELF_REVIEWED."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    wi_id = uuid.uuid4()
+    lineage = "claude-sonnet-4"
+
+    author_ev = _make_signed_event(
+        key_bytes, event_seq=0, transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": lineage},
+    )
+    review_ev = _make_signed_event(
+        key_bytes, event_seq=1, transition="adversarial_pass",
+        payload={"review_note": "looks ok"},
+        timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": lineage},
+        actor_id="agent-reviewer",
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([author_ev, review_ev])
+    assert len(report.assurance_entries) == 1
+    ae = report.assurance_entries[0]
+    assert ae.assurance_level == "self_reviewed"
+    assert ae.same_lineage is True
+    assert ae.has_adversarial_pass is True
+    assert ae.has_human_accept is False
+    assert ae.reviewer_lineage == lineage
+    assert lineage in ae.author_lineages
+    assert ae.lineage_source == "asserted"
+
+
+def test_assurance_independently_reviewed(hmac_keys: Path) -> None:
+    """Cross-lineage adversarial_pass -> INDEPENDENTLY_REVIEWED."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    wi_id = uuid.uuid4()
+
+    author_ev = _make_signed_event(
+        key_bytes, event_seq=0, transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": "claude-sonnet-4"},
+    )
+    review_ev = _make_signed_event(
+        key_bytes, event_seq=1, transition="adversarial_pass",
+        payload={"review_note": "looks ok"},
+        timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": "gpt-5"},
+        actor_id="agent-reviewer",
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([author_ev, review_ev])
+    assert len(report.assurance_entries) == 1
+    ae = report.assurance_entries[0]
+    assert ae.assurance_level == "independently_reviewed"
+    assert ae.same_lineage is False
+    assert ae.has_adversarial_pass is True
+    assert ae.has_human_accept is False
+
+
+def test_assurance_human_accepted_after_same_lineage(hmac_keys: Path) -> None:
+    """Same-lineage review + human accept -> HUMAN_ACCEPTED."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    wi_id = uuid.uuid4()
+    lineage = "claude-sonnet-4"
+
+    author_ev = _make_signed_event(
+        key_bytes, event_seq=0, transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": lineage},
+    )
+    review_ev = _make_signed_event(
+        key_bytes, event_seq=1, transition="adversarial_pass",
+        payload={"review_note": "looks ok"},
+        timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": lineage},
+        actor_id="agent-reviewer",
+    )
+    accept_ev = _make_signed_event(
+        key_bytes, event_seq=2, transition="accept",
+        payload={"review_note": "approved"},
+        timestamp=now, work_item_id=wi_id,
+        actor_kind="human",
+        actor_id="human:operator",
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([author_ev, review_ev, accept_ev])
+    assert len(report.assurance_entries) == 1
+    ae = report.assurance_entries[0]
+    assert ae.assurance_level == "human_accepted"
+    assert ae.same_lineage is True
+    assert ae.has_adversarial_pass is True
+    assert ae.has_human_accept is True
+
+
+def test_assurance_independently_and_accepted(hmac_keys: Path) -> None:
+    """Cross-lineage review + human accept -> INDEPENDENT_AND_ACCEPTED."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    wi_id = uuid.uuid4()
+
+    author_ev = _make_signed_event(
+        key_bytes, event_seq=0, transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": "claude-sonnet-4"},
+    )
+    review_ev = _make_signed_event(
+        key_bytes, event_seq=1, transition="adversarial_pass",
+        payload={"review_note": "looks ok"},
+        timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": "gpt-5"},
+        actor_id="agent-reviewer",
+    )
+    accept_ev = _make_signed_event(
+        key_bytes, event_seq=2, transition="accept",
+        payload={"review_note": "approved"},
+        timestamp=now, work_item_id=wi_id,
+        actor_kind="human",
+        actor_id="human:operator",
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([author_ev, review_ev, accept_ev])
+    assert len(report.assurance_entries) == 1
+    ae = report.assurance_entries[0]
+    assert ae.assurance_level == "independently_and_accepted"
+    assert ae.same_lineage is False
+    assert ae.has_adversarial_pass is True
+    assert ae.has_human_accept is True
+
+
+def test_assurance_close_from_open(hmac_keys: Path) -> None:
+    """close_from_open without review -> NONE."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    wi_id = uuid.uuid4()
+
+    create_ev = _make_signed_event(
+        key_bytes, event_seq=0, transition="create",
+        payload={"tool": "breadcrumb"},
+        timestamp=now, work_item_id=wi_id,
+    )
+    close_ev = _make_signed_event(
+        key_bytes, event_seq=1, transition="close_from_open",
+        payload={"review_note": "won't fix"},
+        timestamp=now, work_item_id=wi_id,
+        actor_kind="human",
+        actor_id="human:operator",
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([create_ev, close_ev])
+    assert len(report.assurance_entries) == 1
+    ae = report.assurance_entries[0]
+    assert ae.assurance_level == "none"
+    assert ae.has_adversarial_pass is False
+    assert ae.has_human_accept is False
+
+
+def test_assurance_undeclared_lineage(hmac_keys: Path) -> None:
+    """adversarial_pass without lineage declaration -> SELF_REVIEWED (unverifiable)."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    wi_id = uuid.uuid4()
+
+    author_ev = _make_signed_event(
+        key_bytes, event_seq=0, transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        timestamp=now, work_item_id=wi_id,
+    )
+    review_ev = _make_signed_event(
+        key_bytes, event_seq=1, transition="adversarial_pass",
+        payload={"review_note": "looks ok"},
+        timestamp=now, work_item_id=wi_id,
+        actor_id="agent-reviewer",
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([author_ev, review_ev])
+    assert len(report.assurance_entries) == 1
+    ae = report.assurance_entries[0]
+    assert ae.assurance_level == "self_reviewed"
+    assert ae.same_lineage is None
+    assert ae.reviewer_lineage is None
+
+
+def test_assurance_in_json_report(hmac_keys: Path) -> None:
+    """Assurance entries appear in the JSON report."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    wi_id = uuid.uuid4()
+
+    author_ev = _make_signed_event(
+        key_bytes, event_seq=0, transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": "claude-sonnet-4"},
+    )
+    review_ev = _make_signed_event(
+        key_bytes, event_seq=1, transition="adversarial_pass",
+        payload={"review_note": "looks ok"},
+        timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": "claude-sonnet-4"},
+        actor_id="agent-reviewer",
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([author_ev, review_ev])
+    json_report = Verifier.format_report_json(report)
+    assert "assurance_entries" in json_report
+    assert len(json_report["assurance_entries"]) == 1
+    ae = json_report["assurance_entries"][0]
+    assert ae["assurance_level"] == "self_reviewed"
+    assert ae["same_lineage"] is True
+    assert ae["lineage_source"] == "asserted"
+
+
+def test_assurance_in_text_report(hmac_keys: Path) -> None:
+    """Assurance section appears in the text report."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    wi_id = uuid.uuid4()
+
+    author_ev = _make_signed_event(
+        key_bytes, event_seq=0, transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": "claude-sonnet-4"},
+    )
+    review_ev = _make_signed_event(
+        key_bytes, event_seq=1, transition="adversarial_pass",
+        payload={"review_note": "ok"},
+        timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": "gpt-5"},
+        actor_id="agent-reviewer",
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([author_ev, review_ev])
+    text = Verifier.format_report(report)
+    assert "REVIEW ASSURANCE LEVELS" in text
+    assert "independently_reviewed" in text
+    assert "same_lineage" in text
+
+
+def test_assurance_in_html_report(hmac_keys: Path) -> None:
+    """Assurance section appears in the HTML report."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    wi_id = uuid.uuid4()
+
+    author_ev = _make_signed_event(
+        key_bytes, event_seq=0, transition="tool_call_begin",
+        payload={"tool": "Edit"},
+        timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": "claude-sonnet-4"},
+    )
+    review_ev = _make_signed_event(
+        key_bytes, event_seq=1, transition="adversarial_pass",
+        payload={"review_note": "ok"},
+        timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": "claude-sonnet-4"},
+        actor_id="agent-reviewer",
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([author_ev, review_ev])
+    html = Verifier.format_report_html(report)
+    assert "Review Assurance Levels" in html
+    assert "self_reviewed" in html
+    assert "Plan 027" in html
+
+
+def test_assurance_multiple_work_items(hmac_keys: Path) -> None:
+    """Multiple work items each get their own assurance entry."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    wi1 = uuid.uuid4()
+    wi2 = uuid.uuid4()
+
+    # WI1: cross-lineage review
+    ev1a = _make_signed_event(
+        key_bytes, event_seq=0, transition="tool_call_begin",
+        payload={"tool": "Edit"}, timestamp=now, work_item_id=wi1,
+        actor_metadata={"model_lineage": "claude-sonnet-4"},
+    )
+    ev1b = _make_signed_event(
+        key_bytes, event_seq=1, transition="adversarial_pass",
+        payload={"review_note": "ok"}, timestamp=now, work_item_id=wi1,
+        actor_metadata={"model_lineage": "gpt-5"},
+        actor_id="agent-reviewer-1",
+    )
+
+    # WI2: same-lineage review
+    ev2a = _make_signed_event(
+        key_bytes, event_seq=0, transition="tool_call_begin",
+        payload={"tool": "Write"}, timestamp=now, work_item_id=wi2,
+        actor_metadata={"model_lineage": "claude-sonnet-4"},
+    )
+    ev2b = _make_signed_event(
+        key_bytes, event_seq=1, transition="adversarial_pass",
+        payload={"review_note": "ok"}, timestamp=now, work_item_id=wi2,
+        actor_metadata={"model_lineage": "claude-sonnet-4"},
+        actor_id="agent-reviewer-2",
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([ev1a, ev1b, ev2a, ev2b])
+    assert len(report.assurance_entries) == 2
+    levels = {ae.work_item_id: ae.assurance_level for ae in report.assurance_entries}
+    assert levels[str(wi1)] == "independently_reviewed"
+    assert levels[str(wi2)] == "self_reviewed"
+
+
+def test_assurance_does_not_affect_all_ok(hmac_keys: Path) -> None:
+    """SELF_REVIEWED is a valid (degraded) state — it should not fail all_ok."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    wi_id = uuid.uuid4()
+    lineage = "claude-sonnet-4"
+
+    author_ev = _make_signed_event(
+        key_bytes, event_seq=0, transition="tool_call_begin",
+        payload={"tool": "Edit"}, timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": lineage},
+        on_behalf_of={"principal_id": "human:test"},
+    )
+    review_ev = _make_signed_event(
+        key_bytes, event_seq=1, transition="adversarial_pass",
+        payload={"review_note": "ok"}, timestamp=now, work_item_id=wi_id,
+        actor_metadata={"model_lineage": lineage},
+        actor_id="agent-reviewer",
+        on_behalf_of={"principal_id": "human:test"},
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([author_ev, review_ev])
+    assert len(report.assurance_entries) == 1
+    assert report.assurance_entries[0].assurance_level == "self_reviewed"
+    assert report.all_ok

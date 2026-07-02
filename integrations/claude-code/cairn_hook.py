@@ -236,7 +236,7 @@ def handle_session_start() -> None:
 
     reply = _run_bridge(
         {
-            "action": "attest_scope",
+            "action": "attest_session",
             "session_id": session_id,
             "harnesses": [
                 {
@@ -249,7 +249,7 @@ def handle_session_start() -> None:
         }
     )
     if not reply or reply.get("status") != "ok":
-        _mark_degraded(session_id, "session_start", "scope attestation bridge call failed")
+        _mark_degraded(session_id, "session_start", "session attestation bridge call failed")
 
 
 def handle_session_end() -> None:

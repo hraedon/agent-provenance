@@ -36,3 +36,17 @@ jobs:
 
       - name: Run tests
         run: pytest --tb=short -q
+
+  js-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Run OpenCode plugin tests
+        run: bun test
+        working-directory: integrations/opencode

@@ -22,9 +22,8 @@ This project is part of a constellation:
 - **`../compliance-substrate`** — the immediate ancestor. Tabled, not
   deleted. The motivation pivot (compliance workflows → agent provenance)
   is documented in `README.md §12`.
-- **`../agent-notes`** — used to file breadcrumbs (see §"Filing
-  breadcrumbs" below). Has its own active gaps (BC-006 projection path,
-  BC-007 query bugs) that affect agents working in this repo.
+- **`../agent-notes`** — the agent face for filing work items (see §"Work
+  tracking (issues)" below).
 - **`../agent-wake`** — sibling project for external-to-session
   signaling. Shares the identity / multi-user design problem; joint
   open questions captured in
@@ -46,21 +45,29 @@ This project is part of a constellation:
 - **MIT license, single-person OSS posture.** See README §8. Architectural
   choices should not encode a hypothetical commercial future.
 
-## Filing breadcrumbs
+## Work tracking (issues)
 
-Use the agent-notes `mcp__breadcrumb__file_breadcrumb` tool with
-`project="agent-provenance"` (once the project is registered there — it
-likely isn't yet, since the project is brand new). Known issues with the
-MCP at time of writing:
+Work-items for this project live in **regista** — the single source of truth. regista is the authoritative, signed, hash-chained event log; the local agent-notes store is a read projection of it. **Do not create physical breadcrumb files** (`breadcrumbs/`, `*.breadcrumb.md`) — those are retired. (This also retires the old `mcp__breadcrumb__file_breadcrumb` MCP tool and the `breadcrumbs_dir`/`/tmp/active/` projection expectation — file via the CLI instead.)
 
-- BC-006 (agent-notes): if the project doesn't have a `breadcrumbs_dir`
-  configured, projections silently land in `/tmp/active/`. Until that's
-  fixed, **verify the projection landed under
-  `/projects/agent-provenance/breadcrumbs/` before assuming the BC is
-  filed correctly.**
-- BC-007 (agent-notes): `find_breadcrumbs` has a SQL parameter-binding
-  bug; `query_breadcrumbs` may return empty for unregistered projects.
-  Read on-disk breadcrumbs directly when in doubt.
+**Agent face — the `agent-notes` CLI (and the `/file-breadcrumb` etc. skills).** Run from the project root so `--path .` resolves this project; the CLI routes to this project's regista schema automatically (you never set the schema). If the project isn't registered with agent-notes yet, run `agent-notes init .` first (idempotent).
+
+```
+# File an issue
+agent-notes breadcrumb file --path . --title "<short title>" \
+    --type <kind> [--severity low|medium|high|critical] [--body "<details>"]
+
+# Find / show / update
+agent-notes breadcrumb find  --path . [--status open] [--type bug] [--text "<q>"]
+agent-notes breadcrumb get   --path . <WI-id>
+agent-notes breadcrumb update --path . <WI-id> [--status <state>] [--title ...] [--body ...]
+```
+
+- **`--type` (kind):** todo, observation, decision, risk, task, bug, feature, improvement, question, experiment, spike, refactor, docs, ci, job.
+- **`--severity`:** low, medium, high, critical.
+
+**Lifecycle (canonical workflow):** `open → in_progress → (blocked | deferred) → in_review → in_human_review → done`. `done` is reachable only through the two-stage review gate (a cross-lineage adversarial-review pass, then accept), except a pre-work `close_from_open` dismissal (won't-fix / duplicate). "Who's working this" is a regista **claim** (a separate liveness axis), not a lifecycle state.
+
+**Human face:** dossier — the web window onto these same items (when deployed).
 
 ## Regista breadcrumbs this project depends on
 
@@ -170,13 +177,18 @@ In rough order. Do not assume any of these are done; check on entry.
   **TSA signature verification against trust anchor** (BC-229 completed);
   **Witness federation coverage check** (bundle export + verifier);
   **OpenCode plugin live end-to-end** (Node.js bridge, UUID v5 session IDs).
+  **Claude Code hook parity** (Plan 008 W-1.1 — hook now calls attest_session,
+  matching the opencode plugin's structurally distinct session entity path);
+  **Review assurance levels** (Plan 027 WI-1.2 — AssuranceLevel closed set
+  computed from signed events, surfaced in text/JSON/HTML reports).
 - **Open gaps**: project not registered with agent-notes yet; live
   opencode dogfood bundle not yet committed to repo; Claude Code hooks not
   yet tested in a live Claude Code session (mock tests only);
   real IdP integration for principal_id; BC-016 (witness signatures not
   cryptographically verified — blocked on regista asymmetric witness signing);
-  BC-005 (scope attestation uses tool_call transitions — blocked on regista
-  Plan 016); BC-018 (global_seq gap check — documented as non-issue);
+  BC-005 (scope attestation uses tool_call transitions — Claude Code hook
+  now uses attest_session; attest_scope method still exists, blocked on
+  regista Plan 016); BC-018 (global_seq gap check — documented as non-issue);
   BC-019 (verify_bundle_chain scheme_counts merge — verified already
   implemented at verifier.py:1597, stale);
   WI-001 remaining (Postgres service container for CI);
@@ -185,7 +197,9 @@ In rough order. Do not assume any of these are done; check on entry.
   global_seq/prev_global_event_hash — pre-existing, exposed by session work);
   WI-011 (missing test coverage for session entity paths: concurrency,
   event handler, mixed entity kinds);
-  WI-012 (CAIRN_ATTEST_ON_START env check treats any non-empty string as true).
+  WI-012 (CAIRN_ATTEST_ON_START env check treats any non-empty string as true);
+  WI-018 (opencode plugin attest_session omits harness_config_digests —
+  parity gap with Claude Code hook).
 
 ## What not to do
 

@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 __all__ = [
+    "AssuranceEntry",
+    "AssuranceLevel",
     "BundleDiff",
     "BundleDiffEntry",
     "ChainContiguityViolation",
@@ -22,6 +24,7 @@ __all__ = [
     "ScopeAttestationEntry",
     "ScopeViolation",
     "SequenceGap",
+    "SessionAttestationEntry",
     "TemporalOrderingViolation",
     "TimestampBatchEntry",
     "VerificationEntry",
@@ -30,6 +33,35 @@ __all__ = [
     "WitnessReceiptEntry",
     "WitnessRegistrationEntry",
 ]
+
+
+class AssuranceLevel:
+    """Closed set of review assurance levels (regista Plan 027 WI-1.2).
+
+    Computed deterministically from the item's signed events — a view over
+    the history, stored nowhere mutable, so it can never disagree with the
+    record.  An auditor reads the level; they do not infer it.
+
+    In the interim (HMAC-era, pre-Plan-026) posture, lineage is *asserted*
+    by the actor_metadata, not cryptographically bound.  When per-actor
+    Ed25519 lands (Plan 026), the verifier checks the actor↔signer binding
+    and flips ``lineage_source`` from ``"asserted"`` to ``"verified"``
+    automatically — no schema migration.
+    """
+
+    NONE = "none"
+    SELF_REVIEWED = "self_reviewed"
+    INDEPENDENTLY_REVIEWED = "independently_reviewed"
+    HUMAN_ACCEPTED = "human_accepted"
+    INDEPENDENT_AND_ACCEPTED = "independently_and_accepted"
+
+    ALL: tuple[str, ...] = (
+        NONE,
+        SELF_REVIEWED,
+        INDEPENDENTLY_REVIEWED,
+        HUMAN_ACCEPTED,
+        INDEPENDENT_AND_ACCEPTED,
+    )
 
 
 @dataclass(frozen=True)
@@ -161,6 +193,19 @@ class ScopeAttestationEntry:
 
 
 @dataclass(frozen=True)
+class SessionAttestationEntry:
+    event_id: str
+    entity_id: str
+    version: str
+    principal_id: str
+    session_id: str
+    attested_at: str
+    harnesses: tuple[dict[str, Any], ...]
+    scope_statement: str
+    harness_config_digests: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
 class ScopeViolation:
     """A tool-call event whose harness is not covered by any active scope attestation."""
 
@@ -190,16 +235,25 @@ class WitnessRegistrationEntry:
     url: str
     status: str = "active"
     mode: str = "witness"
+    public_key: str | None = None
+    key_scheme: str | None = None
 
 
 @dataclass(frozen=True)
 class WitnessReceiptEntry:
-    """A confirmed witness receipt from the bundle."""
+    """A confirmed witness receipt from the bundle.
+
+    ``signature_valid`` is ``None`` when no witness public key was available
+    to verify the signature (backward-compatible mode — a warning is emitted).
+    When a key is available, it is ``True`` (verified) or ``False`` (failed).
+    """
 
     event_id: str
     witness_id: str
     confirmed_at: str | None = None
     has_signature: bool = False
+    signature_valid: bool | None = None
+    verification_detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -269,6 +323,27 @@ class PrincipalBindingViolation:
     expected_principal_id: str | None = None
 
 
+@dataclass(frozen=True)
+class AssuranceEntry:
+    """Review assurance level for a work item (regista Plan 027 WI-1.2).
+
+    The assurance level is a pure function of the item's signed events,
+    computed by the verifier — never stored mutably.  This is the honest
+    answer to "one model weakens review": we cannot manufacture a second
+    lineage, but we refuse to let the record pretend there was one.
+    """
+
+    work_item_id: str
+    assurance_level: str
+    author_lineages: tuple[str, ...]
+    reviewer_lineage: str | None
+    same_lineage: bool | None
+    has_adversarial_pass: bool
+    has_human_accept: bool
+    lineage_source: str
+    detail: str
+
+
 @dataclass
 class VerificationReport:
     total_events: int = 0
@@ -279,6 +354,7 @@ class VerificationReport:
     entries: list[VerificationEntry] = field(default_factory=list)
     file_provenance: list[FileProvenanceEntry] = field(default_factory=list)
     scope_attestations: list[ScopeAttestationEntry] = field(default_factory=list)
+    session_attestations: list[SessionAttestationEntry] = field(default_factory=list)
     scope_violations: list[ScopeViolation] = field(default_factory=list)
     sequence_gaps: list[SequenceGap] = field(default_factory=list)
     key_rotations: list[KeyRotationEntry] = field(default_factory=list)
@@ -293,6 +369,7 @@ class VerificationReport:
     role_gate_violations: list[RoleGateViolation] = field(default_factory=list)
     chain_contiguity_violations: list[ChainContiguityViolation] = field(default_factory=list)
     principal_binding_violations: list[PrincipalBindingViolation] = field(default_factory=list)
+    assurance_entries: list[AssuranceEntry] = field(default_factory=list)
     scheme_counts: dict[str, int] = field(default_factory=dict)
     bundle_hash_ok: bool | None = None
     bundle_hash_detail: str | None = None
@@ -316,6 +393,10 @@ class VerificationReport:
         return sum(1 for tb in self.timestamp_batches if tb.verified is False)
 
     @property
+    def witness_signature_failures(self) -> int:
+        return sum(1 for r in self.witness_receipts if r.signature_valid is False)
+
+    @property
     def all_ok(self) -> bool:
         bundle_ok = self.bundle_hash_ok is not False
         chain_ok = self.chain_integrity_ok is not False
@@ -327,6 +408,7 @@ class VerificationReport:
             and self.key_revocation_failures == 0
             and self.delegation_chain_failures == 0
             and self.tsa_signature_failures == 0
+            and self.witness_signature_failures == 0
             and len(self.witness_coverage_violations) == 0
             and len(self.sequence_gaps) == 0
             and len(self.scope_violations) == 0
