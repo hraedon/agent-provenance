@@ -125,8 +125,8 @@ In rough order. Do not assume any of these are done; check on entry.
 - **Gaps closed this session**: Plan 008 WI-1.2/2.1/3.1/3.2/4.1/4.2; BC-018
   (global_seq gap false positives in filtered bundles — resolved);
   pre-existing test failures (installed asn1crypto + pynacl);
-  identifier scrub (human:plm→human:owner, human:itadmin→human:owner,
-  regista_app→regista_user, absolute paths→relative, git history rewritten).
+  identifier scrub (personal handles→generic, internal service accounts→generic,
+  absolute paths→relative, git history rewritten).
 - **Gaps closed this session**: BC-022 (OpenCode plugin no longer silently loses tool-call end
   events on bridge failure — durable per-session `degradation.log` mirroring the Claude Code
   hook's `_mark_degraded`; bounded FIFO session map with eviction-recorded orphans; begin

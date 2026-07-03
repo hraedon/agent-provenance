@@ -36,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any, cast
 
 _DEFAULT_STATE_DIR = str(Path(tempfile.gettempdir()) / "cairn-sessions")
 _FALLBACK_SESSION_ID = "unknown"
@@ -44,6 +45,8 @@ _FALLBACK_TOOL_NAME = "unknown"
 
 def _safe_session_id(session_id: str) -> str:
     sanitized = re.sub(r"[^a-zA-Z0-9._-]", "_", session_id)
+    if sanitized in (".", ".."):
+        sanitized = "_"
     if sanitized != session_id:
         print(
             f"cairn_hook: session_id sanitized {session_id!r} -> {sanitized!r}",
@@ -71,14 +74,14 @@ def _state_dir(session_id: str) -> Path:
     return d
 
 
-def _call_key(tool_name: str, tool_input: dict) -> str:
+def _call_key(tool_name: str, tool_input: dict[str, Any]) -> str:
     canonical = json.dumps(tool_input, separators=(",", ":"), sort_keys=True)
     h = hashlib.sha256(canonical.encode()).hexdigest()[:16]
     safe_tool = tool_name.replace("/", "_").replace("\\", "_")
     return f"{safe_tool}:{h}"
 
 
-def _run_bridge(payload: dict) -> dict | None:
+def _run_bridge(payload: dict[str, Any]) -> dict[str, Any] | None:
     bridge = os.environ.get("CAIRN_BRIDGE_PATH", "cairn-bridge")
     try:
         result = subprocess.run(
@@ -92,7 +95,7 @@ def _run_bridge(payload: dict) -> dict | None:
         if result.returncode != 0:
             return None
         if result.stdout.strip():
-            return json.loads(result.stdout.strip())
+            return cast(dict[str, Any], json.loads(result.stdout.strip()))
     except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
         pass
     return None
@@ -107,7 +110,7 @@ def _mark_degraded(session_id: str, action: str, detail: str) -> None:
         f.write(entry + "\n")
 
 
-def _extract_files(tool_name: str, tool_input: dict) -> list[str]:
+def _extract_files(tool_name: str, tool_input: dict[str, Any]) -> list[str]:
     files: list[str] = []
     for key in ("filePath", "file_path", "path", "file"):
         if key in tool_input and isinstance(tool_input[key], str):
@@ -143,15 +146,19 @@ def handle_pre() -> None:
     if reply and reply.get("status") == "ok":
         key = _call_key(tool_name, tool_input)
         state_file = _state_dir(session_id) / f"{key}.json"
-        state_file.write_text(
-            json.dumps(
+        fd = os.open(
+            str(state_file),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(
                 {
                     "work_item_id": reply["work_item_id"],
                     "session_id": session_id,
                     "tool": tool_name,
                 }
-            )
-        )
+            ))
     else:
         _mark_degraded(session_id, "pre", f"bridge call failed for {tool_name}")
 
@@ -167,11 +174,13 @@ def handle_post(*, failure: bool = False) -> None:
     state_file = _state_dir(session_id) / f"{key}.json"
 
     if not state_file.exists():
+        _mark_degraded(session_id, "post", f"state file missing for {tool_name}")
         return
 
     try:
         state = json.loads(state_file.read_text())
     except (json.JSONDecodeError, OSError):
+        _mark_degraded(session_id, "post", f"state file unreadable for {tool_name}")
         return
 
     work_item_id = state.get("work_item_id")
@@ -271,8 +280,15 @@ def handle_session_end() -> None:
             pass
 
 
+def _env_truthy(name: str) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return False
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 def main() -> None:
-    if os.environ.get("CAIRN_DISABLE"):
+    if _env_truthy("CAIRN_DISABLE"):
         return
 
     if len(sys.argv) < 2:

@@ -24,6 +24,18 @@ from pathlib import Path
 
 _DEFAULT_STATE_DIR = str(Path(tempfile.gettempdir()) / "cairn-sessions")
 
+
+def _parse_bool(val: str | None) -> bool:
+    """Parse a boolean env var.
+
+    Only ``1``, ``true``, ``yes``, ``on`` (case-insensitive) are truthy.
+    This prevents ``CAIRN_DISABLE=false`` from accidentally enabling the
+    disabled state (WI-012).
+    """
+    if val is None:
+        return False
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
 _SUITE_ENV_PATHS = [    Path(os.environ.get("AGENT_SUITE_CONFIG", "")),
     Path.home() / ".config" / "agent-suite" / "suite.env",
     Path("/etc/agent-suite/suite.env"),
@@ -134,7 +146,7 @@ def resolve_config() -> CairnEnvConfig:
         or suite_env.get("CAIRN_STATE_DIR")
         or _DEFAULT_STATE_DIR
     )
-    disabled = bool(os.environ.get("CAIRN_DISABLE"))
+    disabled = _parse_bool(os.environ.get("CAIRN_DISABLE"))
 
     return CairnEnvConfig(
         dsn=dsn,

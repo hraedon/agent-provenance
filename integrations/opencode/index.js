@@ -43,19 +43,34 @@ import { tmpdir } from "node:os";
  *   log is the honest record instead.
  */
 
-const BRIDGE_TIMEOUT_MS = parseInt(process.env.CAIRN_BRIDGE_TIMEOUT_MS ?? "10000", 10);
+const BRIDGE_TIMEOUT_MS = (() => {
+  const v = parseInt(process.env.CAIRN_BRIDGE_TIMEOUT_MS ?? "10000", 10);
+  return Number.isFinite(v) && v > 0 ? v : 10000;
+})();
 
 // Bound on the number of in-flight (begin-issued, end-pending) tool calls
 // tracked in memory.  Each entry is ~small, but without a bound the map grows
 // forever if an ``after`` hook never fires (tool crash, harness bug).  When
 // the bound is reached the oldest unclosed begin is evicted and recorded as a
 // degradation so the resulting orphan is discoverable.
-const DEFAULT_MAX_SESSION_ENTRIES = parseInt(
-  process.env.CAIRN_MAX_SESSION_ENTRIES ?? "10000",
-  10,
-);
+const DEFAULT_MAX_SESSION_ENTRIES = (() => {
+  const v = parseInt(process.env.CAIRN_MAX_SESSION_ENTRIES ?? "10000", 10);
+  return Number.isFinite(v) && v > 0 ? v : 10000;
+})();
 
 const DEFAULT_STATE_DIR = process.env.CAIRN_STATE_DIR ?? join(tmpdir(), "cairn-sessions");
+
+/**
+ * Parse a boolean env var (WI-012).
+ * Only "1", "true", "yes", "on" (case-insensitive) are truthy.
+ * @param {string} name
+ * @returns {boolean}
+ */
+function isEnvTruthy(name) {
+  const v = process.env[name];
+  if (!v) return false;
+  return ["1", "true", "yes", "on"].includes(v.trim().toLowerCase());
+}
 
 /**
  * Extract file paths from a tool-args object.  Covers the common argument
@@ -388,7 +403,7 @@ export default async function cairnPlugin(ctx) {
     },
 
     event: async ({ event }) => {
-      if (event?.type === "session.started" && process.env.CAIRN_ATTEST_ON_START) {
+      if (event?.type === "session.started" && isEnvTruthy("CAIRN_ATTEST_ON_START")) {
         const sessionID = event.properties?.sessionID ?? "";
         if (!sessionID) {
           markDegraded(

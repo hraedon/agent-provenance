@@ -31,7 +31,7 @@ import os
 import sys
 import tempfile
 import uuid
-from typing import Any
+from typing import Any, cast
 
 # Silence regista/structlog logging before importing anything that uses it
 logging.basicConfig(level=logging.CRITICAL)
@@ -65,7 +65,7 @@ def _resolve_key_path(cfg: Any) -> str:
     race window) and registered for cleanup at process exit.
     """
     if cfg.key_path:
-        return cfg.key_path
+        return cast(str, cfg.key_path)
     if not cfg.key_ref:
         raise RuntimeError("neither key_path nor key_ref configured")
 

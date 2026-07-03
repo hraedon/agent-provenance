@@ -192,7 +192,7 @@ class Verifier:
                 report.signature_failed += 1
             elif entry.result == "hash_mismatch":
                 report.hash_mismatch += 1
-            elif entry.result == "revoked_key":
+            elif entry.result in ("revoked_key", "unknown_key"):
                 report.revoked_key += 1
 
             # Track signing scheme usage
@@ -473,7 +473,7 @@ class Verifier:
                 event_seq=ev.event_seq,
                 timestamp=ev.timestamp.isoformat(),
                 transition=ev.transition,
-                result="revoked_key",
+                result="unknown_key",
                 detail=f"Unknown key_id: {ev.key_id}",
             )
 
@@ -652,7 +652,9 @@ class Verifier:
             )
 
         # If we have the predecessor key in our key set, also verify
-        # the cryptographic signature
+        # the cryptographic signature.  If the predecessor key is NOT
+        # available, mark as unverified — we cannot trust the rotation
+        # without cryptographic proof.
         if sig_valid and pred_id in self._keys:
             scheme_id = getattr(ev, "scheme_id", _DEFAULT_SCHEME_ID)
             try:
@@ -685,6 +687,12 @@ class Verifier:
                 detail = (
                     f"Rotation event signature does not verify against predecessor key {pred_id}"
                 )
+        elif sig_valid:
+            sig_valid = False
+            detail = (
+                f"Rotation claims predecessor={pred_id} but predecessor "
+                f"key is not in the verifier's key set — cannot verify"
+            )
 
         report.key_rotations.append(
             KeyRotationEntry(
@@ -720,7 +728,7 @@ class Verifier:
                 ev.on_behalf_of,
                 event_timestamp=ev.timestamp.isoformat(),
             )
-        except Exception as exc:
+        except (ValueError, TypeError, KeyError, RegistaError) as exc:
             validation_ok = False
             validation_detail = str(exc)[:500]
             log.debug(
@@ -1148,13 +1156,24 @@ class Verifier:
         if not active_witnesses:
             return
 
+        # Build lookup: witness_id → key_scheme from registrations.
+        scheme_by_witness: dict[str, str] = {}
+        for reg in active_witnesses:
+            if reg.key_scheme:
+                scheme_by_witness[reg.witness_id] = reg.key_scheme
+
         # Build lookup: event_id → set of witness_ids with confirmed receipts.
         # A receipt counts as confirmed only if its signature was verified
-        # (signature_valid is True or None — None means "not checked" which
-        # is backward-compatible for HMAC witnesses and pre-BC-016 bundles).
+        # (signature_valid is True).  For HMAC witnesses, signature_valid is
+        # None (not checked) and the receipt still counts — regista's delivery
+        # layer already verified HMAC.  For Ed25519 witnesses, None means the
+        # public key was unavailable, so the receipt does NOT count.
         receipts_by_event: dict[str, set[str]] = {}
         for r in report.witness_receipts:
             if r.signature_valid is False:
+                continue
+            wid_scheme = scheme_by_witness.get(r.witness_id)
+            if r.signature_valid is None and wid_scheme == "ed25519":
                 continue
             if r.event_id not in receipts_by_event:
                 receipts_by_event[r.event_id] = set()
@@ -2206,8 +2225,18 @@ class Verifier:
             merged.key_chain.update(r.key_chain)
             for scheme, count in r.scheme_counts.items():
                 merged.scheme_counts[scheme] = merged.scheme_counts.get(scheme, 0) + count
-            merged.witness_registrations.extend(r.witness_registrations)
-            merged.witness_receipts.extend(r.witness_receipts)
+            seen_regs = {(w.witness_id, w.url) for w in merged.witness_registrations}
+            for reg in r.witness_registrations:
+                key = (reg.witness_id, reg.url)
+                if key not in seen_regs:
+                    merged.witness_registrations.append(reg)
+                    seen_regs.add(key)
+            seen_rcpts = {(rc.event_id, rc.witness_id) for rc in merged.witness_receipts}
+            for rcpt in r.witness_receipts:
+                key = (rcpt.event_id, rcpt.witness_id)
+                if key not in seen_rcpts:
+                    merged.witness_receipts.append(rcpt)
+                    seen_rcpts.add(key)
             if r.bundle_hash_ok is False:
                 merged.bundle_hash_ok = False
                 merged.bundle_hash_detail = r.bundle_hash_detail

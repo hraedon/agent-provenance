@@ -85,7 +85,7 @@ class VerificationEntry:
     event_seq: int
     timestamp: str
     transition: str | None
-    result: str  # "ok" | "signature_failed" | "hash_mismatch" | "revoked_key"
+    result: str  # "ok" | "signature_failed" | "hash_mismatch" | "revoked_key" | "unknown_key"
     detail: str | None = None
 
 

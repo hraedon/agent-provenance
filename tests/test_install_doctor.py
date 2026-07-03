@@ -320,5 +320,17 @@ def test_doctor_exit_code_pass(monkeypatch):
         project="test",
     )
     monkeypatch.setattr("cairn._doctor.resolve_config", lambda: cfg)
+
+    class _FakeRegista:
+        def __init__(self, **kwargs):
+            raise ConnectionError("mock: unreachable")
+
+        def read_events(self, **kwargs):
+            return []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("regista.Regista", _FakeRegista)
     exit_code = run_doctor(json_output=False)
     assert exit_code == 1
