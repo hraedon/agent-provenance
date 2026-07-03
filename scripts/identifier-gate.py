@@ -19,13 +19,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 IDENTIFIERS: list[tuple[str, str]] = [
-    ("human:owner", "personal principal_id handle"),
-    ("human:owner", "OS username as principal_id"),
-    ("cairn@users.noreply.github.com", "personal email"),
-    ("cairn contributors", "real name"),
-    ("regista_user", "internal DB service account"),
-    ("agent_notes_user", "internal DB service account"),
-    ("db-host", "internal hostname"),
+    ("human:plm", "personal principal_id handle"),
+    ("human:itadmin", "OS username as principal_id"),
+    ("plm@hraedon.com", "personal email"),
+    ("Paul Merritt", "real name"),
+    ("regista_app", "internal DB service account"),
+    ("agent_notes_app", "internal DB service account"),
+    ("mvmpostgres01", "internal hostname"),
     ("hraedon.com", "internal domain (non-GitHub)"),
 ]
 
