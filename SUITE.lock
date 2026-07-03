@@ -1,0 +1,24 @@
+# SUITE.lock — the known-good version matrix for the agent-provenance
+# (cairn) deployment.  The suite install reads this file to pin regista
+# to a verified-good SHA so that a fresh sanctioned machine ends with
+# attestation-on across the chosen harness(es) (Plan 008 WI-3.2).
+#
+# Update the regista.ref and pyproject.toml together.
+
+component: cairn
+version: "0.1.0"
+python: ">=3.11"
+
+regista:
+  ref: 07a0b861a7305cefadfb722d557164ce1a6e49be
+  source: github.com/hraedon/regista
+  version: ">=0.4.0"
+  # Pin to a commit SHA, never a branch.  cairn and regista are a
+  # known-good pair recorded here.
+
+# Harness wiring (cairn install-harness):
+#   claude   — ~/.claude/settings.json hooks + env
+#   opencode — ~/.config/opencode/opencode.json plugin + env
+#
+# After install, a new agent session attests by default.  CAIRN_DISABLE
+# is the explicit, audit-visible escape hatch.

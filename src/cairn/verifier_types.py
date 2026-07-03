@@ -12,6 +12,7 @@ from typing import Any
 __all__ = [
     "AssuranceEntry",
     "AssuranceLevel",
+    "AttestationGap",
     "BundleDiff",
     "BundleDiffEntry",
     "ChainContiguityViolation",
@@ -324,6 +325,26 @@ class PrincipalBindingViolation:
 
 
 @dataclass(frozen=True)
+class AttestationGap:
+    """A session that produced tool-call events but never sent a session
+    attestation (Plan 008 WI-3.1).
+
+    This is the auditor-visible "missing attestation" finding: the session
+    ran agent actions that were recorded in the log, but no session-start
+    attestation event covers it.  An auditor treats each gap as a
+    completeness defect — the session's provenance is unscoped.
+    """
+
+    session_id: str
+    tool_call_count: int
+    first_tool_call: str | None = None
+    last_tool_call: str | None = None
+    harness: str | None = None
+    event_ids: tuple[str, ...] = field(default_factory=tuple)
+    detail: str = ""
+
+
+@dataclass(frozen=True)
 class AssuranceEntry:
     """Review assurance level for a work item (regista Plan 027 WI-1.2).
 
@@ -369,6 +390,7 @@ class VerificationReport:
     role_gate_violations: list[RoleGateViolation] = field(default_factory=list)
     chain_contiguity_violations: list[ChainContiguityViolation] = field(default_factory=list)
     principal_binding_violations: list[PrincipalBindingViolation] = field(default_factory=list)
+    attestation_gaps: list[AttestationGap] = field(default_factory=list)
     assurance_entries: list[AssuranceEntry] = field(default_factory=list)
     scheme_counts: dict[str, int] = field(default_factory=dict)
     bundle_hash_ok: bool | None = None
@@ -416,6 +438,7 @@ class VerificationReport:
             and len(self.role_gate_violations) == 0
             and len(self.chain_contiguity_violations) == 0
             and len(self.principal_binding_violations) == 0
+            and len(self.attestation_gaps) == 0
             and bundle_ok
             and chain_ok
         )

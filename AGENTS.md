@@ -108,13 +108,25 @@ In rough order. Do not assume any of these are done; check on entry.
    an auditor-ready report.
    **Done: `src/cairn/verifier.py` + CLI `cairn verify`.**
 
-## Current status (last updated 2026-06-20)
+## Current status (last updated 2026-07-03)
 
-- **Tests**: 154 Python passing (CI runs without Postgres; Postgres-dependent tests skip gracefully)
+- **Tests**: 204 Python passing (3 skipped — Postgres-dependent)
   + 24 Bun tests for the OpenCode plugin (helpers + BC-022 integration coverage).
-- **Lint**: ruff clean on changed code; 2 pre-existing RUF012 in verifier.py (class-level mutable sets).
+  asn1crypto + pynacl installed for TSA/witness signature tests.
+- **Lint**: ruff clean; mypy clean (pre-existing regista import-untyped errors only).
 - **CI**: `.github/workflows/ci.yml` — Python job (ruff + mypy + pytest) and a Bun job
   (`bun test` in `integrations/opencode`) + `Makefile` (`make test-js`, `make all`).
+- **Gaps closed this session**: Plan 008 WI-1.2 (install-harness / uninstall-harness
+  CLI with --dry-run, --json, --user, idempotent, no-clobber); Plan 008 WI-2.1
+  (REGISTA_*/CAIRN_* config precedence with deprecation warnings, doctor --json
+  suite-shape output); Plan 008 WI-3.1 (attestation gap detection — AttestationGap
+  type, _check_attestation_gaps method, text/JSON/HTML report surfacing,
+  verify_bundle_filtered with --since/--until, cross-window attestation info to
+  prevent false positives, cross-bundle gap deduplication in verify_bundle_chain,
+  global_seq gap suppression in filtered mode, timestamp batch verification skipped
+  in filtered mode); Plan 008 WI-3.2 (SUITE.lock pinning regista SHA); BC-018
+  (global_seq gap false positives in filtered bundles — resolved);
+  pre-existing test failures (installed asn1crypto + pynacl).
 - **Gaps closed this session**: BC-022 (OpenCode plugin no longer silently loses tool-call end
   events on bridge failure — durable per-session `degradation.log` mirroring the Claude Code
   hook's `_mark_degraded`; bounded FIFO session map with eviction-recorded orphans; begin
@@ -188,10 +200,9 @@ In rough order. Do not assume any of these are done; check on entry.
   cryptographically verified — blocked on regista asymmetric witness signing);
   BC-005 (scope attestation uses tool_call transitions — Claude Code hook
   now uses attest_session; attest_scope method still exists, blocked on
-  regista Plan 016); BC-018 (global_seq gap check — documented as non-issue);
-  BC-019 (verify_bundle_chain scheme_counts merge — verified already
+  regista Plan 016); BC-019 (verify_bundle_chain scheme_counts merge — verified already
   implemented at verifier.py:1597, stale);
-  WI-001 remaining (Postgres service container for CI);
+  WI-001 remaining (test_client.py hangs — test_cairn.py now passes);
   WI-002 (cross-component meaning contracts as conformance-tested artifacts);
   WI-010 (PostgresEventStore.append returns Event without DB-assigned
   global_seq/prev_global_event_hash — pre-existing, exposed by session work);
@@ -199,7 +210,8 @@ In rough order. Do not assume any of these are done; check on entry.
   event handler, mixed entity kinds);
   WI-012 (CAIRN_ATTEST_ON_START env check treats any non-empty string as true);
   WI-018 (opencode plugin attest_session omits harness_config_digests —
-  parity gap with Claude Code hook).
+  parity gap with Claude Code hook);
+  WI-019 (asn1crypto and pynacl not in dev dependencies).
 
 ## What not to do
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import uuid
 from io import StringIO
 from pathlib import Path
@@ -12,9 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "integrations" / "claude-code"))
-
-from cairn_hook import (
+from cairn._claude_hook import (
     _call_key,
     _extract_files,
     _mark_degraded,
@@ -94,7 +91,7 @@ def test_state_dir_created(tmp_path: Path):
     assert sd.name == "my-session"
 
 
-@patch("cairn_hook._run_bridge")
+@patch("cairn._claude_hook._run_bridge")
 def test_handle_pre_creates_state(mock_bridge: MagicMock, state_dir: Path) -> None:
     wi_id = str(uuid.uuid4())
     mock_bridge.return_value = {"status": "ok", "work_item_id": wi_id, "args_hash": "sha256:abc"}
@@ -123,7 +120,7 @@ def test_handle_pre_creates_state(mock_bridge: MagicMock, state_dir: Path) -> No
     assert state["work_item_id"] == wi_id
 
 
-@patch("cairn_hook._run_bridge")
+@patch("cairn._claude_hook._run_bridge")
 def test_handle_pre_bridge_fails_gracefully(mock_bridge: MagicMock, state_dir: Path) -> None:
     mock_bridge.return_value = None
 
@@ -144,7 +141,7 @@ def test_handle_pre_bridge_fails_gracefully(mock_bridge: MagicMock, state_dir: P
     assert degradation_log.exists()
 
 
-@patch("cairn_hook._run_bridge")
+@patch("cairn._claude_hook._run_bridge")
 def test_handle_post_reads_state_and_calls_end(mock_bridge: MagicMock, state_dir: Path) -> None:
     wi_id = str(uuid.uuid4())
     tool_input = {"filePath": "/tmp/foo.py", "oldString": "x", "newString": "y"}
@@ -182,7 +179,7 @@ def test_handle_post_reads_state_and_calls_end(mock_bridge: MagicMock, state_dir
     assert not state_file.exists()
 
 
-@patch("cairn_hook._run_bridge")
+@patch("cairn._claude_hook._run_bridge")
 def test_handle_post_failure_passes_error(mock_bridge: MagicMock, state_dir: Path) -> None:
     wi_id = str(uuid.uuid4())
     tool_input = {"command": "rm -rf /"}
@@ -216,7 +213,7 @@ def test_handle_post_failure_passes_error(mock_bridge: MagicMock, state_dir: Pat
     assert call_args["error"] == "permission denied"
 
 
-@patch("cairn_hook._run_bridge")
+@patch("cairn._claude_hook._run_bridge")
 def test_handle_post_no_state_does_nothing(mock_bridge: MagicMock, state_dir: Path) -> None:
     hook_input = json.dumps(
         {
@@ -233,7 +230,7 @@ def test_handle_post_no_state_does_nothing(mock_bridge: MagicMock, state_dir: Pa
     mock_bridge.assert_not_called()
 
 
-@patch("cairn_hook._run_bridge")
+@patch("cairn._claude_hook._run_bridge")
 def test_handle_session_start(mock_bridge: MagicMock) -> None:
     mock_bridge.return_value = {"status": "ok", "event_id": str(uuid.uuid4())}
 
@@ -263,7 +260,7 @@ def test_handle_session_end_cleans_state_dir(state_dir: Path) -> None:
     hook_input = json.dumps({"session_id": "test-session"})
 
     with patch("sys.stdin", StringIO(hook_input)):
-        from cairn_hook import handle_session_end
+        from cairn._claude_hook import handle_session_end
 
         handle_session_end()
 
@@ -318,7 +315,7 @@ def test_resolve_settings_digest_from_project_dir(tmp_path: Path) -> None:
 
 def test_resolve_settings_digest_returns_none_when_missing(tmp_path: Path) -> None:
     with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(tmp_path)}, clear=False):
-        with patch("cairn_hook.Path.home", return_value=tmp_path):
+        with patch("cairn._claude_hook.Path.home", return_value=tmp_path):
             digest = _resolve_settings_digest()
 
     assert digest is None
@@ -350,7 +347,7 @@ def test_handle_session_end_preserves_degradation_log(state_dir: Path) -> None:
 # ----------------------------------------------------------------------
 
 
-@patch("cairn_hook._run_bridge")
+@patch("cairn._claude_hook._run_bridge")
 def test_handle_post_bridge_failure_creates_degradation(
     mock_bridge: MagicMock, state_dir: Path
 ) -> None:
@@ -387,7 +384,7 @@ def test_handle_post_bridge_failure_creates_degradation(
 # ----------------------------------------------------------------------
 
 
-@patch("cairn_hook._run_bridge")
+@patch("cairn._claude_hook._run_bridge")
 def test_handle_session_start_includes_config_digest(
     mock_bridge: MagicMock, tmp_path: Path
 ) -> None:
@@ -430,7 +427,7 @@ def test_state_dir_permissions_are_restrictive(tmp_path: Path) -> None:
 
 
 def test_safe_session_id_sanitizes():
-    from cairn_hook import _safe_session_id
+    from cairn._claude_hook import _safe_session_id
 
     assert _safe_session_id("abc-123") == "abc-123"
     assert _safe_session_id("../../../etc/passwd") == ".._.._.._etc_passwd"

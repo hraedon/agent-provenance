@@ -338,6 +338,21 @@ def format_report(report: VerificationReport) -> str:
             lines.append(f"    -> {pv.detail}")
         lines.append("")
 
+    if report.attestation_gaps:
+        lines.append("ATTESTATION GAPS (UNSCOPED SESSIONS)")
+        lines.append("-" * 40)
+        for ag in report.attestation_gaps:
+            lines.append(f"  session {ag.session_id}")
+            lines.append(f"    tool_calls : {ag.tool_call_count}")
+            if ag.harness:
+                lines.append(f"    harness    : {ag.harness}")
+            if ag.first_tool_call:
+                lines.append(f"    first      : {ag.first_tool_call}")
+            if ag.last_tool_call:
+                lines.append(f"    last       : {ag.last_tool_call}")
+            lines.append(f"    -> {ag.detail}")
+        lines.append("")
+
     if report.assurance_entries:
         lines.append("REVIEW ASSURANCE LEVELS")
         lines.append("-" * 40)
@@ -604,6 +619,18 @@ def format_report_json(report: VerificationReport) -> dict[str, Any]:
                 "expected_principal_id": pv.expected_principal_id,
             }
             for pv in report.principal_binding_violations
+        ],
+        "attestation_gaps": [
+            {
+                "session_id": ag.session_id,
+                "tool_call_count": ag.tool_call_count,
+                "first_tool_call": ag.first_tool_call,
+                "last_tool_call": ag.last_tool_call,
+                "harness": ag.harness,
+                "event_ids": list(ag.event_ids),
+                "detail": ag.detail,
+            }
+            for ag in report.attestation_gaps
         ],
         "assurance_entries": [
             {
@@ -1220,6 +1247,41 @@ def format_report_html(report: VerificationReport) -> str:
                 f"{v_hdr}<tbody>{v_rows}</tbody></table>"
             )
         sections.append(w_html)
+
+    # Attestation gaps (unscoped sessions)
+    if report.attestation_gaps:
+        gap_rows = ""
+        cell = "padding:4px 8px"
+        mono = f"{cell};font-family:monospace;font-size:12px"
+        for ag in report.attestation_gaps:
+            gap_rows += (
+                f"<tr>"
+                f'<td style="{mono}">{_esc(ag.session_id[:16])}...</td>'
+                f'<td style="{cell};text-align:center">{ag.tool_call_count}</td>'
+                f'<td style="{cell}">{_esc(ag.harness or "—")}</td>'
+                f'<td style="{cell}">{_esc(ag.first_tool_call or "—")}</td>'
+                f'<td style="{cell};font-size:12px">{_esc(ag.detail)}</td>'
+                f"</tr>"
+            )
+        gap_hdr = (
+            '<thead><tr style="background:#fef2f2">'
+            f'<th style="{cell};text-align:left">Session ID</th>'
+            f'<th style="{cell};text-align:center">Tool Calls</th>'
+            f'<th style="{cell};text-align:left">Harness</th>'
+            f'<th style="{cell};text-align:left">First Call</th>'
+            f'<th style="{cell};text-align:left">Detail</th>'
+            "</tr></thead>"
+        )
+        sections.append(
+            '<div class="section">'
+            '<h2 style="color:#dc2626">Attestation Gaps (Unscoped Sessions)</h2>'
+            '<p style="font-size:13px;color:#64748b">Plan 008 WI-3.1: sessions '
+            "that produced tool-call events but never sent a session attestation. "
+            "Each gap is a completeness defect — the session&apos;s provenance is "
+            "uncovered by any signed scope declaration.</p>"
+            '<table style="border-collapse:collapse;width:100%">'
+            f"{gap_hdr}<tbody>{gap_rows}</tbody></table></div>"
+        )
 
     # Assurance levels
     if report.assurance_entries:

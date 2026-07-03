@@ -5913,3 +5913,588 @@ def test_assurance_does_not_affect_all_ok(hmac_keys: Path) -> None:
     assert len(report.assurance_entries) == 1
     assert report.assurance_entries[0].assurance_level == "self_reviewed"
     assert report.all_ok
+
+
+# ----------------------------------------------------------------------
+# Attestation gap tests (Plan 008 WI-3.1)
+# ----------------------------------------------------------------------
+
+
+def test_attestation_gap_unscoped_session(hmac_keys: Path) -> None:
+    """Tool calls without a session attestation produce an attestation gap."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    session_id = str(uuid.uuid4())
+
+    tc_ev = _make_signed_event(
+        key_bytes,
+        event_seq=0,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Edit",
+            "tool_args_hash": "sha256:abc",
+            "harness": {"name": "claude-code", "version": "1.0"},
+        },
+        timestamp=now,
+        on_behalf_of={"principal_id": "human:test", "session_id": session_id},
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([tc_ev])
+
+    assert len(report.attestation_gaps) == 1
+    gap = report.attestation_gaps[0]
+    assert gap.session_id == session_id
+    assert gap.tool_call_count == 1
+    assert gap.harness == "claude-code"
+    assert not report.all_ok
+
+
+def test_attestation_gap_no_gap_when_attested(hmac_keys: Path) -> None:
+    """Tool calls with a matching session attestation produce no gap."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime, timedelta
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    now = datetime.now(UTC)
+    session_entity_id = uuid.uuid4()
+    session_id_str = str(session_entity_id)
+
+    sa_sig, sa_hash, sa_env = sign_event(
+        event_id=uuid.uuid4(),
+        work_item_id=session_entity_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now - timedelta(seconds=10),
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": session_id_str,
+            "attested_at": (now - timedelta(seconds=10)).isoformat(),
+            "harnesses": [{"name": "claude-code", "version": "1.0"}],
+            "scope_statement": "In scope: claude-code.",
+        },
+        key=key_bytes,
+        entity_kind="session",
+    )
+    sa_event = Event(
+        event_id=uuid.uuid4(),
+        work_item_id=session_entity_id,
+        entity_kind="session",
+        entity_id=session_entity_id,
+        hash_alg="sha-256",
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now - timedelta(seconds=10),
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": session_id_str,
+            "attested_at": (now - timedelta(seconds=10)).isoformat(),
+            "harnesses": [{"name": "claude-code", "version": "1.0"}],
+            "scope_statement": "In scope: claude-code.",
+        },
+        payload_canonical_hash=sa_hash,
+        signature=sa_sig,
+        canonical_envelope=sa_env,
+    )
+
+    tc_ev = _make_signed_event(
+        key_bytes,
+        event_seq=1,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Edit",
+            "tool_args_hash": "sha256:abc",
+            "harness": {"name": "claude-code", "version": "1.0"},
+        },
+        timestamp=now,
+        on_behalf_of={"principal_id": "human:owner", "session_id": session_id_str},
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([sa_event, tc_ev])
+
+    assert len(report.attestation_gaps) == 0
+    assert report.all_ok
+
+
+def test_attestation_gap_multiple_tool_calls(hmac_keys: Path) -> None:
+    """Multiple tool calls from the same unattested session produce one gap."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    session_id = str(uuid.uuid4())
+    wi_id = uuid.uuid4()
+
+    tc1 = _make_signed_event(
+        key_bytes,
+        event_seq=0,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Edit",
+            "tool_args_hash": "sha256:aaa",
+            "harness": {"name": "opencode", "version": "0.1"},
+        },
+        timestamp=now,
+        work_item_id=wi_id,
+        on_behalf_of={"principal_id": "human:test", "session_id": session_id},
+    )
+    tc2 = _make_signed_event(
+        key_bytes,
+        event_seq=1,
+        transition="tool_call_end",
+        payload={
+            "tool": "Edit",
+            "tool_args_hash": "sha256:aaa",
+            "harness": {"name": "opencode", "version": "0.1"},
+        },
+        timestamp=now + timedelta(seconds=5),
+        work_item_id=wi_id,
+        on_behalf_of={"principal_id": "human:test", "session_id": session_id},
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([tc1, tc2])
+
+    assert len(report.attestation_gaps) == 1
+    gap = report.attestation_gaps[0]
+    assert gap.tool_call_count == 2
+    assert len(gap.event_ids) == 2
+
+
+def test_attestation_gap_in_text_report(hmac_keys: Path) -> None:
+    """Attestation gaps appear in the text report."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    session_id = str(uuid.uuid4())
+
+    tc_ev = _make_signed_event(
+        key_bytes,
+        event_seq=0,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Read",
+            "tool_args_hash": "sha256:abc",
+            "harness": {"name": "claude-code", "version": "1.0"},
+        },
+        timestamp=now,
+        on_behalf_of={"principal_id": "human:test", "session_id": session_id},
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([tc_ev])
+    text = Verifier.format_report(report)
+
+    assert "ATTESTATION GAPS" in text
+    assert "UNSCOPED SESSIONS" in text
+    assert session_id in text
+
+
+def test_attestation_gap_in_json_report(hmac_keys: Path) -> None:
+    """Attestation gaps appear in the JSON report."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    session_id = str(uuid.uuid4())
+
+    tc_ev = _make_signed_event(
+        key_bytes,
+        event_seq=0,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Read",
+            "tool_args_hash": "sha256:abc",
+            "harness": {"name": "claude-code", "version": "1.0"},
+        },
+        timestamp=now,
+        on_behalf_of={"principal_id": "human:test", "session_id": session_id},
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([tc_ev])
+    data = Verifier.format_report_json(report)
+
+    assert "attestation_gaps" in data
+    assert len(data["attestation_gaps"]) == 1
+    assert data["attestation_gaps"][0]["session_id"] == session_id
+    assert data["attestation_gaps"][0]["tool_call_count"] == 1
+
+
+def test_attestation_gap_in_html_report(hmac_keys: Path) -> None:
+    """Attestation gaps appear in the HTML report."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    session_id = str(uuid.uuid4())
+
+    tc_ev = _make_signed_event(
+        key_bytes,
+        event_seq=0,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Read",
+            "tool_args_hash": "sha256:abc",
+            "harness": {"name": "claude-code", "version": "1.0"},
+        },
+        timestamp=now,
+        on_behalf_of={"principal_id": "human:test", "session_id": session_id},
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([tc_ev])
+    html = Verifier.format_report_html(report)
+
+    assert "Attestation Gaps" in html
+    assert "Unscoped Sessions" in html
+
+
+def test_attestation_gap_no_session_id_skipped(hmac_keys: Path) -> None:
+    """Tool calls without session_id are not flagged as attestation gaps."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+
+    tc_ev = _make_signed_event(
+        key_bytes,
+        event_seq=0,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Read",
+            "tool_args_hash": "sha256:abc",
+            "harness": {"name": "claude-code", "version": "1.0"},
+        },
+        timestamp=now,
+        on_behalf_of={"principal_id": "human:test"},
+    )
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events([tc_ev])
+
+    assert len(report.attestation_gaps) == 0
+
+
+def test_verify_bundle_filtered_by_since(hmac_keys: Path, tmp_path: Path) -> None:
+    """verify_bundle_filtered correctly filters events by --since."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    session_id = str(uuid.uuid4())
+
+    old_ev = _make_signed_event(
+        key_bytes,
+        event_seq=0,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Read",
+            "tool_args_hash": "sha256:old",
+            "harness": {"name": "claude-code", "version": "1.0"},
+        },
+        timestamp=now - timedelta(hours=2),
+        on_behalf_of={"principal_id": "human:test", "session_id": session_id},
+    )
+    new_ev = _make_signed_event(
+        key_bytes,
+        event_seq=1,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Edit",
+            "tool_args_hash": "sha256:new",
+            "harness": {"name": "claude-code", "version": "1.0"},
+        },
+        timestamp=now,
+        on_behalf_of={"principal_id": "human:test", "session_id": session_id},
+    )
+
+    bundle = {
+        "manifest": {
+            "events_count": 2,
+            "exported_at": now.isoformat(),
+            "source_project": "test",
+            "source_dsn_host": "localhost",
+        },
+        "events": [old_ev.to_dict(), new_ev.to_dict()],
+    }
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode()
+    bundle["manifest"]["bundle_hash"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    bundle_path = tmp_path / "test_bundle.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle_filtered(
+        bundle_path,
+        since=(now - timedelta(hours=1)).isoformat(),
+    )
+
+    assert report.total_events == 1
+    assert report.key_chain.get("filtered", {}).get("verified") == 1
+    assert report.key_chain.get("filtered", {}).get("total_in_bundle") == 2
+
+
+def test_attestation_gap_no_false_positive_cross_window(hmac_keys: Path, tmp_path: Path) -> None:
+    """Filtered verify does not flag a gap when attestation is outside the window."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime, timedelta
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    now = datetime.now(UTC)
+    session_entity_id = uuid.uuid4()
+    session_id_str = str(session_entity_id)
+
+    # Session attestation is 2 hours ago (OUTSIDE the --since window)
+    sa_sig, sa_hash, sa_env = sign_event(
+        event_id=uuid.uuid4(),
+        work_item_id=session_entity_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now - timedelta(hours=2),
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": session_id_str,
+            "attested_at": (now - timedelta(hours=2)).isoformat(),
+            "harnesses": [{"name": "claude-code", "version": "1.0"}],
+            "scope_statement": "In scope: claude-code.",
+        },
+        key=key_bytes,
+        entity_kind="session",
+    )
+    sa_event = Event(
+        event_id=uuid.uuid4(),
+        work_item_id=session_entity_id,
+        entity_kind="session",
+        entity_id=session_entity_id,
+        hash_alg="sha-256",
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now - timedelta(hours=2),
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": session_id_str,
+            "attested_at": (now - timedelta(hours=2)).isoformat(),
+            "harnesses": [{"name": "claude-code", "version": "1.0"}],
+            "scope_statement": "In scope: claude-code.",
+        },
+        payload_canonical_hash=sa_hash,
+        signature=sa_sig,
+        canonical_envelope=sa_env,
+    )
+
+    # Tool call is now (INSIDE the --since window)
+    tc_ev = _make_signed_event(
+        key_bytes,
+        event_seq=1,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Edit",
+            "tool_args_hash": "sha256:abc",
+            "harness": {"name": "claude-code", "version": "1.0"},
+        },
+        timestamp=now,
+        on_behalf_of={"principal_id": "human:owner", "session_id": session_id_str},
+    )
+
+    bundle = {
+        "manifest": {
+            "events_count": 2,
+            "exported_at": now.isoformat(),
+            "source_project": "test",
+            "source_dsn_host": "localhost",
+        },
+        "events": [sa_event.to_dict(), tc_ev.to_dict()],
+    }
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode()
+    bundle["manifest"]["bundle_hash"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    bundle_path = tmp_path / "cross_window_bundle.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle_filtered(
+        bundle_path,
+        since=(now - timedelta(hours=1)).isoformat(),
+    )
+
+    # The tool call is inside the window but the attestation is outside.
+    # The gap check should NOT flag this session — the attestation exists
+    # in the full bundle, just outside the filter window.
+    assert len(report.attestation_gaps) == 0, [
+        g.detail for g in report.attestation_gaps
+    ]
+
+
+def test_attestation_gap_chain_dedup_across_bundles(hmac_keys: Path, tmp_path: Path) -> None:
+    """A session attested in bundle 1 should not be a gap in bundle 2."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime, timedelta
+
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    now = datetime.now(UTC)
+    session_entity_id = uuid.uuid4()
+    session_id_str = str(session_entity_id)
+
+    # Bundle 1: session attestation only
+    sa_sig, sa_hash, sa_env = sign_event(
+        event_id=uuid.uuid4(),
+        work_item_id=session_entity_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=0,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now - timedelta(hours=1),
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": session_id_str,
+            "attested_at": (now - timedelta(hours=1)).isoformat(),
+            "harnesses": [{"name": "claude-code", "version": "1.0"}],
+            "scope_statement": "In scope: claude-code.",
+        },
+        key=key_bytes,
+        entity_kind="session",
+    )
+    sa_event = Event(
+        event_id=uuid.uuid4(),
+        work_item_id=session_entity_id,
+        entity_kind="session",
+        entity_id=session_entity_id,
+        hash_alg="sha-256",
+        event_seq=0,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now - timedelta(hours=1),
+        transition="session_attestation",
+        payload={
+            "version": "1",
+            "principal_id": "human:owner",
+            "session_id": session_id_str,
+            "attested_at": (now - timedelta(hours=1)).isoformat(),
+            "harnesses": [{"name": "claude-code", "version": "1.0"}],
+            "scope_statement": "In scope: claude-code.",
+        },
+        payload_canonical_hash=sa_hash,
+        signature=sa_sig,
+        canonical_envelope=sa_env,
+    )
+
+    bundle1 = {
+        "manifest": {
+            "events_count": 1,
+            "exported_at": (now - timedelta(hours=1)).isoformat(),
+            "source_project": "test",
+            "source_dsn_host": "localhost",
+        },
+        "events": [sa_event.to_dict()],
+    }
+    canon1 = json.dumps(bundle1, separators=(",", ":"), sort_keys=True).encode()
+    bundle1["manifest"]["bundle_hash"] = "sha256:" + hashlib.sha256(canon1).hexdigest()
+    p1 = tmp_path / "bundle1.json"
+    p1.write_text(json.dumps(bundle1, indent=2))
+
+    # Bundle 2: tool call only (no attestation in this bundle)
+    tc_ev = _make_signed_event(
+        key_bytes,
+        event_seq=0,
+        transition="tool_call_begin",
+        payload={
+            "tool": "Edit",
+            "tool_args_hash": "sha256:abc",
+            "harness": {"name": "claude-code", "version": "1.0"},
+        },
+        timestamp=now,
+        on_behalf_of={"principal_id": "human:owner", "session_id": session_id_str},
+    )
+    bundle2 = {
+        "manifest": {
+            "events_count": 1,
+            "exported_at": now.isoformat(),
+            "source_project": "test",
+            "source_dsn_host": "localhost",
+            "previous_bundle_hash": bundle1["manifest"]["bundle_hash"],
+        },
+        "events": [tc_ev.to_dict()],
+    }
+    canon2 = json.dumps(bundle2, separators=(",", ":"), sort_keys=True).encode()
+    bundle2["manifest"]["bundle_hash"] = "sha256:" + hashlib.sha256(canon2).hexdigest()
+    p2 = tmp_path / "bundle2.json"
+    p2.write_text(json.dumps(bundle2, indent=2))
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle_chain([p1, p2])
+
+    # The session was attested in bundle 1, so bundle 2's tool call should
+    # NOT be flagged as an attestation gap after cross-bundle dedup.
+    assert len(report.attestation_gaps) == 0, [
+        g.detail for g in report.attestation_gaps
+    ]

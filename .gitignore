@@ -9,3 +9,7 @@ dist/
 build/
 node_modules/
 bun.lock
+
+# Claude Code project settings (contains env secrets after install-harness)
+.claude/settings.json
+.claude/settings.local.json

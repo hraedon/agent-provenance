@@ -39,6 +39,7 @@ from cairn.verifier_report import (
 from cairn.verifier_types import (
     AssuranceEntry,
     AssuranceLevel,
+    AttestationGap,
     BundleDiff,
     BundleDiffEntry,
     ChainContiguityViolation,
@@ -70,6 +71,7 @@ log = structlog.get_logger()
 __all__ = [
     "AssuranceEntry",
     "AssuranceLevel",
+    "AttestationGap",
     "BundleDiff",
     "BundleDiffEntry",
     "ChainContiguityViolation",
@@ -222,6 +224,7 @@ class Verifier:
         self._check_chain_contiguity(events, report)
         self._check_scope_coverage(events, report)
         self._check_principal_binding(events, report)
+        self._check_attestation_gaps(events, report)
         self._check_temporal_ordering(events, report)
         self._compute_assurance_levels(events, report)
 
@@ -292,6 +295,101 @@ class Verifier:
             return raw, [], manifest, report
 
         return raw, events, manifest, None
+
+    def verify_bundle_filtered(
+        self,
+        bundle_path: str | Path,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> VerificationReport:
+        """Verify a bundle with temporal filtering (Plan 008 WI-3.1).
+
+        Loads the bundle, filters events to those within the ``[since, until)``
+        window, and verifies only the filtered subset.  The bundle hash is
+        verified against the *full* bundle (not the filtered subset) so that
+        tamper-evidence is not lost.
+
+        Attestation gaps are computed over the filtered events but use
+        attestation info from the **full** event list — this prevents
+        false positives when a session attestation falls outside the filter
+        window but its tool calls fall inside it.
+
+        Timestamp-batch signature verification is **skipped** in filtered
+        mode because the Merkle root covers the full batch, not the filtered
+        subset.  TSA temporal ordering is still checked for covered events.
+
+        ``global_seq`` gap violations are suppressed because temporal
+        filtering creates expected gaps in the cross-work-item sequence.
+
+        ``since`` and ``until`` are ISO 8601 timestamp strings.  ``since`` is
+        inclusive, ``until`` is exclusive.
+        """
+        path = Path(bundle_path)
+        raw, events, manifest, error_report = self._load_bundle(path)
+        if error_report is not None:
+            return error_report
+
+        hash_verified = self._verify_bundle_hash(raw, manifest)
+        if hash_verified is False:
+            report = VerificationReport()
+            report.bundle_hash_ok = False
+            report.bundle_hash_detail = "Bundle integrity hash mismatch (see log)"
+            report.key_chain["bundle"] = manifest
+            return report
+
+        since_dt = _parse_iso(since) if since else None
+        until_dt = _parse_iso(until) if until else None
+
+        filtered = []
+        for ev in events:
+            ev_ts = ev.timestamp
+            if since_dt is not None and ev_ts < since_dt:
+                continue
+            if until_dt is not None and ev_ts >= until_dt:
+                continue
+            filtered.append(ev)
+
+        report = self.verify_events(filtered)
+        report.bundle_hash_ok = True if hash_verified else None
+        report.key_chain["bundle"] = manifest
+        report.key_chain["filtered"] = {
+            "since": since,
+            "until": until,
+            "total_in_bundle": len(events),
+            "verified": len(filtered),
+        }
+
+        prev_hash = manifest.get("previous_bundle_hash")
+        if prev_hash:
+            report.previous_bundle_hash = prev_hash
+        report.chain_integrity_ok = None
+
+        # Suppress global_seq gap violations — temporal filtering creates
+        # expected gaps in the cross-work-item sequence.
+        report.chain_contiguity_violations = [
+            v for v in report.chain_contiguity_violations
+            if v.kind != "global_seq_gap"
+        ]
+
+        # Re-run attestation gap check with attested sessions from the FULL
+        # event list, not just the filtered subset.  This prevents false
+        # positives when the session attestation is outside the filter window.
+        all_attested = self._collect_attested_session_ids(events)
+        report.attestation_gaps.clear()
+        self._check_attestation_gaps(filtered, report, attested_sessions=all_attested)
+
+        # Timestamp batches: load for coverage info but skip signature
+        # verification (Merkle root covers the full batch, not the subset).
+        self._accumulate_timestamp_batches(raw, filtered, report)
+
+        self._accumulate_witness_data(raw, filtered, report)
+        self._verify_witness_signatures(filtered, report)
+        self._check_witness_coverage(filtered, report)
+
+        self._check_tsa_temporal_ordering(filtered, report)
+
+        return report
 
     def _verify_loaded_bundle(
         self,
@@ -1501,7 +1599,128 @@ class Verifier:
                         principal_id=principal_id,
                         expected_principal_id=expected,
                     )
+                    )
+
+    def _collect_attested_session_ids(self, events: list[Event]) -> set[str]:
+        """Collect all attested session IDs from a full event list.
+
+        Used by ``verify_bundle_filtered`` to avoid false-positive
+        attestation gaps when the session attestation falls outside the
+        filter window but the tool calls fall inside it.
+        """
+        attested: set[str] = set()
+        for ev in events:
+            transition = ev.transition or ""
+            if transition == "session_attestation":
+                payload = ev.payload or {}
+                sid = payload.get("session_id")
+                if sid and sid != "?":
+                    attested.add(sid)
+            elif transition == "scope_statement" and ev.on_behalf_of is not None:
+                sid = ev.on_behalf_of.get("session_id")
+                if sid:
+                    attested.add(sid)
+        return attested
+
+    def _check_attestation_gaps(
+        self,
+        events: list[Event],
+        report: VerificationReport,
+        *,
+        attested_sessions: set[str] | None = None,
+    ) -> None:
+        """Detect sessions that produced tool-call events without a session
+        attestation (Plan 008 WI-3.1).
+
+        A session attestation (``cairn.session_attestation`` transition) is
+        the harness's signed declaration that a session started under a
+        known scope.  When tool-call events carry a ``session_id`` that has
+        no matching session attestation, that session ran **unscoped** — a
+        completeness defect an auditor must see named explicitly.
+
+        This check is complementary to ``_check_scope_coverage``: scope
+        coverage flags *individual events* whose harness is not listed in
+        any active attestation; attestation gaps flag *whole sessions* that
+        never attested at all.
+
+        A session is considered "attested" if it has a session attestation
+        event OR a scope attestation event (the legacy path) whose
+        ``on_behalf_of.session_id`` matches.
+
+        When ``attested_sessions`` is provided (filtered-verification
+        mode), the method uses that set instead of collecting from the
+        report — this prevents false positives when the session
+        attestation falls outside the filter window but the tool calls
+        fall inside it.
+        """
+        if attested_sessions is None:
+            # Collect attested session IDs from session attestations
+            attested_sessions = set()
+            for sa in report.session_attestations:
+                if sa.session_id and sa.session_id != "?":
+                    attested_sessions.add(sa.session_id)
+
+            # Also collect session IDs from scope attestation events (legacy path).
+            sa_event_ids = {sa.event_id for sa in report.scope_attestations}
+            for ev in events:
+                if str(ev.event_id) in sa_event_ids and ev.on_behalf_of is not None:
+                    sid = ev.on_behalf_of.get("session_id")
+                    if sid:
+                        attested_sessions.add(sid)
+
+        # Group tool-call events by session_id
+        session_tool_calls: dict[str, list[Event]] = {}
+        for ev in events:
+            transition = ev.transition or ""
+            if not transition.startswith("tool_call"):
+                continue
+            payload = ev.payload or {}
+            if not payload.get("harness"):
+                continue
+            session_id = None
+            if ev.on_behalf_of is not None:
+                session_id = ev.on_behalf_of.get("session_id")
+            if not session_id or session_id == "?":
+                continue
+            session_tool_calls.setdefault(session_id, []).append(ev)
+
+        # Flag sessions with tool calls but no attestation
+        for session_id, tool_call_events in session_tool_calls.items():
+            if session_id in attested_sessions:
+                continue
+
+            sorted_calls = sorted(tool_call_events, key=lambda e: e.timestamp)
+            first_ev = sorted_calls[0]
+            last_ev = sorted_calls[-1]
+            first_payload = first_ev.payload or {}
+            h_raw = first_payload.get("harness", "")
+            if isinstance(h_raw, dict):
+                harness = h_raw.get("name")
+            elif isinstance(h_raw, str):
+                harness = h_raw
+            else:
+                harness = None
+
+            report.attestation_gaps.append(
+                AttestationGap(
+                    session_id=session_id,
+                    tool_call_count=len(tool_call_events),
+                    first_tool_call=first_ev.timestamp.isoformat()
+                    if first_ev.timestamp
+                    else None,
+                    last_tool_call=last_ev.timestamp.isoformat()
+                    if last_ev.timestamp
+                    else None,
+                    harness=harness,
+                    event_ids=tuple(str(ev.event_id) for ev in sorted_calls),
+                    detail=(
+                        f"Session {session_id} produced {len(tool_call_events)} "
+                        f"tool-call event(s) but has no session attestation. "
+                        f"The session ran unscoped — its provenance is "
+                        f"uncovered by any signed scope declaration."
+                    ),
                 )
+            )
 
     def _accumulate_key_revocations(self, report: VerificationReport, ev: Event) -> None:
         """Detect key_revocation events and flag events signed after revocation.
@@ -1977,6 +2196,7 @@ class Verifier:
             merged.role_gate_violations.extend(r.role_gate_violations)
             merged.chain_contiguity_violations.extend(r.chain_contiguity_violations)
             merged.principal_binding_violations.extend(r.principal_binding_violations)
+            merged.attestation_gaps.extend(r.attestation_gaps)
             merged.assurance_entries.extend(r.assurance_entries)
             merged.key_revocations.extend(r.key_revocations)
             merged.delegation_chains.extend(r.delegation_chains)
@@ -1997,6 +2217,18 @@ class Verifier:
                 merged.chain_integrity_ok = False
             elif merged.chain_integrity_ok is None and r.chain_integrity_ok is True:
                 merged.chain_integrity_ok = True
+
+        # Cross-bundle attestation gap deduplication: a session attested in
+        # one bundle should not be flagged as a gap in another bundle.
+        all_attested_session_ids: set[str] = set()
+        for sa in merged.session_attestations:
+            if sa.session_id and sa.session_id != "?":
+                all_attested_session_ids.add(sa.session_id)
+        if all_attested_session_ids:
+            merged.attestation_gaps = [
+                gap for gap in merged.attestation_gaps
+                if gap.session_id not in all_attested_session_ids
+            ]
 
         return merged
 

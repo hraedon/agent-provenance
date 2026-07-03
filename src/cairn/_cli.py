@@ -313,6 +313,16 @@ def main() -> None:
     "for verifying witness receipt signatures (BC-016). "
     "When omitted, witness keys from bundle registrations are used.",
 )
+@click.option(
+    "--since",
+    default=None,
+    help="ISO timestamp — only verify events at or after this time (Plan 008 WI-3.1).",
+)
+@click.option(
+    "--until",
+    default=None,
+    help="ISO timestamp — only verify events before this time (Plan 008 WI-3.1).",
+)
 def verify(
     bundle_path: Path,
     keys: Path,
@@ -320,6 +330,8 @@ def verify(
     fmt: str,
     tsa_cert: Path | None,
     witness_keys: Path | None,
+    since: str | None,
+    until: str | None,
 ) -> None:
     """Verify a signed Cairn bundle and emit an auditor-ready report."""
     for w in check_key_file_permissions(str(keys)):
@@ -338,7 +350,20 @@ def verify(
         tsa_cert_path=str(tsa_cert) if tsa_cert else None,
         witness_keys=witness_key_set,
     )
-    report = verifier.verify_bundle(bundle_path)
+
+    if since or until:
+        if since and until:
+            since_dt = datetime.datetime.fromisoformat(since)
+            until_dt = datetime.datetime.fromisoformat(until)
+            if since_dt > until_dt:
+                raise click.ClickException("--since must be <= --until")
+        report = verifier.verify_bundle_filtered(
+            bundle_path,
+            since=since,
+            until=until,
+        )
+    else:
+        report = verifier.verify_bundle(bundle_path)
 
     if fmt == "json":
         result = json.dumps(Verifier.format_report_json(report), indent=2)
@@ -725,6 +750,67 @@ def timestamp(
         raise SystemExit(1) from exc
     finally:
         sub.close()
+
+
+@main.command("install-harness")
+@click.argument(
+    "harness",
+    type=click.Choice(["claude", "opencode", "all"]),
+)
+@click.option("--dry-run", is_flag=True, help="Print planned changes; act on nothing")
+@click.option("--uninstall", is_flag=True, help="Reverse a prior install-harness")
+@click.option("--user", default=None, help="Per-user principal_id overlay")
+@click.option("--json", "json_output", is_flag=True, help="Emit contract-shaped JSON")
+def install_harness(
+    harness: str,
+    dry_run: bool,
+    uninstall: bool,
+    user: str | None,
+    json_output: bool,
+) -> None:
+    """Wire cairn's interception (hooks + default-on env) into a named harness."""
+    from ._install import format_results_human, run_install_harness
+
+    results = run_install_harness(harness, dry_run=dry_run, uninstall=uninstall, user=user)
+
+    if json_output:
+        click.echo(json.dumps([r.to_dict() for r in results], indent=2))
+    else:
+        click.echo(format_results_human(results, dry_run=dry_run, uninstall=uninstall))
+
+    if dry_run:
+        sys.exit(2)
+
+
+@main.command("uninstall-harness")
+@click.argument(
+    "harness",
+    type=click.Choice(["claude", "opencode", "all"]),
+)
+@click.option("--dry-run", is_flag=True)
+@click.option("--json", "json_output", is_flag=True)
+def uninstall_harness(harness: str, dry_run: bool, json_output: bool) -> None:
+    """Reverse a prior ``cairn install-harness`` — removes only cairn's wiring."""
+    from ._install import format_results_human, run_install_harness
+
+    results = run_install_harness(harness, dry_run=dry_run, uninstall=True)
+
+    if json_output:
+        click.echo(json.dumps([r.to_dict() for r in results], indent=2))
+    else:
+        click.echo(format_results_human(results, dry_run=dry_run, uninstall=True))
+
+    if dry_run:
+        sys.exit(2)
+
+
+@main.command()
+@click.option("--json", "json_output", is_flag=True, help="Emit suite-shape JSON")
+def doctor(json_output: bool) -> None:
+    """Health check — validates config, regista connectivity, harness wiring."""
+    from ._doctor import run_doctor
+
+    sys.exit(run_doctor(json_output=json_output))
 
 
 if __name__ == "__main__":

@@ -45,6 +45,7 @@ structlog.configure(
 from regista import Regista  # noqa: E402
 
 from cairn import CairnAdapter, CairnConfig  # noqa: E402
+from cairn._config import resolve_config  # noqa: E402
 from cairn.schema import hash_payload  # noqa: E402
 
 _MAX_INPUT_BYTES = 10 * 1024 * 1024  # 10 MiB safety limit on stdin
@@ -65,23 +66,26 @@ def main() -> None:
         sys.stderr.write(f"cairn_bridge: bad JSON: {exc}\n")
         sys.exit(1)
 
-    dsn = os.environ.get("CAIRN_DSN")
-    project = os.environ.get("CAIRN_PROJECT")
-    key_path = os.environ.get("CAIRN_KEY_PATH")
+    cfg = resolve_config()
+
+    dsn = cfg.dsn
+    project = cfg.project
+    key_path = cfg.key_path
 
     if not all([dsn, project, key_path]):
-        sys.stderr.write("cairn_bridge: CAIRN_DSN, CAIRN_PROJECT, CAIRN_KEY_PATH required\n")
+        missing = ", ".join(
+            m for m, v in [("DSN", dsn), ("PROJECT", project), ("KEY_PATH", key_path)] if not v
+        )
+        sys.stderr.write(
+            f"cairn_bridge: missing required config: {missing}\n"
+            "Set REGISTA_DSN/REGISTA_KEY_PATH (or legacy CAIRN_DSN/CAIRN_KEY_PATH) "
+            "and CAIRN_PROJECT.\n"
+        )
         sys.exit(1)
 
-    harness_name = os.environ.get("CAIRN_HARNESS_NAME", "opencode")
-    harness_version = os.environ.get("CAIRN_HARNESS_VERSION", "unknown")
-    try:
-        _default_principal = f"human:{os.getlogin()}"
-    except OSError:
-        import getpass
-
-        _default_principal = f"human:{getpass.getuser()}"
-    principal_id = os.environ.get("PRINCIPAL_ID", _default_principal)
+    harness_name = cfg.harness_name
+    harness_version = cfg.harness_version
+    principal_id = cfg.principal_id or "human:unknown"
 
     action = msg.get("action")
     files = [f for f in (msg.get("files") or []) if isinstance(f, str)]
