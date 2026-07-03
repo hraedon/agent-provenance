@@ -110,23 +110,23 @@ In rough order. Do not assume any of these are done; check on entry.
 
 ## Current status (last updated 2026-07-03)
 
-- **Tests**: 204 Python passing (3 skipped — Postgres-dependent)
+- **Tests**: 209 Python passing (3 skipped — Postgres-dependent)
   + 24 Bun tests for the OpenCode plugin (helpers + BC-022 integration coverage).
-  asn1crypto + pynacl installed for TSA/witness signature tests.
+  asn1crypto + pynacl in dev dependencies.
 - **Lint**: ruff clean; mypy clean (pre-existing regista import-untyped errors only).
-- **CI**: `.github/workflows/ci.yml` — Python job (ruff + mypy + pytest) and a Bun job
-  (`bun test` in `integrations/opencode`) + `Makefile` (`make test-js`, `make all`).
-- **Gaps closed this session**: Plan 008 WI-1.2 (install-harness / uninstall-harness
-  CLI with --dry-run, --json, --user, idempotent, no-clobber); Plan 008 WI-2.1
-  (REGISTA_*/CAIRN_* config precedence with deprecation warnings, doctor --json
-  suite-shape output); Plan 008 WI-3.1 (attestation gap detection — AttestationGap
-  type, _check_attestation_gaps method, text/JSON/HTML report surfacing,
-  verify_bundle_filtered with --since/--until, cross-window attestation info to
-  prevent false positives, cross-bundle gap deduplication in verify_bundle_chain,
-  global_seq gap suppression in filtered mode, timestamp batch verification skipped
-  in filtered mode); Plan 008 WI-3.2 (SUITE.lock pinning regista SHA); BC-018
+- **CI**: `.github/workflows/ci.yml` — Python job (ruff + mypy + pytest + identifier-gate)
+  and a Bun job (`bun test` in `integrations/opencode`) + `Makefile`.
+- **Plan 008 status**: All WIs complete. WI-1.1 (Claude Code hook parity),
+  WI-1.2 (install-harness/uninstall-harness CLI), WI-2.1 (REGISTA_*/CAIRN_* config
+  precedence + doctor --json), WI-3.1 (attestation gap detection + verify_bundle_filtered
+  with --since/--until), WI-3.2 (SUITE.lock), WI-4.1 (secrets resolution via
+  regista._secrets.resolve + Windows compatibility), WI-4.2 (publication gate —
+  identifier scrub, CI identifier-gate, publication checklist, git history scrub).
+- **Gaps closed this session**: Plan 008 WI-1.2/2.1/3.1/3.2/4.1/4.2; BC-018
   (global_seq gap false positives in filtered bundles — resolved);
-  pre-existing test failures (installed asn1crypto + pynacl).
+  pre-existing test failures (installed asn1crypto + pynacl);
+  identifier scrub (human:plm→human:owner, human:itadmin→human:owner,
+  regista_app→regista_user, absolute paths→relative, git history rewritten).
 - **Gaps closed this session**: BC-022 (OpenCode plugin no longer silently loses tool-call end
   events on bridge failure — durable per-session `degradation.log` mirroring the Claude Code
   hook's `_mark_degraded`; bounded FIFO session map with eviction-recorded orphans; begin
@@ -193,15 +193,14 @@ In rough order. Do not assume any of these are done; check on entry.
   matching the opencode plugin's structurally distinct session entity path);
   **Review assurance levels** (Plan 027 WI-1.2 — AssuranceLevel closed set
   computed from signed events, surfaced in text/JSON/HTML reports).
-- **Open gaps**: project not registered with agent-notes yet; live
-  opencode dogfood bundle not yet committed to repo; Claude Code hooks not
-  yet tested in a live Claude Code session (mock tests only);
+- **Open gaps**: live opencode dogfood bundle not yet committed to repo;
+  Claude Code hooks not yet tested in a live Claude Code session (mock tests only);
   real IdP integration for principal_id; BC-016 (witness signatures not
   cryptographically verified — blocked on regista asymmetric witness signing);
   BC-005 (scope attestation uses tool_call transitions — Claude Code hook
   now uses attest_session; attest_scope method still exists, blocked on
-  regista Plan 016); BC-019 (verify_bundle_chain scheme_counts merge — verified already
-  implemented at verifier.py:1597, stale);
+  regista Plan 016); BC-019 (verify_bundle_chain scheme_counts merge — stale,
+  already implemented);
   WI-001 remaining (test_client.py hangs — test_cairn.py now passes);
   WI-002 (cross-component meaning contracts as conformance-tested artifacts);
   WI-010 (PostgresEventStore.append returns Event without DB-assigned
@@ -210,8 +209,7 @@ In rough order. Do not assume any of these are done; check on entry.
   event handler, mixed entity kinds);
   WI-012 (CAIRN_ATTEST_ON_START env check treats any non-empty string as true);
   WI-018 (opencode plugin attest_session omits harness_config_digests —
-  parity gap with Claude Code hook);
-  WI-019 (asn1crypto and pynacl not in dev dependencies).
+  parity gap with Claude Code hook).
 
 ## What not to do
 

@@ -1,9 +1,10 @@
 # Plan 008 — Suite cohesion: provenance on by default
 
-**Status:** WI-1.1 complete (committed). WI-1.2, WI-2.1 complete (this commit).
-WI-3.1 (attestation gap detection + filtered verify) complete (this commit).
-WI-3.2 (SUITE.lock) complete (this commit). WI-4.1/WI-4.2 deferred (blocked
-on regista Plan 025 / repo still private).
+**Status:** Complete (all WIs). WI-1.1 committed (30893e5, pre-session).
+WI-1.2, WI-2.1, WI-3.1, WI-3.2 committed (5afb779). WI-4.1, WI-4.2
+committed (d68e50b/bea1954). Git history scrubbed via filter-repo.
+WI-4.1 blocked items (Windows live test, real Vault/Azure backend
+tests) are deployment-validation tasks, not code gaps.
 **Author:** Claude (Fable 5), from the 2026-07-02 agent-suite deployment review
 **Strategic role:** agent-provenance (`cairn`) is the compliance keystone — the
 reason a regulated shop can adopt the suite at all. For that value to be real in
