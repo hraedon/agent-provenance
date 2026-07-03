@@ -24,10 +24,12 @@ Environment::
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
 import sys
+import tempfile
 import uuid
 from typing import Any
 
@@ -51,6 +53,72 @@ from cairn.schema import hash_payload  # noqa: E402
 _MAX_INPUT_BYTES = 10 * 1024 * 1024  # 10 MiB safety limit on stdin
 
 
+def _resolve_key_path(cfg: Any) -> str:
+    """Return a usable ``hmac_key_path`` from the config.
+
+    When ``key_ref`` is set, create a temporary key-set JSON that uses
+    ``secret_ref`` so regista's KeySet resolves the key material from the
+    configured backend (env, vault, azure) — no plaintext key on disk.
+    When ``key_path`` is set, return it directly.
+
+    The temp file is created with 0o600 permissions from the start (no
+    race window) and registered for cleanup at process exit.
+    """
+    if cfg.key_path:
+        return cfg.key_path
+    if not cfg.key_ref:
+        raise RuntimeError("neither key_path nor key_ref configured")
+
+    from regista._secrets import resolve as resolve_secret
+
+    key_ref = cfg.key_ref
+    try:
+        raw = resolve_secret(key_ref)
+    except Exception as exc:
+        sys.stderr.write(f"cairn_bridge: failed to resolve key_ref: {exc}\n")
+        sys.exit(1)
+
+    key_set: dict[str, Any]
+    try:
+        key_data = json.loads(raw)
+        if isinstance(key_data, dict) and "keys" in key_data:
+            key_set = key_data
+        else:
+            key_set = {
+                "keys": [
+                    {
+                        "key_id": "cairn-resolved",
+                        "scheme": "hmac-sha256",
+                        "secret_ref": key_ref,
+                    }
+                ]
+            }
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        key_set = {
+            "keys": [
+                {
+                    "key_id": "cairn-resolved",
+                    "scheme": "hmac-sha256",
+                    "secret_ref": key_ref,
+                }
+            ]
+        }
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix="cairn-key-")
+    os.chmod(tmp_path, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(key_set, f)
+    atexit.register(_cleanup_temp_key, tmp_path)
+    return tmp_path
+
+
+def _cleanup_temp_key(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def main() -> None:
     if os.environ.get("CAIRN_DISABLE"):
         return
@@ -71,10 +139,17 @@ def main() -> None:
     dsn = cfg.dsn
     project = cfg.project
     key_path = cfg.key_path
+    key_ref = cfg.key_ref
 
-    if not all([dsn, project, key_path]):
+    if not all([dsn, project, key_path or key_ref]):
         missing = ", ".join(
-            m for m, v in [("DSN", dsn), ("PROJECT", project), ("KEY_PATH", key_path)] if not v
+            m
+            for m, v in [
+                ("DSN", dsn),
+                ("PROJECT", project),
+                ("KEY_PATH or KEY_REF", key_path or key_ref),
+            ]
+            if not v
         )
         sys.stderr.write(
             f"cairn_bridge: missing required config: {missing}\n"
@@ -107,7 +182,7 @@ def main() -> None:
     except ValueError:
         session_id = str(uuid.uuid5(uuid.NAMESPACE_URL, session_id))
 
-    sub = Regista(dsn=dsn, project=project, hmac_key_path=key_path)
+    sub = Regista(dsn=dsn, project=project, hmac_key_path=_resolve_key_path(cfg))
     adapter = CairnAdapter(
         sub,
         config=CairnConfig(harness_name, harness_version),

@@ -34,9 +34,10 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-_DEFAULT_STATE_DIR = "/tmp/cairn-sessions"
+_DEFAULT_STATE_DIR = str(Path(tempfile.gettempdir()) / "cairn-sessions")
 _FALLBACK_SESSION_ID = "unknown"
 _FALLBACK_TOOL_NAME = "unknown"
 

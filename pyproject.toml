@@ -32,6 +32,8 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.5",
     "mypy>=1.10",
+    "asn1crypto>=1.5",
+    "pynacl>=1.5",
 ]
 
 [project.scripts]

@@ -24,7 +24,7 @@ process.env.CAIRN_DSN = "postgresql://regista_test:regista_test@localhost/regist
 process.env.CAIRN_PROJECT = "cairn_dogfood_test";
 process.env.CAIRN_KEY_PATH = keyFile;
 process.env.PRINCIPAL_ID = "human:owner";
-process.env.CAIRN_BRIDGE_PATH = "/projects/agent-provenance/.venv/bin/cairn-bridge";
+process.env.CAIRN_BRIDGE_PATH = "cairn-bridge";
 
 const capturedLogs = [];
 const mockClient = {

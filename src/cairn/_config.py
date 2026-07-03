@@ -1,12 +1,17 @@
 """Config resolution for cairn — suite-aware env var precedence.
 
 Precedence (highest first):
-  1. Explicit process env (REGISTA_DSN / REGISTA_KEY_PATH)
-  2. Legacy alias (CAIRN_DSN / CAIRN_KEY_PATH) — warns on fallback
-  3. suite.env file (if present)
+   1. Explicit process env (REGISTA_DSN / REGISTA_KEY_PATH / REGISTA_KEY_REF)
+   2. Legacy alias (CAIRN_DSN / CAIRN_KEY_PATH / CAIRN_KEY_REF) — warns on fallback
+   3. suite.env file (if present)
 
 Cairn-specific vars (CAIRN_PROJECT, CAIRN_HARNESS_NAME, etc.) have no
 REGISTA_ equivalent and are read directly.
+
+Key resolution: when ``key_ref`` is set (e.g. ``env:MY_SECRET_KEY`` or
+``vault:secret/data/cairn/private_key``), the signing key is resolved at
+bridge startup via ``regista._secrets.resolve()`` — no plaintext key on
+disk.  When ``key_path`` is set, the key is read from a file as before.
 """
 
 from __future__ import annotations
@@ -14,10 +19,12 @@ from __future__ import annotations
 import dataclasses
 import os
 import sys
+import tempfile
 from pathlib import Path
 
-_SUITE_ENV_PATHS = [
-    Path(os.environ.get("AGENT_SUITE_CONFIG", "")),
+_DEFAULT_STATE_DIR = str(Path(tempfile.gettempdir()) / "cairn-sessions")
+
+_SUITE_ENV_PATHS = [    Path(os.environ.get("AGENT_SUITE_CONFIG", "")),
     Path.home() / ".config" / "agent-suite" / "suite.env",
     Path("/etc/agent-suite/suite.env"),
 ]
@@ -66,23 +73,24 @@ def _resolve(key_suite: str, key_legacy: str, suite_env: dict[str, str]) -> str 
 class CairnEnvConfig:
     dsn: str | None = None
     key_path: str | None = None
+    key_ref: str | None = None
     project: str | None = None
     harness_name: str = "claude-code"
     harness_version: str = "unknown"
     principal_id: str | None = None
-    state_dir: str = "/tmp/cairn-sessions"
+    state_dir: str = _DEFAULT_STATE_DIR
     disabled: bool = False
 
     @property
     def is_configured(self) -> bool:
-        return all([self.dsn, self.key_path, self.project])
+        return all([self.dsn, self.key_path or self.key_ref, self.project])
 
     def missing(self) -> list[str]:
         missing = []
         if not self.dsn:
             missing.append("DSN")
-        if not self.key_path:
-            missing.append("KEY_PATH")
+        if not self.key_path and not self.key_ref:
+            missing.append("KEY_PATH or KEY_REF")
         if not self.project:
             missing.append("PROJECT")
         return missing
@@ -93,9 +101,9 @@ def resolve_config() -> CairnEnvConfig:
 
     dsn = _resolve("REGISTA_DSN", "CAIRN_DSN", suite_env)
     key_path = _resolve("REGISTA_KEY_PATH", "CAIRN_KEY_PATH", suite_env)
+    key_ref = _resolve("REGISTA_KEY_REF", "CAIRN_KEY_REF", suite_env)
     project = (
         os.environ.get("CAIRN_PROJECT")
-        or suite_env.get("CAIRN_PROJECT")
         or suite_env.get("CAIRN_PROJECT")
     )
 
@@ -124,13 +132,14 @@ def resolve_config() -> CairnEnvConfig:
     state_dir = (
         os.environ.get("CAIRN_STATE_DIR")
         or suite_env.get("CAIRN_STATE_DIR")
-        or "/tmp/cairn-sessions"
+        or _DEFAULT_STATE_DIR
     )
     disabled = bool(os.environ.get("CAIRN_DISABLE"))
 
     return CairnEnvConfig(
         dsn=dsn,
         key_path=key_path,
+        key_ref=key_ref,
         project=project,
         harness_name=harness_name,
         harness_version=harness_version,

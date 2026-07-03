@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 from typing import Any
 
 logging.basicConfig(level=logging.CRITICAL)
@@ -44,6 +45,21 @@ def _check_config(cfg: Any) -> dict[str, Any]:
 
 
 def _check_key_file(cfg: Any) -> dict[str, Any]:
+    if cfg.key_ref:
+        try:
+            from regista._secrets import resolve as resolve_secret
+            resolve_secret(cfg.key_ref)
+            return {
+                "name": "key_file",
+                "status": "pass",
+                "detail": f"key_ref: {cfg.key_ref} (resolvable)",
+            }
+        except Exception as exc:
+            return {
+                "name": "key_file",
+                "status": "fail",
+                "detail": f"key_ref {cfg.key_ref!r} not resolvable: {exc}",
+            }
     if not cfg.key_path:
         return {"name": "key_file", "status": "fail", "detail": "no key path configured"}
     path = cfg.key_path
@@ -69,7 +85,33 @@ def _check_regista(cfg: Any) -> dict[str, Any]:
     try:
         from regista import Regista
 
-        sub = Regista(dsn=cfg.dsn, project=cfg.project, hmac_key_path=cfg.key_path)
+        key_path = cfg.key_path
+        if not key_path and cfg.key_ref:
+            fd, key_path = tempfile.mkstemp(suffix=".json", prefix="cairn-doctor-")
+            os.chmod(key_path, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump({
+                    "keys": [{
+                        "key_id": "cairn-doctor",
+                        "scheme": "hmac-sha256",
+                        "secret_ref": cfg.key_ref,
+                    }]
+                }, f)
+            try:
+                sub = Regista(dsn=cfg.dsn, project=cfg.project, hmac_key_path=key_path)
+                try:
+                    events = sub.read_events(limit=1)
+                    return {
+                        "name": "regista",
+                        "status": "pass",
+                        "detail": f"reachable, {len(events)} event(s) in project '{cfg.project}'",
+                    }
+                finally:
+                    sub.close()
+            finally:
+                os.unlink(key_path)
+
+        sub = Regista(dsn=cfg.dsn, project=cfg.project, hmac_key_path=key_path)
         try:
             events = sub.read_events(limit=1)
             return {

@@ -27,7 +27,7 @@ process.env.PRINCIPAL_ID = "human:owner";
 process.env.CAIRN_HARNESS_NAME = "opencode";
 process.env.CAIRN_HARNESS_VERSION = "1.15.7";
 
-process.env.CAIRN_BRIDGE_PATH = "/projects/agent-provenance/.venv/bin/cairn-bridge";
+process.env.CAIRN_BRIDGE_PATH = "cairn-bridge";
 const dogfoodDir = "/tmp/cairn_dogfood_session";
 try {
   await (await import("fs/promises")).mkdir(dogfoodDir, { recursive: true });

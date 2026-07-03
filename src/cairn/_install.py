@@ -12,13 +12,30 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ._config import resolve_config
 
-CAIRN_HOOK_COMMAND = "python3 -m cairn._claude_hook"
+
+def _python_command() -> str:
+    """Return the python command for the hook entry.
+
+    Uses ``python3`` on Unix (where ``python`` may be Python 2) and
+    ``python`` on Windows (where ``python3`` is often not on PATH).
+    """
+    if sys.platform == "win32":
+        return "python"
+    return "python3"
+
+CAIRN_HOOK_COMMAND = f"{_python_command()} -m cairn._claude_hook"
+
+# Note: CAIRN_HOOK_COMMAND is evaluated at import time on the machine
+# running install-harness. If settings.json is synced across platforms,
+# the user should manually adjust the command or use the cairn-hook
+# entry point (planned for a future release).
 
 HOOK_EVENTS: dict[str, str] = {
     "PreToolUse": "pre",
@@ -31,6 +48,7 @@ HOOK_EVENTS: dict[str, str] = {
 _ENV_VARS = [
     "REGISTA_DSN",
     "REGISTA_KEY_PATH",
+    "REGISTA_KEY_REF",
     "CAIRN_PROJECT",
     "CAIRN_HARNESS_NAME",
     "CAIRN_HARNESS_VERSION",
@@ -115,6 +133,7 @@ def _env_values(cfg: Any, harness: str) -> dict[str, str | None]:
     vals: dict[str, str | None] = {
         "REGISTA_DSN": cfg.dsn,
         "REGISTA_KEY_PATH": cfg.key_path,
+        "REGISTA_KEY_REF": cfg.key_ref,
         "CAIRN_PROJECT": cfg.project,
         "CAIRN_HARNESS_NAME": harness,
         "CAIRN_HARNESS_VERSION": cfg.harness_version,

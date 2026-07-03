@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-exec /projects/agent-provenance/.venv/bin/python -m cairn._bridge
+exec python3 -m cairn._bridge

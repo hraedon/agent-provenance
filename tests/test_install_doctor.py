@@ -25,6 +25,7 @@ def cfg(tmp_path: Path) -> CairnEnvConfig:
     return CairnEnvConfig(
         dsn="postgresql://user:pw@host/db",
         key_path=str(tmp_path / "keys.json"),
+        key_ref=None,
         project="test_project",
         harness_name="claude-code",
         harness_version="1.0.0",
@@ -269,8 +270,34 @@ def test_resolve_config_missing():
     cfg = CairnEnvConfig()
     assert not cfg.is_configured
     assert "DSN" in cfg.missing()
-    assert "KEY_PATH" in cfg.missing()
+    assert "KEY_PATH or KEY_REF" in cfg.missing()
     assert "PROJECT" in cfg.missing()
+
+
+def test_resolve_config_key_ref(monkeypatch):
+    """key_ref satisfies is_configured without key_path."""
+    cfg = CairnEnvConfig(
+        dsn="postgresql://x@h/db",
+        key_ref="env:MY_SECRET_KEY",
+        project="proj",
+    )
+    assert cfg.is_configured
+    assert cfg.missing() == []
+
+
+def test_cairn_env_config_key_ref_in_doctor(monkeypatch):
+    """Doctor reports key_ref as pass when resolvable."""
+    cfg = CairnEnvConfig(
+        dsn="postgresql://x@h/db",
+        key_ref="env:MY_SECRET_KEY",
+        project="proj",
+    )
+    monkeypatch.setattr("cairn._doctor.resolve_config", lambda: cfg)
+    monkeypatch.setenv("MY_SECRET_KEY", "test-secret-value")
+    from cairn._doctor import _check_key_file
+    result = _check_key_file(cfg)
+    assert result["status"] == "pass"
+    assert "key_ref" in result["detail"]
 
 
 # ----------------------------------------------------------------------
