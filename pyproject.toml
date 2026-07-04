@@ -63,3 +63,9 @@ python_version = "3.11"
 strict = true
 warn_return_any = true
 warn_unused_ignores = true
+
+# regista is a sibling repo without a py.typed marker. Ignore its missing
+# stubs rather than letting them fail the CI type-check gate.
+[[tool.mypy.overrides]]
+module = ["regista", "regista.*"]
+ignore_missing_imports = true
