@@ -1,5 +1,14 @@
 import { spawn } from "node:child_process";
-import { mkdirSync, appendFileSync, chmodSync, readFileSync } from "node:fs";
+import {
+  mkdirSync,
+  appendFileSync,
+  chmodSync,
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  unlinkSync,
+  existsSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
@@ -61,6 +70,22 @@ const DEFAULT_MAX_SESSION_ENTRIES = (() => {
 })();
 
 const DEFAULT_STATE_DIR = process.env.CAIRN_STATE_DIR ?? join(tmpdir(), "cairn-sessions");
+
+// Entries older than this on plugin startup are treated as orphans left by a
+// prior process that crashed mid-tool-call. Their matching ``after`` hook will
+// never fire (the call died with the process), so they are recorded as
+// degradations and dropped from the in-memory map instead of lingering.
+// 30 minutes is generous: tool calls rarely span that, and a session that
+// resumes after a crash will re-issue calls under new call IDs.
+const INFLIGHT_STALENESS_MS = (() => {
+  const v = parseInt(process.env.CAIRN_INFLIGHT_STALENESS_MS ?? "1800000", 10);
+  return Number.isFinite(v) && v > 0 ? v : 1800000;
+})();
+
+// Subdirectory (under each session's state dir) holding one JSON file per
+// in-flight tool call. A per-session layout keeps a restart's recovery scoped
+// and reuses the existing 0o700 session-state perms.
+const INFLIGHT_SUBDIR = "inflight";
 
 /**
  * Parse a boolean env var (WI-012).
@@ -157,6 +182,163 @@ export function markDegraded(sessionId, action, detail, stateDirOverride) {
   const entry = JSON.stringify({ ts, action, detail }) + "\n";
   const marker = join(dir, "degradation.log");
   appendFileSync(marker, entry, { mode: 0o600 });
+}
+
+/**
+ * Sanitize an arbitrary string for safe use as a filename component.
+ * @param {string} s
+ * @returns {string}
+ */
+function safeName(s) {
+  let out = String(s).replace(/[^a-zA-Z0-9._-]/g, "_");
+  if (out === "." || out === "..") out = "_";
+  return out;
+}
+
+/**
+ * Map a session-map key (``${sessionId}:${callID}``) to a collision-free
+ * filename stem. Two distinct keys must never collapse to the same file
+ * (adversarial review H1): a lossy character substitution like ``safeName``
+ * would let ``a:b`` and ``a_b`` clobber each other's in-flight entry. We
+ * therefore hash the *original* key with SHA-256 and use the hex digest as
+ * the stem. The original key is also stored inside the JSON entry so
+ * recovery can reconstruct the canonical session-map key without relying
+ * on the (now opaque) filename.
+ *
+ * @param {string} key
+ * @returns {string}
+ */
+function inflightFileName(key) {
+  return createHash("sha256").update(String(key)).digest("hex") + ".json";
+}
+
+/**
+ * Resolve the in-flight directory for a given session.
+ *
+ * @param {string} sessionId
+ * @param {string} [stateDirOverride]
+ * @returns {string}
+ */
+function inflightDir(sessionId, stateDirOverride) {
+  const dir = join(stateDir(sessionId, stateDirOverride), INFLIGHT_SUBDIR);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    // best-effort
+  }
+  return dir;
+}
+
+/**
+ * Persist an in-flight tool-call entry to disk so a plugin restart can
+ * recover it (WI-024).  The entry is written as
+ * ``<session-state>/inflight/<sha256(key)>.json`` with 0o600 perms.
+ *
+ * @param {string} key  the ``${sessionID}:${callID}`` session-map key
+ * @param {Record<string, unknown>} entry
+ * @param {string} sessionId
+ * @param {string} [stateDirOverride]
+ */
+export function persistInFlightEntry(key, entry, sessionId, stateDirOverride) {
+  const dir = inflightDir(sessionId, stateDirOverride);
+  const file = join(dir, inflightFileName(key));
+  try {
+    writeFileSync(file, JSON.stringify(entry) + "\n", { mode: 0o600 });
+  } catch {
+    // Persistence is best-effort; if it fails the entry still lives in the
+    // in-memory map and a restart simply cannot recover it. Record the gap
+    // so an auditor can discover it (adversarial review L10).
+    markDegraded(
+      sessionId,
+      "persist",
+      `could not persist in-flight entry for ${entry.tool ?? "unknown"} ` +
+        `(work_item ${entry.workItemId ?? "?"}); a restart will not recover it`,
+      stateDirOverride,
+    );
+  }
+}
+
+/**
+ * Remove a persisted in-flight entry once the matching ``end`` has been
+ * recorded (WI-024).  Missing file is a no-op.
+ *
+ * @param {string} key
+ * @param {string} sessionId
+ * @param {string} [stateDirOverride]
+ */
+export function removeInFlightEntry(key, sessionId, stateDirOverride) {
+  const dir = inflightDir(sessionId, stateDirOverride);
+  const file = join(dir, inflightFileName(key));
+  try {
+    unlinkSync(file);
+  } catch {
+    // already gone or never persisted — fine
+  }
+}
+
+/**
+ * Load all persisted in-flight entries for a session (WI-024).  Returns a
+ * list of ``{ key, entry }`` pairs.  Files that fail to parse are skipped
+ * (best-effort recovery; a corrupt entry is logged via markDegraded so the
+ * gap is discoverable).  Entries whose ``sessionId`` does not match the
+ * directory they were loaded from are treated as corrupt (adversarial
+ * review H2).
+ *
+ * The ``key`` returned is reconstructed from ``entry.sessionId`` and
+ * ``entry.callID`` (the canonical session-map key), NOT from the filename —
+ * the filename is an opaque SHA-256 digest and is not reversible.
+ *
+ * @param {string} sessionId
+ * @param {string} [stateDirOverride]
+ * @returns {{ key: string, entry: Record<string, unknown> }[]}
+ */
+export function loadInFlightEntries(sessionId, stateDirOverride) {
+  const base = stateDirOverride || DEFAULT_STATE_DIR;
+  const dir = join(base, safeSessionId(sessionId), INFLIGHT_SUBDIR);
+  if (!existsSync(dir)) return [];
+  const out = [];
+  let files;
+  try {
+    files = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  for (const f of files) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const raw = readFileSync(join(dir, f), "utf8");
+      const entry = JSON.parse(raw);
+      if (!entry || typeof entry !== "object") {
+        throw new Error("not an object");
+      }
+      // Validate the entry belongs to this session (adversarial review H2).
+      if (
+        typeof entry.sessionId !== "string" ||
+        typeof entry.callID !== "string" ||
+        entry.sessionId !== sessionId
+      ) {
+        markDegraded(
+          sessionId,
+          "recover",
+          `in-flight entry file ${f} has a sessionId/callID that does not ` +
+            `match its directory; treating it as corrupt and skipping`,
+          stateDirOverride,
+        );
+        continue;
+      }
+      out.push({ key: `${entry.sessionId}:${entry.callID}`, entry });
+    } catch {
+      markDegraded(
+        sessionId,
+        "recover",
+        `in-flight entry file ${f} could not be parsed; orphan from prior ` +
+          `process may be undiscoverable`,
+        stateDirOverride,
+      );
+    }
+  }
+  return out;
 }
 
 /**
@@ -338,6 +520,56 @@ export default async function cairnPlugin(ctx) {
   const client = ctx?.client ?? null;
   const stateDirOverride = ctx?.stateDir ?? null;
 
+  // WI-024: recover in-flight entries persisted by a prior (crashed) plugin
+  // instance. Each session's state dir may hold ``inflight/*.json`` files;
+  // we seed the in-memory map from them so a pending ``after`` hook can
+  // still close the work item. Entries older than the staleness threshold
+  // are recorded as degraded orphans (their ``after`` will never fire) and
+  // dropped from disk so they are not re-recovered on the next restart.
+  {
+    const baseDir = stateDirOverride || DEFAULT_STATE_DIR;
+    let sessionDirs;
+    try {
+      sessionDirs = readdirSync(baseDir, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => d.name);
+    } catch {
+      sessionDirs = [];
+    }
+    for (const sd of sessionDirs) {
+      for (const { key, entry } of loadInFlightEntries(sd, stateDirOverride)) {
+        const beganAt = entry.beganAt ? Date.parse(entry.beganAt) : NaN;
+        const age = Number.isFinite(beganAt) ? Date.now() - beganAt : Infinity;
+        if (age > INFLIGHT_STALENESS_MS) {
+          markDegraded(
+            sd,
+            "orphan_restart",
+            `in-flight begin for ${entry.tool ?? "unknown"} ` +
+              `(work_item ${entry.workItemId ?? "?"}) was still open when the ` +
+              `plugin restarted and is older than the staleness threshold ` +
+              `(${Math.round(INFLIGHT_STALENESS_MS / 1000)}s); its end event will ` +
+              `never fire — recorded as an orphan (WI-024)`,
+            stateDirOverride,
+          );
+          // Remove the stale file so it is not re-recovered next restart.
+          removeInFlightEntry(key, sd, stateDirOverride);
+          logTo(
+            client,
+            `[cairn] recovered stale in-flight begin for ${entry.tool ?? "unknown"} ` +
+              `(work_item ${entry.workItemId ?? "?"}) — recorded as orphan`,
+          );
+        } else {
+          sessionMap.set(key, entry);
+          logTo(
+            client,
+            `[cairn] recovered in-flight begin for ${entry.tool ?? "unknown"} ` +
+              `(work_item ${entry.workItemId ?? "?"}) from prior process`,
+          );
+        }
+      }
+    }
+  }
+
   return {
     "tool.execute.before": async (input, output) => {
       const { tool, sessionID, callID } = input;
@@ -350,17 +582,25 @@ export default async function cairnPlugin(ctx) {
       );
 
       if (reply?.status === "ok" && reply.work_item_id) {
-        const { evictedKey, evicted } = sessionMap.set(`${sessionID}:${callID}`, {
+        const entry = {
           workItemId: reply.work_item_id,
           tool,
           sessionId: sessionID,
           callID,
           beganAt: new Date().toISOString(),
-        });
+        };
+        const { evictedKey, evicted } = sessionMap.set(`${sessionID}:${callID}`, entry);
+        // WI-024: persist so a plugin restart can recover this in-flight call.
+        persistInFlightEntry(`${sessionID}:${callID}`, entry, sessionID, stateDirOverride);
         // If evicting an unclosed begin, record it so the orphan is
         // discoverable.  (An evicted entry always had a successful begin and
         // no matching end — that is precisely an orphaned work item.)
         if (evicted && evicted.sessionId) {
+          removeInFlightEntry(
+            `${evicted.sessionId}:${evicted.callID ?? ""}`,
+            evicted.sessionId,
+            stateDirOverride,
+          );
           markDegraded(
             evicted.sessionId,
             "evicted",
@@ -419,6 +659,8 @@ export default async function cairnPlugin(ctx) {
 
       if (reply?.status === "ok") {
         logTo(client, `[cairn] end ${tool} → work_item ${entry.workItemId}`);
+        // WI-024: the call closed cleanly; drop the persisted in-flight entry.
+        removeInFlightEntry(key, sessionID, stateDirOverride);
       } else {
         // BC-022: the end event was lost.  The begin is now an orphan — a
         // real provenance gap.  Record it durably so an auditor can find it
@@ -437,6 +679,10 @@ export default async function cairnPlugin(ctx) {
       }
 
       sessionMap.delete(key);
+      // WI-024: the in-flight file is removed only on a *successful* end
+      // (above). On a failed end the begin is an orphan, but we keep the
+      // persisted entry so a future restart can still recover and surface it
+      // rather than silently losing it (adversarial review H3).
     },
 
     event: async ({ event }) => {

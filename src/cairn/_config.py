@@ -36,9 +36,15 @@ def _parse_bool(val: str | None) -> bool:
         return False
     return val.strip().lower() in ("1", "true", "yes", "on")
 
-_SUITE_ENV_PATHS = [    Path(os.environ.get("AGENT_SUITE_CONFIG", "")),
-    Path.home() / ".config" / "agent-suite" / "suite.env",
-    Path("/etc/agent-suite/suite.env"),
+_suite_config = os.environ.get("AGENT_SUITE_CONFIG")
+_SUITE_ENV_PATHS = [
+    p
+    for p in [
+        Path(_suite_config) if _suite_config and _suite_config.strip() else None,
+        Path.home() / ".config" / "agent-suite" / "suite.env",
+        Path("/etc/agent-suite/suite.env"),
+    ]
+    if p is not None
 ]
 
 

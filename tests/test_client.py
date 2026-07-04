@@ -7,40 +7,15 @@ import uuid
 from pathlib import Path
 
 import pytest
-from regista import Regista
 
 from cairn.client import CairnClient, ToolCallContext
 
 # ----------------------------------------------------------------------
 # Fixtures
 # ----------------------------------------------------------------------
-
-
-@pytest.fixture
-def dsn() -> str:
-    return os.environ.get(
-        "REGISTA_TEST_DSN",
-        "postgresql://regista_test:regista_test@localhost/regista_test",
-    )
-
-
-@pytest.fixture
-def project() -> str:
-    return f"cairn_client_test_{uuid.uuid4().hex[:8]}"
-
-
-@pytest.fixture
-def regista_instance(dsn: str, project: str, hmac_keys: Path) -> Regista:
-    try:
-        sub = Regista.create_project(
-            dsn=dsn,
-            project=project,
-            hmac_key_path=str(hmac_keys),
-        )
-    except Exception:
-        pytest.skip("Postgres not available; set REGISTA_TEST_DSN to run")
-    yield sub
-    sub.close()
+# ``dsn``, ``project``, ``hmac_keys``, and ``regista_instance`` are provided
+# by conftest.py (single source). The pre-check in conftest skips fast when
+# Postgres is unreachable (WI-001).
 
 
 @pytest.fixture

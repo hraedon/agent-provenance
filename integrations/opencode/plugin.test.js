@@ -6,9 +6,17 @@ import {
   writeFileSync,
   chmodSync,
   existsSync,
+  mkdirSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
+
+// Compute the collision-free in-flight filename the plugin uses (WI-024 /
+// adversarial review H1). Mirrors ``inflightFileName`` in index.js.
+function inflightFile(sessionId, callID) {
+  return createHash("sha256").update(`${sessionId}:${callID}`).digest("hex") + ".json";
+}
 
 import cairnPlugin from "./index.js";
 
@@ -165,6 +173,148 @@ process.stdout.write(JSON.stringify(out) + "\\n");`,
       );
       expect(existsSync(join(sub, "sess-happy", "degradation.log"))).toBe(false);
       expect(plugin._sessionMapSize()).toBe(0);
+    } finally {
+      process.env.CAIRN_BRIDGE_PATH = saved;
+      rmSync(sub, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("WI-024: in-flight work items survive a plugin restart", async () => {
+  test("begin persists an in-flight entry that a fresh plugin recovers", async () => {
+    const sub = mkdtempSync(join(tmpdir(), "cairn-restart-"));
+    const okBridge = join(sub, "ok.mjs");
+    writeBridge(
+      okBridge,
+      `import { readFileSync } from "node:fs";
+const msg = JSON.parse(readFileSync(0, "utf8"));
+const out = msg.action === "begin"
+  ? { status: "ok", work_item_id: "00000000-0000-0000-0000-000000000003", args_hash: "sha256:beef" }
+  : { status: "ok", event_id: "ev-" + msg.action };
+process.stdout.write(JSON.stringify(out) + "\\n");`,
+    );
+    const saved = process.env.CAIRN_BRIDGE_PATH;
+    process.env.CAIRN_BRIDGE_PATH = okBridge;
+    try {
+      // First "process": begin succeeds, creating a persisted in-flight entry.
+      const p1 = await cairnPlugin({ client: mkClient([]), stateDir: sub });
+      await p1["tool.execute.before"](
+        { tool: "Write", sessionID: "sess-restart", callID: "c9" },
+        { args: { filePath: join(sub, "x.txt"), content: "y" } },
+      );
+      // An in-flight file now exists on disk (hash-named, collision-free).
+      const file = inflightFile("sess-restart", "c9");
+      const inflightFile2 = join(sub, "sess-restart", "inflight", file);
+      expect(existsSync(inflightFile2)).toBe(true);
+
+      // Simulate a restart: drop p1, instantiate a fresh plugin against the
+      // same state dir. The recovery loop should re-seed the in-memory map.
+      const p2 = await cairnPlugin({ client: mkClient([]), stateDir: sub });
+      expect(p2._sessionMapSize()).toBe(1);
+
+      // The recovered entry lets the after hook close the work item cleanly.
+      await p2["tool.execute.after"](
+        { tool: "Write", sessionID: "sess-restart", callID: "c9", args: { filePath: "/tmp/x" } },
+        { output: "written", result: { exit_code: 0 } },
+      );
+      expect(p2._sessionMapSize()).toBe(0);
+      // Clean close removes the in-flight file.
+      expect(existsSync(inflightFile2)).toBe(false);
+      // No degradation on a successful recovery + close.
+      expect(existsSync(join(sub, "sess-restart", "degradation.log"))).toBe(false);
+    } finally {
+      process.env.CAIRN_BRIDGE_PATH = saved;
+      rmSync(sub, { recursive: true, force: true });
+    }
+  });
+
+  test("stale in-flight entries from a crashed process are recorded as orphans", async () => {
+    const sub = mkdtempSync(join(tmpdir(), "cairn-stale-"));
+    const okBridge = join(sub, "ok.mjs");
+    writeBridge(
+      okBridge,
+      `import { readFileSync } from "node:fs";
+const msg = JSON.parse(readFileSync(0, "utf8"));
+const out = msg.action === "begin"
+  ? { status: "ok", work_item_id: "00000000-0000-0000-0000-000000000004", args_hash: "sha256:old" }
+  : { status: "ok", event_id: "ev-" + msg.action };
+process.stdout.write(JSON.stringify(out) + "\\n");`,
+    );
+    const saved = process.env.CAIRN_BRIDGE_PATH;
+    process.env.CAIRN_BRIDGE_PATH = okBridge;
+    try {
+      // Manually plant a stale in-flight entry that predates the staleness
+      // threshold, simulating a begin from a process that crashed long ago.
+      const staleDir = join(sub, "sess-stale", "inflight");
+      mkdirSync(staleDir, { recursive: true });
+      const old = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // 2h ago
+      const staleFile = join(staleDir, inflightFile("sess-stale", "c1"));
+      writeFileSync(
+        staleFile,
+        JSON.stringify({
+          workItemId: "00000000-0000-0000-0000-000000000004",
+          tool: "Edit",
+          sessionId: "sess-stale",
+          callID: "c1",
+          beganAt: old,
+        }) + "\n",
+      );
+
+      const logs = [];
+      const plugin = await cairnPlugin({ client: mkClient(logs), stateDir: sub });
+      // The stale entry was not re-seeded into the in-memory map...
+      expect(plugin._sessionMapSize()).toBe(0);
+      // ...but it was recorded as a degraded orphan.
+      const logPath = join(sub, "sess-stale", "degradation.log");
+      expect(existsSync(logPath)).toBe(true);
+      const entries = readFileSync(logPath, "utf8").trim().split("\n").map(JSON.parse);
+      const orphan = entries.find((e) => e.action === "orphan_restart");
+      expect(orphan).toBeDefined();
+      expect(orphan.detail).toContain("Edit");
+      expect(orphan.detail).toMatch(/orphan/i);
+      // The stale in-flight file was removed so it isn't re-recovered.
+      expect(existsSync(staleFile)).toBe(false);
+    } finally {
+      process.env.CAIRN_BRIDGE_PATH = saved;
+      rmSync(sub, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed end keeps the in-flight file so a restart can surface the orphan", async () => {
+    // Adversarial review H3: after a failed end the begin is an orphan, but
+    // the persisted entry must survive so a restart's staleness sweep can
+    // record it rather than silently losing it.
+    const sub = mkdtempSync(join(tmpdir(), "cairn-failedend-"));
+    const beginOnlyBridge = join(sub, "bo.mjs");
+    writeBridge(
+      beginOnlyBridge,
+      `import { readFileSync } from "node:fs";
+const msg = JSON.parse(readFileSync(0, "utf8"));
+if (msg.action === "begin") {
+  process.stdout.write(JSON.stringify({ status: "ok", work_item_id: "00000000-0000-0000-0000-000000000005", args_hash: "sha256:f" }) + "\\n");
+} else if (msg.action === "end") {
+  process.stderr.write("end fails\\n");
+  process.exit(1);
+} else {
+  process.stdout.write(JSON.stringify({ status: "ok", event_id: "ev" }) + "\\n");
+}`,
+    );
+    const saved = process.env.CAIRN_BRIDGE_PATH;
+    process.env.CAIRN_BRIDGE_PATH = beginOnlyBridge;
+    try {
+      const p1 = await cairnPlugin({ client: mkClient([]), stateDir: sub });
+      await p1["tool.execute.before"](
+        { tool: "Bash", sessionID: "sess-fe", callID: "c1" },
+        { args: { command: "true" } },
+      );
+      await p1["tool.execute.after"](
+        { tool: "Bash", sessionID: "sess-fe", callID: "c1", args: { command: "true" } },
+        { output: "", result: { exit_code: 0 } },
+      );
+      // The end failed; the in-memory entry was removed but the file must
+      // persist so a restart can recover/surface it.
+      const file = join(sub, "sess-fe", "inflight", inflightFile("sess-fe", "c1"));
+      expect(existsSync(file)).toBe(true);
     } finally {
       process.env.CAIRN_BRIDGE_PATH = saved;
       rmSync(sub, { recursive: true, force: true });

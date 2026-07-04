@@ -108,14 +108,33 @@ In rough order. Do not assume any of these are done; check on entry.
    an auditor-ready report.
    **Done: `src/cairn/verifier.py` + CLI `cairn verify`.**
 
-## Current status (last updated 2026-07-03)
+## Current status (last updated 2026-07-04)
 
-- **Tests**: 209 Python passing (3 skipped — Postgres-dependent)
-  + 24 Bun tests for the OpenCode plugin (helpers + BC-022 integration coverage).
+- **Tests**: 217 Python passing (12 skipped — Postgres-dependent)
+  + 27 Bun tests for the OpenCode plugin (helpers + BC-022 integration +
+  WI-024 in-flight persistence/recovery coverage).
   asn1crypto + pynacl in dev dependencies.
 - **Lint**: ruff clean; mypy clean (pre-existing regista import-untyped errors only).
 - **CI**: `.github/workflows/ci.yml` — Python job (ruff + mypy + pytest + identifier-gate)
   and a Bun job (`bun test` in `integrations/opencode`) + `Makefile`.
+- **Gaps closed this session**: WI-001 (test hangs — regista pool retries auth
+  failures indefinitely; added `_postgres_reachable` pre-check with one-shot
+  `psycopg.connect(connect_timeout=2)` so fixtures skip fast; helpers
+  centralized in `tests/_dbutil.py`, conftest is single source for
+  `regista_instance`/`dsn`/`project`); WI-024 (OpenCode plugin in-flight work
+  items lost on restart — persisted to per-session `inflight/<sha256(key)>.json`
+  files, recovered on startup with staleness sweep; collision-free filenames,
+  failed-end entries kept for recovery; 3 new JS tests).
+- **Adversarial review this session**: two parallel reviewers (kimi + glm)
+  on WI-024 + test-hang fix. Findings addressed: collision-free SHA-256
+  filenames (was lossy `safeName`), failed-end file retention (was
+  unconditionally deleted breaking recovery), sessionId validation against
+  directory, fixture dedup (removed 3 duplicate `regista_instance` overrides),
+  import fragility (`from tests.conftest` → `tests/_dbutil.py` plain module),
+  persistence-failure degradation logging, config whitespace robustness.
+- **Verified in_review**: WI-013/WI-016/WI-018/WI-020/WI-021/WI-022/WI-023
+  implementation confirmed present; remain in_review for cross-lineage
+  adversarial accept (strict gate blocks same-actor self-review).
 - **Plan 008 status**: All WIs complete. WI-1.1 (Claude Code hook parity),
   WI-1.2 (install-harness/uninstall-harness CLI), WI-2.1 (REGISTA_*/CAIRN_* config
   precedence + doctor --json), WI-3.1 (attestation gap detection + verify_bundle_filtered
