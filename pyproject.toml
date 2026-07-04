@@ -34,6 +34,7 @@ dev = [
     "mypy>=1.10",
     "asn1crypto>=1.5",
     "pynacl>=1.5",
+    "cryptography>=42.0",
 ]
 
 [project.scripts]
