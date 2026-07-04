@@ -135,12 +135,19 @@ class Verifier:
         "auditor_attestation",
     }
 
+    # Default size limits to defend against OOM / zip-bomb bundles (WI-021).
+    # 512 MB max bundle file size; 1_000_000 max events per bundle.
+    _DEFAULT_MAX_BUNDLE_BYTES: ClassVar[int] = 512 * 1024 * 1024
+    _DEFAULT_MAX_EVENTS: ClassVar[int] = 1_000_000
+
     def __init__(
         self,
         key_set: dict[str, bytes],
         key_metadata: dict[str, dict[str, Any]] | None = None,
         tsa_cert_path: str | None = None,
         witness_keys: dict[str, bytes] | None = None,
+        max_bundle_size_bytes: int | None = None,
+        max_events: int | None = None,
     ) -> None:
         """
         Args:
@@ -161,11 +168,29 @@ class Verifier:
                 signatures do not count toward witness coverage.  When
                 omitted, receipt signatures are not checked (a warning is
                 emitted if any receipts have signatures).
+            max_bundle_size_bytes: Maximum bundle file size in bytes.
+                Bundles exceeding this are rejected before parsing to
+                prevent OOM (WI-021).  ``None`` uses the default (512 MB).
+            max_events: Maximum number of events per bundle.  Bundles
+                with more events are rejected after loading (WI-021).
+                ``None`` uses the default (1 000 000).
         """
         self._keys = key_set
         self._key_meta = key_metadata or {}
         self._tsa_cert_path = tsa_cert_path
         self._witness_keys = witness_keys or {}
+        self._max_bundle_bytes = (
+            max_bundle_size_bytes
+            if max_bundle_size_bytes is not None
+            else self._DEFAULT_MAX_BUNDLE_BYTES
+        )
+        self._max_events = (
+            max_events if max_events is not None else self._DEFAULT_MAX_EVENTS
+        )
+        if self._max_bundle_bytes < 0:
+            raise ValueError("max_bundle_size_bytes must be non-negative")
+        if self._max_events < 0:
+            raise ValueError("max_events must be non-negative")
         # Per-batch claimed event_ids, captured during _accumulate_timestamp_batches
         # so _verify_timestamp_signatures can recompute Merkle roots (BC-015).
         self._batch_claimed_ids: dict[str, list[str]] = {}
@@ -267,7 +292,26 @@ class Verifier:
         should be returned as the verification result.
         """
         try:
-            raw = json.loads(path.read_text())
+            file_size = path.stat().st_size
+        except OSError as exc:
+            report = VerificationReport()
+            report.bundle_hash_ok = False
+            report.bundle_hash_detail = f"Cannot stat bundle: {exc}"
+            return {}, [], {}, report
+
+        if file_size > self._max_bundle_bytes:
+            report = VerificationReport()
+            report.bundle_hash_ok = False
+            report.bundle_hash_detail = (
+                f"Bundle file size ({file_size} bytes) exceeds maximum "
+                f"({self._max_bundle_bytes} bytes). "
+                f"Adjust max_bundle_size_bytes if this is expected (WI-021)."
+            )
+            return {}, [], {}, report
+
+        try:
+            with open(path, "rb") as f:
+                raw = json.loads(f.read())
         except (json.JSONDecodeError, OSError) as exc:
             report = VerificationReport()
             report.bundle_hash_ok = False
@@ -279,6 +323,16 @@ class Verifier:
             report.bundle_hash_ok = False
             report.bundle_hash_detail = (
                 "Malformed bundle: expected a JSON object with an 'events' list"
+            )
+            return {}, [], {}, report
+
+        if len(raw["events"]) > self._max_events:
+            report = VerificationReport()
+            report.bundle_hash_ok = False
+            report.bundle_hash_detail = (
+                f"Bundle contains {len(raw['events'])} events, exceeding the "
+                f"maximum ({self._max_events}). "
+                f"Adjust max_events if this is expected (WI-021)."
             )
             return {}, [], {}, report
 
@@ -379,9 +433,27 @@ class Verifier:
         report.attestation_gaps.clear()
         self._check_attestation_gaps(filtered, report, attested_sessions=all_attested)
 
-        # Timestamp batches: load for coverage info but skip signature
-        # verification (Merkle root covers the full batch, not the subset).
+        # Timestamp batches: accumulate for coverage info but mark
+        # signature verification as not-checked — the Merkle root covers
+        # the full batch, not the filtered subset, so a filtered bundle's
+        # TSA tokens cannot be cryptographically bound to its events
+        # (WI-020). Use verified=None (not checked) rather than False
+        # (failed) to distinguish "skipped" from "attempted and failed."
         self._accumulate_timestamp_batches(raw, filtered, report)
+        _detail = (
+            "TSA signature verification skipped in filtered mode: "
+            "the Merkle root covers the full batch, not the filtered "
+            "subset. Re-verify with an unfiltered bundle to check TSA "
+            "signatures (WI-020)."
+        )
+        updated_batches = [
+            replace(e, verified=None, verification_detail=_detail)
+            if e.status == "confirmed"
+            else e
+            for e in report.timestamp_batches
+        ]
+        report.timestamp_batches.clear()
+        report.timestamp_batches.extend(updated_batches)
 
         self._accumulate_witness_data(raw, filtered, report)
         self._verify_witness_signatures(filtered, report)
@@ -2163,6 +2235,14 @@ class Verifier:
         Bundles must be ordered oldest-first.  Verifies that each bundle's
         ``previous_bundle_hash`` matches the computed hash of the preceding
         bundle, and that all events within each bundle verify.
+
+        Additionally verifies the cross-bundle *event-level* hash chain
+        (WI-022): the first event in bundle N+1 that carries
+        ``prev_global_event_hash`` must chain to the last event in bundle N
+        via ``sha256(prev.canonical_envelope + prev.signature)``.  This
+        prevents an attacker from creating a bundle with a valid
+        ``previous_bundle_hash`` but events that don't actually chain at
+        the event level.
         """
         if not bundle_paths:
             report = VerificationReport()
@@ -2171,12 +2251,18 @@ class Verifier:
 
         reports: list[VerificationReport] = []
         prev_hash: str | None = None
+        # Last event's hash from the previous bundle, for cross-bundle
+        # event-level chain verification (WI-022).
+        prev_last_event_hash: bytes | None = None
+        # Whether the previous bundle used the global hash chain at all.
+        prev_used_global_chain: bool = False
 
         for path in bundle_paths:
             raw, events, manifest, error_report = self._load_bundle(Path(path))
             if error_report is not None:
                 reports.append(error_report)
                 prev_hash = None
+                prev_last_event_hash = None
                 continue
 
             computed_hash = self._compute_bundle_hash(raw, manifest)
@@ -2184,7 +2270,7 @@ class Verifier:
             report = self._verify_loaded_bundle(raw, events, manifest)
             reports.append(report)
 
-            # Check chain link
+            # Check manifest-level chain link
             claimed_prev = manifest.get("previous_bundle_hash")
             if prev_hash is not None and claimed_prev != prev_hash:
                 report.chain_integrity_ok = False
@@ -2194,6 +2280,75 @@ class Verifier:
                     expected_prev=prev_hash,
                     claimed_prev=claimed_prev,
                 )
+
+            # Check cross-bundle event-level hash chain (WI-022).
+            if prev_last_event_hash is not None and events:
+                first_ev = events[0]
+                if first_ev.prev_global_event_hash is None:
+                    # Only flag as a violation if the previous bundle used
+                    # the global hash chain. Events from older regista
+                    # versions may not have prev_global_event_hash.
+                    if prev_used_global_chain:
+                        report.chain_integrity_ok = False
+                        report.chain_contiguity_violations.append(
+                            ChainContiguityViolation(
+                                kind="cross_bundle_missing_link",
+                                detail=(
+                                    f"First event {first_ev.event_id} in {path} "
+                                    "lacks prev_global_event_hash — cannot verify "
+                                    "cross-bundle event chain (WI-022)."
+                                ),
+                                event_id=str(first_ev.event_id),
+                                work_item_id=str(first_ev.work_item_id),
+                            )
+                        )
+                else:
+                    actual = bytes(first_ev.prev_global_event_hash)
+                    if actual != prev_last_event_hash:
+                        report.chain_integrity_ok = False
+                        report.chain_contiguity_violations.append(
+                            ChainContiguityViolation(
+                                kind="cross_bundle_hash_mismatch",
+                                detail=(
+                                    f"Cross-bundle event hash chain broken: "
+                                    f"first event {first_ev.event_id} in "
+                                    f"{path} chains to "
+                                    f"{actual.hex()[:16]}... but the last "
+                                    f"event in the preceding bundle hashes to "
+                                    f"{prev_last_event_hash.hex()[:16]}... "
+                                    f"(WI-022)."
+                                ),
+                                event_id=str(first_ev.event_id),
+                                work_item_id=str(first_ev.work_item_id),
+                                expected=prev_last_event_hash.hex(),
+                                actual=actual.hex(),
+                            )
+                        )
+                        log.error(
+                            "cairn.cross_bundle_chain_broken",
+                            bundle=str(path),
+                            event_id=str(first_ev.event_id),
+                            expected=prev_last_event_hash.hex()[:16],
+                            actual=actual.hex()[:16],
+                        )
+
+            # Track whether this bundle uses the global hash chain.
+            used_global_chain = any(
+                ev.prev_global_event_hash is not None for ev in events
+            )
+
+            # Capture the last event's hash for the next bundle's chain check.
+            if events:
+                last_ev = events[-1]
+                if last_ev.canonical_envelope and last_ev.signature:
+                    prev_last_event_hash = hashlib.sha256(
+                        bytes(last_ev.canonical_envelope) + bytes(last_ev.signature)
+                    ).digest()
+                else:
+                    prev_last_event_hash = None
+                prev_used_global_chain = used_global_chain
+            # Empty bundle: carry forward prev_last_event_hash unchanged.
+            # An empty bundle contributes no events to the global chain.
 
             prev_hash = computed_hash
 
@@ -2259,6 +2414,17 @@ class Verifier:
                 if gap.session_id not in all_attested_session_ids
             ]
 
+        # Set chain_integrity_ok to True if chain was verified and passed.
+        if (
+            merged.chain_integrity_ok is None
+            and len(bundle_paths) > 1
+            and not any(
+                v.kind.startswith("cross_bundle")
+                for v in merged.chain_contiguity_violations
+            )
+        ):
+            merged.chain_integrity_ok = True
+
         return merged
 
     # ------------------------------------------------------------------
@@ -2275,8 +2441,16 @@ class Verifier:
         Bundles are compared by event_id (set difference), file provenance,
         scope attestations, and manifest metadata.
         """
-        older_raw = json.loads(Path(older_path).read_text())
-        newer_raw = json.loads(Path(newer_path).read_text())
+        older_raw, _older_events, older_manifest, older_err = self._load_bundle(
+            Path(older_path)
+        )
+        newer_raw, _newer_events, newer_manifest, newer_err = self._load_bundle(
+            Path(newer_path)
+        )
+        if older_err is not None:
+            raise ValueError(f"Cannot load older bundle: {older_err.bundle_hash_detail}")
+        if newer_err is not None:
+            raise ValueError(f"Cannot load newer bundle: {newer_err.bundle_hash_detail}")
 
         older_events = older_raw.get("events", [])
         newer_events = newer_raw.get("events", [])

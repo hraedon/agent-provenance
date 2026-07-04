@@ -77,8 +77,69 @@ def _state_dir(session_id: str) -> Path:
 def _call_key(tool_name: str, tool_input: dict[str, Any]) -> str:
     canonical = json.dumps(tool_input, separators=(",", ":"), sort_keys=True)
     h = hashlib.sha256(canonical.encode()).hexdigest()[:16]
-    safe_tool = tool_name.replace("/", "_").replace("\\", "_")
+    safe_tool = re.sub(r"[^a-zA-Z0-9._-]", "_", tool_name)
     return f"{safe_tool}:{h}"
+
+
+def _next_state_file(state_dir: Path, key: str) -> Path:
+    """Find the next available state file for this call key (WI-023).
+
+    Repeated identical tool calls (same tool, same args) would collide on
+    the same ``{key}.json`` filename.  Instead we use ``{key}.{seq}.json``
+    where ``seq`` is a monotonically increasing integer, so each begin
+    gets a unique state file.  The matching post picks the oldest (FIFO).
+
+    Uses ``O_EXCL`` to handle concurrent pre hooks safely (adversarial
+    review H2): if two pre hooks race on the same seq, the loser retries
+    with the next seq.
+    """
+    prefix = f"{key}."
+    max_seq = 0
+    for f in state_dir.glob(f"{prefix}*.json"):
+        stem = f.stem
+        try:
+            seq = int(stem.rsplit(".", 1)[-1])
+            max_seq = max(max_seq, seq)
+        except ValueError:
+            continue
+    for attempt in range(max_seq + 1, max_seq + 100):
+        candidate = state_dir / f"{key}.{attempt}.json"
+        try:
+            fd = os.open(
+                str(candidate),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            os.close(fd)
+            return candidate
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"could not allocate state file for {key}")
+
+
+def _oldest_state_file(state_dir: Path, key: str) -> Path | None:
+    """Find the oldest state file for this call key (WI-023).
+
+    Returns ``None`` if no state file exists for this key.  Also checks
+    for the legacy ``{key}.json`` format (backward compat, adversarial
+    review H3).
+    """
+    legacy = state_dir / f"{key}.json"
+    if legacy.exists():
+        return legacy
+    prefix = f"{key}."
+    candidates: list[tuple[int, Path]] = []
+    for f in state_dir.glob(f"{prefix}*.json"):
+        stem = f.stem
+        try:
+            seq = int(stem.rsplit(".", 1)[-1])
+            candidates.append((seq, f))
+        except ValueError:
+            continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
 
 
 def _run_bridge(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -144,14 +205,13 @@ def handle_pre() -> None:
     )
 
     if reply and reply.get("status") == "ok":
+        wi_id = reply.get("work_item_id")
+        if not wi_id:
+            _mark_degraded(session_id, "pre", "bridge returned ok but no work_item_id")
+            return
         key = _call_key(tool_name, tool_input)
-        state_file = _state_dir(session_id) / f"{key}.json"
-        fd = os.open(
-            str(state_file),
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-            0o600,
-        )
-        with os.fdopen(fd, "w") as f:
+        state_file = _next_state_file(_state_dir(session_id), key)
+        with open(state_file, "w") as f:
             f.write(json.dumps(
                 {
                     "work_item_id": reply["work_item_id"],
@@ -171,9 +231,9 @@ def handle_post(*, failure: bool = False) -> None:
     tool_output = hook_input.get("tool_output", "")
 
     key = _call_key(tool_name, tool_input)
-    state_file = _state_dir(session_id) / f"{key}.json"
+    state_file = _oldest_state_file(_state_dir(session_id), key)
 
-    if not state_file.exists():
+    if state_file is None:
         _mark_degraded(session_id, "post", f"state file missing for {tool_name}")
         return
 
@@ -181,10 +241,18 @@ def handle_post(*, failure: bool = False) -> None:
         state = json.loads(state_file.read_text())
     except (json.JSONDecodeError, OSError):
         _mark_degraded(session_id, "post", f"state file unreadable for {tool_name}")
+        try:
+            state_file.unlink(missing_ok=True)
+        except OSError:
+            pass
         return
 
     work_item_id = state.get("work_item_id")
     if not work_item_id:
+        try:
+            state_file.unlink(missing_ok=True)
+        except OSError:
+            pass
         return
 
     files = _extract_files(tool_name, tool_input)

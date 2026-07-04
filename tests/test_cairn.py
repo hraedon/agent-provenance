@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -749,8 +750,13 @@ def test_verify_bundle_chain_valid(hmac_keys: Path, tmp_path: Path) -> None:
     p1 = tmp_path / "bundle1.json"
     p1.write_text(json.dumps(bundle1, indent=2))
 
-    # Bundle 2 (references bundle 1)
-    ev2 = make_event(1)
+    # Compute ev1's global hash for cross-bundle event chain (WI-022)
+    ev1_hash = hashlib.sha256(
+        bytes(ev1.canonical_envelope) + bytes(ev1.signature)
+    ).digest()
+
+    # Bundle 2 (references bundle 1, event chains to ev1)
+    ev2 = replace(make_event(1), prev_global_event_hash=ev1_hash)
     manifest2: dict = {"events_count": 1, "previous_bundle_hash": hash1}
     bundle2: dict = {"manifest": manifest2, "events": [ev2.to_dict()]}
     canonical2 = json.dumps(bundle2, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -822,8 +828,13 @@ def test_verify_bundle_chain_broken(hmac_keys: Path, tmp_path: Path) -> None:
     p1 = tmp_path / "bundle1.json"
     p1.write_text(json.dumps(bundle1, indent=2))
 
-    # Bundle 2 with WRONG previous hash
-    ev2 = make_event(1)
+    # Compute ev1's global hash for cross-bundle event chain (WI-022)
+    ev1_hash = hashlib.sha256(
+        bytes(ev1.canonical_envelope) + bytes(ev1.signature)
+    ).digest()
+
+    # Bundle 2 with WRONG previous hash (but valid event-level chain)
+    ev2 = replace(make_event(1), prev_global_event_hash=ev1_hash)
     manifest2: dict = {"events_count": 1, "previous_bundle_hash": "sha256:deadbeef"}
     bundle2: dict = {"manifest": manifest2, "events": [ev2.to_dict()]}
     canonical2 = json.dumps(bundle2, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -836,6 +847,229 @@ def test_verify_bundle_chain_broken(hmac_keys: Path, tmp_path: Path) -> None:
     report = verifier.verify_bundle_chain([p1, p2])
     assert not report.all_ok
     assert report.chain_integrity_ok is False
+
+
+# ----------------------------------------------------------------------
+# WI-021: bundle size limits
+# ----------------------------------------------------------------------
+
+
+def test_verify_bundle_rejects_oversized(hmac_keys: Path, tmp_path: Path) -> None:
+    """Bundles exceeding max_bundle_size_bytes are rejected (WI-021)."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    ev = _make_signed_event(key_bytes, event_seq=0, payload={"tool": "Read"})
+    bundle = {
+        "manifest": {"events_count": 1},
+        "events": [ev.to_dict()],
+    }
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode()
+    bundle["manifest"]["bundle_hash"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    p = tmp_path / "bundle.json"
+    p.write_text(json.dumps(bundle))
+
+    verifier = Verifier(key_set, max_bundle_size_bytes=10)
+    report = verifier.verify_bundle(p)
+    assert not report.bundle_hash_ok
+    assert "exceeds maximum" in report.bundle_hash_detail
+
+
+def test_verify_bundle_rejects_too_many_events(hmac_keys: Path, tmp_path: Path) -> None:
+    """Bundles with too many events are rejected (WI-021)."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    ev = _make_signed_event(key_bytes, event_seq=0, payload={"tool": "Read"})
+    bundle = {
+        "manifest": {"events_count": 1},
+        "events": [ev.to_dict()],
+    }
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode()
+    bundle["manifest"]["bundle_hash"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    p = tmp_path / "bundle.json"
+    p.write_text(json.dumps(bundle))
+
+    verifier = Verifier(key_set, max_events=0)
+    report = verifier.verify_bundle(p)
+    assert not report.bundle_hash_ok
+    assert "exceeding the maximum" in report.bundle_hash_detail
+
+
+# ----------------------------------------------------------------------
+# WI-022: cross-bundle event hash chain
+# ----------------------------------------------------------------------
+
+
+def test_verify_bundle_chain_event_hash_broken(
+    hmac_keys: Path, tmp_path: Path
+) -> None:
+    """Cross-bundle event hash chain mismatch is detected (WI-022)."""
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    def make_chained_event(
+        seq: int,
+        prev_global_hash: bytes | None = None,
+        global_seq: int = 1,
+    ) -> Event:
+        ev_id = uuid.uuid4()
+        wi_id = uuid.uuid4()
+        now = datetime.now(UTC)
+        sig, c_hash, env = sign_event(
+            event_id=ev_id,
+            work_item_id=wi_id,
+            actor_id="agent-1",
+            key_id="cairn-test-001",
+            event_seq=seq,
+            workflow_name="cairn_agent_actions",
+            workflow_version=1,
+            timestamp=now,
+            transition="tool_call_begin",
+            payload={"tool": "Read"},
+            key=key_bytes,
+        )
+        return Event(
+            event_id=ev_id,
+            work_item_id=wi_id,
+            event_seq=seq,
+            actor_id="agent-1",
+            actor_kind="agent",
+            actor_metadata=None,
+            key_id="cairn-test-001",
+            workflow_name="cairn_agent_actions",
+            workflow_version=1,
+            timestamp=now,
+            transition="tool_call_begin",
+            payload={"tool": "Read"},
+            payload_canonical_hash=c_hash,
+            signature=sig,
+            canonical_envelope=env,
+            prev_global_event_hash=prev_global_hash,
+            global_seq=global_seq,
+        )
+
+    # Bundle 1: one event with global_seq=1, no prev (genesis)
+    ev1 = make_chained_event(0, prev_global_hash=None, global_seq=1)
+    manifest1: dict = {"events_count": 1}
+    bundle1: dict = {"manifest": manifest1, "events": [ev1.to_dict()]}
+    canonical1 = json.dumps(bundle1, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    hash1 = "sha256:" + hashlib.sha256(canonical1).hexdigest()
+    manifest1["bundle_hash"] = hash1
+    p1 = tmp_path / "bundle1.json"
+    p1.write_text(json.dumps(bundle1, indent=2))
+
+    # Bundle 2: first event chains to a WRONG hash (not the real hash of ev1)
+    wrong_hash = b"\x00" * 32
+    ev2 = make_chained_event(0, prev_global_hash=wrong_hash, global_seq=2)
+    manifest2: dict = {"events_count": 1, "previous_bundle_hash": hash1}
+    bundle2: dict = {"manifest": manifest2, "events": [ev2.to_dict()]}
+    canonical2 = json.dumps(bundle2, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    hash2 = "sha256:" + hashlib.sha256(canonical2).hexdigest()
+    manifest2["bundle_hash"] = hash2
+    p2 = tmp_path / "bundle2.json"
+    p2.write_text(json.dumps(bundle2, indent=2))
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle_chain([p1, p2])
+    assert report.chain_integrity_ok is False
+    cross_bundle_violations = [
+        v for v in report.chain_contiguity_violations
+        if v.kind == "cross_bundle_hash_mismatch"
+    ]
+    assert len(cross_bundle_violations) == 1
+
+
+def test_verify_bundle_chain_event_hash_valid(
+    hmac_keys: Path, tmp_path: Path
+) -> None:
+    """Cross-bundle event hash chain with correct linking passes (WI-022)."""
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    def make_chained_event(
+        seq: int,
+        prev_global_hash: bytes | None = None,
+        global_seq: int = 1,
+    ) -> Event:
+        ev_id = uuid.uuid4()
+        wi_id = uuid.uuid4()
+        now = datetime.now(UTC)
+        sig, c_hash, env = sign_event(
+            event_id=ev_id,
+            work_item_id=wi_id,
+            actor_id="agent-1",
+            key_id="cairn-test-001",
+            event_seq=seq,
+            workflow_name="cairn_agent_actions",
+            workflow_version=1,
+            timestamp=now,
+            transition="tool_call_begin",
+            payload={"tool": "Read"},
+            key=key_bytes,
+        )
+        return Event(
+            event_id=ev_id,
+            work_item_id=wi_id,
+            event_seq=seq,
+            actor_id="agent-1",
+            actor_kind="agent",
+            actor_metadata=None,
+            key_id="cairn-test-001",
+            workflow_name="cairn_agent_actions",
+            workflow_version=1,
+            timestamp=now,
+            transition="tool_call_begin",
+            payload={"tool": "Read"},
+            payload_canonical_hash=c_hash,
+            signature=sig,
+            canonical_envelope=env,
+            prev_global_event_hash=prev_global_hash,
+            global_seq=global_seq,
+        )
+
+    # Bundle 1: genesis event
+    ev1 = make_chained_event(0, prev_global_hash=None, global_seq=1)
+    manifest1: dict = {"events_count": 1}
+    bundle1: dict = {"manifest": manifest1, "events": [ev1.to_dict()]}
+    canonical1 = json.dumps(bundle1, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    hash1 = "sha256:" + hashlib.sha256(canonical1).hexdigest()
+    manifest1["bundle_hash"] = hash1
+    p1 = tmp_path / "bundle1.json"
+    p1.write_text(json.dumps(bundle1, indent=2))
+
+    # Compute the real hash of ev1
+    real_hash = hashlib.sha256(
+        bytes(ev1.canonical_envelope) + bytes(ev1.signature)
+    ).digest()
+
+    # Bundle 2: first event correctly chains to ev1's hash
+    ev2 = make_chained_event(0, prev_global_hash=real_hash, global_seq=2)
+    manifest2: dict = {"events_count": 1, "previous_bundle_hash": hash1}
+    bundle2: dict = {"manifest": manifest2, "events": [ev2.to_dict()]}
+    canonical2 = json.dumps(bundle2, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    hash2 = "sha256:" + hashlib.sha256(canonical2).hexdigest()
+    manifest2["bundle_hash"] = hash2
+    p2 = tmp_path / "bundle2.json"
+    p2.write_text(json.dumps(bundle2, indent=2))
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle_chain([p1, p2])
+    cross_bundle_violations = [
+        v for v in report.chain_contiguity_violations
+        if v.kind == "cross_bundle_hash_mismatch"
+    ]
+    assert len(cross_bundle_violations) == 0
 
 
 # ----------------------------------------------------------------------

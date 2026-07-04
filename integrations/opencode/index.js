@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
-import { mkdirSync, appendFileSync, chmodSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, appendFileSync, chmodSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import { tmpdir } from "node:os";
 
 /**
@@ -105,7 +107,9 @@ export function extractFiles(args) {
  * @returns {string}
  */
 export function safeSessionId(sessionId) {
-  return String(sessionId).replace(/[^a-zA-Z0-9._-]/g, "_");
+  let s = String(sessionId).replace(/[^a-zA-Z0-9._-]/g, "_");
+  if (s === "." || s === "..") s = "_";
+  return s;
 }
 
 /**
@@ -293,6 +297,39 @@ export function summarizeResult(result) {
   return { exit_code: exitCode, stdout };
 }
 
+/**
+ * Resolve a sha256 digest of the opencode config file, mirroring the
+ * Claude Code hook's _resolve_settings_digest (WI-018).
+ *
+ * Looks for opencode.json or opencode.jsonc in the project directory,
+ * then in the user's home config directory.  Returns null if no config
+ * file is found.
+ *
+ * @param {string} [projectDir]  override, mainly for tests
+ * @param {string} [homeDir]     override, mainly for tests
+ * @returns {string | null}  "sha256:..." or null
+ */
+export function resolveConfigDigest(projectDir, homeDir) {
+  const candidates = [];
+  if (projectDir) {
+    candidates.push(join(projectDir, "opencode.json"));
+    candidates.push(join(projectDir, "opencode.jsonc"));
+  }
+  const home = homeDir || homedir();
+  candidates.push(join(home, ".config", "opencode", "opencode.json"));
+  candidates.push(join(home, ".config", "opencode", "opencode.jsonc"));
+  for (const p of candidates) {
+    try {
+      const buf = readFileSync(p);
+      const hash = createHash("sha256").update(buf).digest("hex");
+      return "sha256:" + hash;
+    } catch {
+      // file not found or unreadable; try next candidate
+    }
+  }
+  return null;
+}
+
 export default async function cairnPlugin(ctx) {
   // The session map is per-plugin-instance (one opencode process), shared
   // across sessions/calls.  Bounded so a flood of unclosed begins cannot grow
@@ -414,17 +451,24 @@ export default async function cairnPlugin(ctx) {
           );
           return;
         }
+        const configDigest = resolveConfigDigest(
+          process.env.OPENCODE_PROJECT_DIR || process.env.PWD,
+        );
+        const harnessName = "opencode";
         const reply = await invokeBridge(
           {
             action: "attest_session",
             session_id: sessionID,
             harnesses: [
               {
-                name: "opencode",
+                name: harnessName,
                 version: event.properties?.version ?? "unknown",
               },
             ],
             scope_statement: "In scope: opencode.",
+            harness_config_digests: configDigest
+              ? { [harnessName]: configDigest }
+              : null,
           },
           client,
         );

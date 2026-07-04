@@ -15,6 +15,8 @@ from cairn._claude_hook import (
     _call_key,
     _extract_files,
     _mark_degraded,
+    _next_state_file,
+    _oldest_state_file,
     _resolve_settings_digest,
     _state_dir,
     handle_post,
@@ -114,7 +116,8 @@ def test_handle_pre_creates_state(mock_bridge: MagicMock, state_dir: Path) -> No
     assert call_args["session_id"] == "test-session"
 
     key = _call_key("Edit", {"filePath": "/tmp/foo.py", "oldString": "x", "newString": "y"})
-    state_file = state_dir / f"{key}.json"
+    state_file = _oldest_state_file(state_dir, key)
+    assert state_file is not None
     assert state_file.exists()
     state = json.loads(state_file.read_text())
     assert state["work_item_id"] == wi_id
@@ -146,7 +149,7 @@ def test_handle_post_reads_state_and_calls_end(mock_bridge: MagicMock, state_dir
     wi_id = str(uuid.uuid4())
     tool_input = {"filePath": "/tmp/foo.py", "oldString": "x", "newString": "y"}
     key = _call_key("Edit", tool_input)
-    state_file = state_dir / f"{key}.json"
+    state_file = _next_state_file(state_dir, key)
     state_file.write_text(
         json.dumps(
             {
@@ -184,7 +187,7 @@ def test_handle_post_failure_passes_error(mock_bridge: MagicMock, state_dir: Pat
     wi_id = str(uuid.uuid4())
     tool_input = {"command": "rm -rf /"}
     key = _call_key("Bash", tool_input)
-    state_file = state_dir / f"{key}.json"
+    state_file = _next_state_file(state_dir, key)
     state_file.write_text(
         json.dumps(
             {
@@ -354,7 +357,7 @@ def test_handle_post_bridge_failure_creates_degradation(
     wi_id = str(uuid.uuid4())
     tool_input = {"filePath": "/tmp/foo.py"}
     key = _call_key("Edit", tool_input)
-    state_file = state_dir / f"{key}.json"
+    state_file = _next_state_file(state_dir, key)
     state_file.write_text(
         json.dumps({"work_item_id": wi_id, "session_id": "test-session", "tool": "Edit"})
     )
@@ -432,3 +435,80 @@ def test_safe_session_id_sanitizes():
     assert _safe_session_id("abc-123") == "abc-123"
     assert _safe_session_id("../../../etc/passwd") == ".._.._.._etc_passwd"
     assert _safe_session_id("session/with/slashes") == "session_with_slashes"
+
+
+# ----------------------------------------------------------------------
+# WI-023: repeated identical tool calls don't collide
+# ----------------------------------------------------------------------
+
+
+def test_next_state_file_increments_seq(state_dir: Path) -> None:
+    """Repeated identical tool calls get unique state files (WI-023)."""
+    key = _call_key("Edit", {"filePath": "/tmp/foo.py"})
+    f1 = _next_state_file(state_dir, key)
+    f1.write_text('{"work_item_id": "wi-1"}')
+    f2 = _next_state_file(state_dir, key)
+    f2.write_text('{"work_item_id": "wi-2"}')
+
+    assert f1 != f2
+    assert f1.exists()
+    assert f2.exists()
+
+
+def test_oldest_state_file_returns_fifo(state_dir: Path) -> None:
+    """_oldest_state_file returns the first-created file (FIFO)."""
+    key = _call_key("Edit", {"filePath": "/tmp/foo.py"})
+    f1 = _next_state_file(state_dir, key)
+    f1.write_text('{"work_item_id": "wi-1"}')
+    f2 = _next_state_file(state_dir, key)
+    f2.write_text('{"work_item_id": "wi-2"}')
+
+    oldest = _oldest_state_file(state_dir, key)
+    assert oldest == f1
+
+
+def test_oldest_state_file_none_when_empty(state_dir: Path) -> None:
+    key = _call_key("Edit", {"filePath": "/tmp/foo.py"})
+    assert _oldest_state_file(state_dir, key) is None
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_repeated_identical_tool_calls_dont_collide(
+    mock_bridge: MagicMock, state_dir: Path
+) -> None:
+    """Two identical begin/end pairs don't overwrite each other (WI-023)."""
+    wi1 = str(uuid.uuid4())
+    wi2 = str(uuid.uuid4())
+    mock_bridge.side_effect = [
+        {"status": "ok", "work_item_id": wi1, "args_hash": "sha256:abc"},
+        {"status": "ok", "event_id": str(uuid.uuid4())},
+        {"status": "ok", "work_item_id": wi2, "args_hash": "sha256:def"},
+        {"status": "ok", "event_id": str(uuid.uuid4())},
+    ]
+
+    tool_input = {"filePath": "/tmp/identical.py", "oldString": "a", "newString": "b"}
+    hook_begin = json.dumps(
+        {"tool_name": "Edit", "tool_input": tool_input, "session_id": "test-session"}
+    )
+    hook_end = json.dumps(
+        {
+            "tool_name": "Edit",
+            "tool_input": tool_input,
+            "session_id": "test-session",
+            "tool_output": "ok",
+        }
+    )
+
+    with patch("sys.stdin", StringIO(hook_begin)):
+        handle_pre()
+    with patch("sys.stdin", StringIO(hook_end)):
+        handle_post()
+    with patch("sys.stdin", StringIO(hook_begin)):
+        handle_pre()
+    with patch("sys.stdin", StringIO(hook_end)):
+        handle_post()
+
+    end_calls = [c[0][0] for c in mock_bridge.call_args_list if c[0][0]["action"] == "end"]
+    assert len(end_calls) == 2
+    assert end_calls[0]["work_item_id"] == wi1
+    assert end_calls[1]["work_item_id"] == wi2

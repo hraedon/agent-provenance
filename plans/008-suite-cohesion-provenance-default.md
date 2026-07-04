@@ -17,7 +17,7 @@ the suite install rather than a manual step. See `/projects/agent-suite-blueprin
 
 ## Ground truth at time of writing
 
-- agent-provenance is private (`hraedon/agent-provenance`), built on regista.
+- agent-provenance is public (`hraedon/agent-provenance`), built on regista.
   Skeleton + adapter (`CairnAdapter`) + verifier (`cairn verify`/`export`) +
   regista workflow are in place; scope attestation is a signed first-class event;
   the **opencode plugin + Python bridge are end-to-end functional**.
