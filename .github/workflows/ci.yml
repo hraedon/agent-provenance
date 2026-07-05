@@ -25,8 +25,12 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
+      # Denylist is never committed — it comes from the CAIRN_FORBIDDEN_IDENTIFIERS
+      # repository secret (gpo-lens pattern). No-op until the secret is set.
       - name: Identifier gate
-        run: python3 scripts/identifier-gate.py
+        env:
+          CAIRN_FORBIDDEN_IDENTIFIERS: ${{ secrets.CAIRN_FORBIDDEN_IDENTIFIERS }}
+        run: python3 scripts/check_committed_identifiers.py
 
       - name: Lint (ruff)
         run: ruff check src tests

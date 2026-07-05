@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+#
+# cairn local identifier gate.
+#
+# Mirrors the CI `identifier-gate` job so a work-domain identifier is caught
+# BEFORE it lands in a commit. The CI gate only runs after push, which is why
+# the same FQDN has leaked through reflections repeatedly: by the time CI
+# flags it, the token is already in history. This hook closes that window.
+#
+# Activate (once per clone):   git config core.hooksPath githooks
+# Or run:                      scripts/install-git-hooks.sh
+#
+# The denylist is never committed. It is resolved, in order, from:
+#   1. $CAIRN_FORBIDDEN_IDENTIFIERS (already exported)
+#   2. <repo>/.identifiers-denylist.local   (gitignored)
+#   3. ~/.config/cairn/forbidden-identifiers
+#
+# Layered design: this hook is an EARLY WARNING (fail-open if no denylist is
+# configured, so a fresh clone is not bricked). CI remains the hard gate
+# (fail-closed — the secret is always set there).
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+if [ -z "${CAIRN_FORBIDDEN_IDENTIFIERS:-}" ]; then
+  for candidate in \
+    "$repo_root/.identifiers-denylist.local" \
+    "$HOME/.config/cairn/forbidden-identifiers"; do
+    if [ -f "$candidate" ]; then
+      CAIRN_FORBIDDEN_IDENTIFIERS="$(cat "$candidate")"
+      export CAIRN_FORBIDDEN_IDENTIFIERS
+      break
+    fi
+  done
+fi
+
+if [ -z "${CAIRN_FORBIDDEN_IDENTIFIERS:-}" ]; then
+  echo "cairn pre-commit: identifier gate INACTIVE — no denylist found." >&2
+  echo "  Set \$CAIRN_FORBIDDEN_IDENTIFIERS, or create" >&2
+  echo "  .identifiers-denylist.local (gitignored) or" >&2
+  echo "  ~/.config/cairn/forbidden-identifiers to enable it. Allowing commit." >&2
+  exit 0
+fi
+
+python_bin="$repo_root/.venv/bin/python"
+[ -x "$python_bin" ] || python_bin="$(command -v python3 || command -v python)"
+
+exec "$python_bin" "$repo_root/scripts/check_committed_identifiers.py" --staged

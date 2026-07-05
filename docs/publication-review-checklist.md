@@ -4,7 +4,7 @@ Before flipping the repository from private to public, verify each item.
 
 ## 1. Identifier scrub
 
-- [ ] `scripts/identifier-gate.py` exits 0 (no personal/internal identifiers in tracked files)
+- [ ] `CAIRN_FORBIDDEN_IDENTIFIERS="$(cat .identifiers-denylist.local)" python3 scripts/check_committed_identifiers.py` exits 0 (denylist is never committed — gpo-lens pattern; set the repo secret in CI and run `scripts/install-git-hooks.sh` for the local pre-commit gate)
 - [ ] Git history rewritten via `git filter-repo` to scrub author/committer identity
 - [ ] No work-domain email addresses in git log (`git log --format='%ae %ce' | sort -u`)
 - [ ] No internal hostnames in git history (search for known internal hostnames)

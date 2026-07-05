@@ -13,3 +13,6 @@ bun.lock
 # Claude Code project settings (contains env secrets after install-harness)
 .claude/settings.json
 .claude/settings.local.json
+
+# local denylist for the pre-commit identifier gate (never committed)
+.identifiers-denylist.local
