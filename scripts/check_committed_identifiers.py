@@ -33,8 +33,19 @@ def _filter_identifiers(identifiers: frozenset[str]) -> frozenset[str]:
 
 
 def parse_identifier_set(raw: str) -> frozenset[str]:
-    """Build a normalized set of identifiers from a whitespace-separated string."""
-    return _filter_identifiers(frozenset(raw.split()))
+    """Build a normalized set of identifiers from the raw denylist.
+
+    Accepts whitespace-separated tokens (the CI-secret form) and/or one token
+    per line. Full-line and trailing ``#`` comments are stripped, so a
+    human-maintained denylist file may document itself without every comment
+    word becoming a forbidden token.
+    """
+    tokens: set[str] = set()
+    for line in raw.splitlines() or [raw]:
+        content = line.split("#", 1)[0].strip()
+        if content:
+            tokens.update(content.split())
+    return _filter_identifiers(frozenset(tokens))
 
 
 def scan_text(text: str, identifiers: frozenset[str]) -> Iterator[Violation]:
