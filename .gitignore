@@ -16,3 +16,11 @@ bun.lock
 
 # local denylist for the pre-commit identifier gate (never committed)
 .identifiers-denylist.local
+
+# Real identifier-bearing data (the always-on guard in check_committed_identifiers.py
+# also blocks force-adds here). Holds the denylist source data, never committed.
+/samples/
+
+# Dry-run audit artifacts — contain raw identifiers, never committed
+docs/history-identifier-audit.md
+scripts/filter-repo-replacements.txt
