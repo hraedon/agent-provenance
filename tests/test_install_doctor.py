@@ -296,7 +296,7 @@ def test_cairn_env_config_key_ref_in_doctor(monkeypatch):
     monkeypatch.setenv("MY_SECRET_KEY", "test-secret-value")
     from cairn._doctor import _check_key_file
     result = _check_key_file(cfg)
-    assert result["status"] == "pass"
+    assert result["status"] == "ok"
     assert "key_ref" in result["detail"]
 
 

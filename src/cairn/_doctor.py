@@ -1,7 +1,9 @@
 """``cairn doctor`` — health check conforming to the suite shape.
 
-Emits ``{component, version, regista:{reachable, project, chain_ok}, checks:[…]}``
-so the suite-doctor can aggregate it alongside the other components.
+Emits ``{component, version, ok, degraded, regista:{reachable, project,
+chain_ok}, checks:[…]}`` so the suite-doctor umbrella (which reads the top-level
+``ok`` boolean) can aggregate it alongside the other components. Check status
+follows regista's canonical vocabulary: ``ok``/``warn``/``fail``/``skip``.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ def _check_config(cfg: Any) -> dict[str, Any]:
     )
     return {
         "name": "config",
-        "status": "pass" if not missing else "fail",
+        "status": "ok" if not missing else "fail",
         "detail": detail,
     }
 
@@ -51,7 +53,7 @@ def _check_key_file(cfg: Any) -> dict[str, Any]:
             resolve_secret(cfg.key_ref)
             return {
                 "name": "key_file",
-                "status": "pass",
+                "status": "ok",
                 "detail": f"key_ref: {cfg.key_ref} (resolvable)",
             }
         except Exception as exc:
@@ -72,7 +74,7 @@ def _check_key_file(cfg: Any) -> dict[str, Any]:
             return {"name": "key_file", "status": "fail", "detail": "key file has no keys"}
         return {
             "name": "key_file",
-            "status": "pass",
+            "status": "ok",
             "detail": f"{len(keys)} key(s), active={keys[0].get('key_id', '?')}",
         }
     except Exception as exc:
@@ -103,7 +105,7 @@ def _check_regista(cfg: Any) -> dict[str, Any]:
                     events = sub.read_events(limit=1)
                     return {
                         "name": "regista",
-                        "status": "pass",
+                        "status": "ok",
                         "detail": f"reachable, {len(events)} event(s) in project '{cfg.project}'",
                     }
                 finally:
@@ -116,7 +118,7 @@ def _check_regista(cfg: Any) -> dict[str, Any]:
             events = sub.read_events(limit=1)
             return {
                 "name": "regista",
-                "status": "pass",
+                "status": "ok",
                 "detail": f"reachable, {len(events)} event(s) in project '{cfg.project}'",
             }
         finally:
@@ -164,7 +166,7 @@ def _check_harness_wired(cfg: Any) -> dict[str, Any]:
         }
     return {
         "name": "harness_wired",
-        "status": "pass",
+        "status": "ok",
         "detail": f"hooks + env configured in {path}",
     }
 
@@ -174,7 +176,7 @@ def _check_bridge() -> dict[str, Any]:
 
     bridge = shutil.which("cairn-bridge")
     if bridge:
-        return {"name": "bridge", "status": "pass", "detail": f"cairn-bridge at {bridge}"}
+        return {"name": "bridge", "status": "ok", "detail": f"cairn-bridge at {bridge}"}
     return {
         "name": "bridge",
         "status": "warn",
@@ -194,11 +196,18 @@ def run_doctor(*, json_output: bool = False) -> int:
     ]
 
     regista_check = next((c for c in checks if c["name"] == "regista"), None)
-    regista_reachable = regista_check["status"] == "pass" if regista_check else False
+    regista_reachable = regista_check["status"] == "ok" if regista_check else False
+
+    has_fail = any(c["status"] == "fail" for c in checks)
+    has_warn = any(c["status"] == "warn" for c in checks)
+    ok = not has_fail
+    degraded = ok and has_warn
 
     report: dict[str, Any] = {
         "component": "cairn",
         "version": _cairn_version,
+        "ok": ok,
+        "degraded": degraded,
         "regista": {
             "reachable": regista_reachable,
             "project": cfg.project or None,
@@ -206,8 +215,6 @@ def run_doctor(*, json_output: bool = False) -> int:
         },
         "checks": checks,
     }
-
-    all_pass = all(c["status"] in ("pass", "skip") for c in checks)
 
     if json_output:
         print(json.dumps(report, indent=2))
@@ -220,9 +227,11 @@ def run_doctor(*, json_output: bool = False) -> int:
             status = c["status"].upper()
             print(f"  [{status:4s}] {c['name']:16s} {c['detail']}")
         print()
-        if all_pass:
+        if ok and not degraded:
             print("  All checks passed.")
+        elif degraded:
+            print("  Healthy, with warnings — see above.")
         else:
             print("  Some checks failed — see above.")
 
-    return 0 if all_pass else 1
+    return 0 if ok else 1
