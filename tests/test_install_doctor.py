@@ -13,6 +13,7 @@ from cairn._doctor import run_doctor
 from cairn._install import (
     InstallResult,
     _install_claude,
+    _install_hermes,
     _is_cairn_hook_entry,
     _uninstall_claude,
     format_results_human,
@@ -202,6 +203,108 @@ def test_is_cairn_hook_entry_rejects_foreign():
 
 
 # ----------------------------------------------------------------------
+# install-harness hermes
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def hermes_home(tmp_path: Path, monkeypatch) -> Path:
+    home = tmp_path / "hermes-home"
+    monkeypatch.setenv("CAIRN_HERMES_HOME", str(home))
+    return home
+
+
+def test_install_hermes_writes_env_and_plugin(cfg, hermes_home):
+    result = _install_hermes(cfg, dry_run=False, uninstall=False, user=None)
+
+    assert not result.no_op
+    env_path = hermes_home / ".env"
+    assert env_path.is_file()
+    content = env_path.read_text()
+    assert "# BEGIN cairn-harness-managed" in content
+    assert "# END cairn-harness-managed" in content
+    assert "REGISTA_DSN=postgresql://user:pw@host/db" in content
+    assert "CAIRN_PROJECT=test_project" in content
+    assert "CAIRN_HARNESS_NAME=hermes" in content
+
+    # Plugin files installed.
+    plugin_dir = hermes_home / "plugins" / "observability" / "cairn"
+    assert (plugin_dir / "plugin.yaml").is_file()
+    assert (plugin_dir / "__init__.py").is_file()
+
+
+def test_install_hermes_idempotent(cfg, hermes_home):
+    _install_hermes(cfg, dry_run=False, uninstall=False, user=None)
+    result = _install_hermes(cfg, dry_run=False, uninstall=False, user=None)
+
+    assert result.no_op
+    # All actions should be "skip" (already up-to-date).
+    assert all(a.kind == "skip" for a in result.actions)
+
+
+def test_install_hermes_dry_run_does_not_write(cfg, hermes_home):
+    result = _install_hermes(cfg, dry_run=True, uninstall=False, user=None)
+
+    assert not result.no_op
+    assert len(result.actions) > 0
+    assert not (hermes_home / ".env").exists()
+
+
+def test_install_hermes_no_clobber_existing_env(cfg, hermes_home):
+    env_path = hermes_home / ".env"
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text("REGISTA_DSN=postgresql://existing:secret@host/db\n")
+
+    result = _install_hermes(cfg, dry_run=False, uninstall=False, user=None)
+
+    content = env_path.read_text()
+    assert "postgresql://existing:secret@host/db" in content
+    skip_actions = [a for a in result.actions if a.kind == "skip"]
+    assert any("REGISTA_DSN" in a.detail for a in skip_actions)
+
+
+def test_install_hermes_with_user_principal(cfg, hermes_home):
+    result = _install_hermes(cfg, dry_run=False, uninstall=False, user="human:bob")
+
+    content = (hermes_home / ".env").read_text()
+    assert "PRINCIPAL_ID=human:bob" in content
+    assert result.user == "human:bob"
+
+
+def test_uninstall_hermes_removes_managed_block(cfg, hermes_home):
+    _install_hermes(cfg, dry_run=False, uninstall=False, user=None)
+
+    env_path = hermes_home / ".env"
+    # Add a user line outside the managed block.
+    content = env_path.read_text()
+    env_path.write_text("USER_VAR=keep\n" + content)
+
+    result = _install_hermes(cfg, dry_run=False, uninstall=True, user=None)
+
+    content = env_path.read_text()
+    assert "cairn-harness-managed" not in content
+    assert "USER_VAR=keep" in content
+    assert not result.no_op
+
+
+def test_uninstall_hermes_removes_plugin(cfg, hermes_home):
+    _install_hermes(cfg, dry_run=False, uninstall=False, user=None)
+
+    plugin_dir = hermes_home / "plugins" / "observability" / "cairn"
+    assert plugin_dir.is_dir()
+
+    _install_hermes(cfg, dry_run=False, uninstall=True, user=None)
+
+    assert not (plugin_dir / "plugin.yaml").exists()
+    assert not (plugin_dir / "__init__.py").exists()
+
+
+def test_uninstall_hermes_noop_on_clean(cfg, hermes_home):
+    result = _install_hermes(cfg, dry_run=False, uninstall=True, user=None)
+    assert result.no_op
+
+
+# ----------------------------------------------------------------------
 # run_install_harness (all)
 # ----------------------------------------------------------------------
 
@@ -209,9 +312,10 @@ def test_is_cairn_hook_entry_rejects_foreign():
 def test_run_install_harness_all(cfg, monkeypatch):
     monkeypatch.setattr("cairn._install.resolve_config", lambda: cfg)
     results = run_install_harness("all", dry_run=True, uninstall=False, user=None)
-    assert len(results) == 2
+    assert len(results) == 3
     assert results[0].harness == "claude"
     assert results[1].harness == "opencode"
+    assert results[2].harness == "hermes"
 
 
 # ----------------------------------------------------------------------

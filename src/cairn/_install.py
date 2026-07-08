@@ -6,6 +6,8 @@ harness, re-runnable, with ``--dry-run`` and ``--uninstall``.
 
 Claude Code target: ``~/.claude/settings.json`` (or ``$CAIRN_CLAUDE_SETTINGS``).
 OpenCode target: ``~/.config/opencode/opencode.json`` (or ``$CAIRN_OPENCODE_CONFIG``).
+Hermes target: ``~/.hermes/.env`` + ``~/.hermes/plugins/observability/cairn/``
+(or ``$CAIRN_HERMES_HOME``).
 """
 
 from __future__ import annotations
@@ -104,6 +106,289 @@ def _opencode_config_path() -> Path:
             str(Path.home() / ".config" / "opencode" / "opencode.json"),
         )
     )
+
+
+def _hermes_home() -> Path:
+    """Return the Hermes home directory (``~/.hermes`` by default)."""
+    return Path(os.environ.get("CAIRN_HERMES_HOME", str(Path.home() / ".hermes")))
+
+
+def _hermes_env_path() -> Path:
+    """Return the path to Hermes's ``.env`` file."""
+    return _hermes_home() / ".env"
+
+
+def _hermes_plugin_dir() -> Path:
+    """Return the target directory for the cairn plugin."""
+    return _hermes_home() / "plugins" / "observability" / "cairn"
+
+
+def _hermes_source_plugin_dir() -> Path:
+    """Return the source plugin directory in the repo."""
+    root = Path(__file__).resolve().parent.parent.parent
+    return root / "integrations" / "hermes"
+
+
+# Sentinel comments for the managed env block in ~/.hermes/.env.
+_HERMES_ENV_BEGIN = "# BEGIN cairn-harness-managed"
+_HERMES_ENV_END = "# END cairn-harness-managed"
+
+
+def _parse_env_file(path: Path) -> list[str]:
+    """Read .env file lines, returning [] if missing."""
+    if not path.is_file():
+        return []
+    return path.read_text().splitlines()
+
+
+def _find_managed_block(lines: list[str]) -> tuple[int, int] | None:
+    """Find the (begin_idx, end_idx) of the managed block, or None."""
+    begin_idx = -1
+    end_idx = -1
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == _HERMES_ENV_BEGIN:
+            begin_idx = i
+        elif stripped == _HERMES_ENV_END:
+            end_idx = i
+            break
+    if begin_idx >= 0 and end_idx > begin_idx:
+        return (begin_idx, end_idx)
+    return None
+
+
+def _parse_env_entries(lines: list[str]) -> dict[str, str]:
+    """Parse KEY=VALUE entries from a list of .env lines."""
+    entries: dict[str, str] = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" in stripped:
+            k, v = stripped.split("=", 1)
+            entries[k.strip()] = v.strip()
+    return entries
+
+
+def _build_managed_env_lines(
+    env_vals: dict[str, str | None],
+    user: str | None,
+) -> list[str]:
+    """Build the managed env block lines (including sentinels)."""
+    lines = [_HERMES_ENV_BEGIN]
+    for key in _ENV_VARS:
+        val: str | None = None
+        if key == "CAIRN_HARNESS_NAME":
+            val = "hermes"
+        elif key == "PRINCIPAL_ID" and user:
+            val = user
+        else:
+            val = env_vals.get(key)
+        if val is not None:
+            lines.append(f"{key}={val}")
+    lines.append(_HERMES_ENV_END)
+    return lines
+
+
+def _install_hermes(
+    cfg: Any,
+    *,
+    dry_run: bool,
+    uninstall: bool,
+    user: str | None,
+) -> InstallResult:
+    result = InstallResult(harness="hermes", user=user)
+
+    env_path = _hermes_env_path()
+    plugin_target = _hermes_plugin_dir()
+    plugin_source = _hermes_source_plugin_dir()
+
+    if uninstall:
+        return _uninstall_hermes(env_path, plugin_target, dry_run=dry_run, result=result)
+
+    # --- Env wiring ---
+    lines = _parse_env_file(env_path)
+    desired_env = _env_values(cfg, "hermes")
+    managed_block = _find_managed_block(lines)
+
+    changed = False
+
+    # Check for existing keys outside managed block (no clobber).
+    unmanaged_entries: dict[str, str] = {}
+    if managed_block is not None:
+        begin, end = managed_block
+        before = lines[:begin]
+        after = lines[end + 1:]
+        unmanaged_entries = _parse_env_entries(before + after)
+    else:
+        unmanaged_entries = _parse_env_entries(lines)
+
+    # Build desired values, respecting no-clobber.
+    final_vals: dict[str, str | None] = {}
+    for key in _ENV_VARS:
+        val: str | None
+        if key == "CAIRN_HARNESS_NAME":
+            val = "hermes"
+        elif key == "PRINCIPAL_ID" and user:
+            val = user
+        else:
+            val = desired_env.get(key)
+        final_vals[key] = val
+
+        if val is not None and key in unmanaged_entries:
+            existing = unmanaged_entries[key]
+            if existing != val:
+                result.actions.append(
+                    InstallAction(
+                        "skip",
+                        str(env_path),
+                        f"{key} already set outside managed block — keeping existing (no clobber)",
+                        keys=[f"env.{key}"],
+                    )
+                )
+                final_vals[key] = existing  # keep existing
+
+    managed_lines = _build_managed_env_lines(final_vals, user)
+
+    if managed_block is not None:
+        begin, end = managed_block
+        existing_block = lines[begin : end + 1]
+        if existing_block != managed_lines:
+            lines[begin : end + 1] = managed_lines
+            changed = True
+            result.actions.append(
+                InstallAction(
+                    "update_file",
+                    str(env_path),
+                    "update cairn-managed env block",
+                    keys=["env"],
+                )
+            )
+        else:
+            result.actions.append(
+                InstallAction("skip", str(env_path), "env block already up-to-date")
+            )
+    else:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend(managed_lines)
+        changed = True
+        result.actions.append(
+            InstallAction(
+                "create_file",
+                str(env_path),
+                "add cairn-managed env block",
+                keys=["env"],
+            )
+        )
+
+    # --- Plugin install ---
+    if plugin_source.is_dir():
+        plugin_files = ["plugin.yaml", "__init__.py"]
+        plugin_changed = False
+        plugin_target.mkdir(parents=True, exist_ok=True)
+
+        for fname in plugin_files:
+            src = plugin_source / fname
+            dst = plugin_target / fname
+            if not src.is_file():
+                continue
+            content = src.read_text()
+            if not dst.is_file() or dst.read_text() != content:
+                plugin_changed = True
+                if not dry_run:
+                    dst.write_text(content)
+                result.actions.append(
+                    InstallAction(
+                        "create_file" if not dst.is_file() else "update_file",
+                        str(dst),
+                        f"install cairn Hermes plugin ({fname})",
+                    )
+                )
+
+        if not plugin_changed:
+            result.actions.append(
+                InstallAction("skip", str(plugin_target), "plugin already installed")
+            )
+    else:
+        result.actions.append(
+            InstallAction(
+                "skip",
+                str(plugin_source),
+                "plugin source not found in repo — skipping plugin install",
+            )
+        )
+
+    if not any(a.kind != "skip" for a in result.actions):
+        result.no_op = True
+    elif not dry_run and changed:
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("\n".join(lines) + "\n")
+
+    return result
+
+
+def _uninstall_hermes(
+    env_path: Path,
+    plugin_dir: Path,
+    *,
+    dry_run: bool,
+    result: InstallResult,
+) -> InstallResult:
+    lines = _parse_env_file(env_path)
+    changed = False
+
+    # --- Remove managed env block ---
+    managed_block = _find_managed_block(lines)
+    if managed_block is not None:
+        begin, end = managed_block
+        del lines[begin : end + 1]
+        # Clean up trailing blank lines left behind.
+        while lines and not lines[-1].strip():
+            lines.pop()
+        changed = True
+        result.actions.append(
+            InstallAction(
+                "update_file",
+                str(env_path),
+                "remove cairn-managed env block",
+                keys=["env"],
+            )
+        )
+
+    if not dry_run and changed:
+        if lines:
+            env_path.write_text("\n".join(lines) + "\n")
+        elif env_path.is_file():
+            env_path.unlink()
+
+    # --- Remove plugin directory ---
+    if plugin_dir.is_dir():
+        plugin_files = ["plugin.yaml", "__init__.py"]
+        for fname in plugin_files:
+            f = plugin_dir / fname
+            if f.is_file():
+                if not dry_run:
+                    f.unlink()
+                result.actions.append(
+                    InstallAction(
+                        "delete_file",
+                        str(f),
+                        f"remove cairn Hermes plugin ({fname})",
+                    )
+                )
+        # Try to remove now-empty directories.
+        if not dry_run:
+            for d in reversed([plugin_dir, plugin_dir.parent, plugin_dir.parent.parent]):
+                try:
+                    d.rmdir()
+                except OSError:
+                    break
+
+    if not result.actions:
+        result.no_op = True
+
+    return result
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -432,13 +717,18 @@ def run_install_harness(
     user: str | None = None,
 ) -> list[InstallResult]:
     cfg = resolve_config()
-    targets = ["claude", "opencode"] if harness == "all" else [harness]
+    if harness == "all":
+        targets = ["claude", "opencode", "hermes"]
+    else:
+        targets = [harness]
     results: list[InstallResult] = []
     for t in targets:
         if t == "claude":
             results.append(_install_claude(cfg, dry_run=dry_run, uninstall=uninstall, user=user))
         elif t == "opencode":
             results.append(_install_opencode(cfg, dry_run=dry_run, uninstall=uninstall, user=user))
+        elif t == "hermes":
+            results.append(_install_hermes(cfg, dry_run=dry_run, uninstall=uninstall, user=user))
     return results
 
 

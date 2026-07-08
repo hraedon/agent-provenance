@@ -1,0 +1,13 @@
+name: cairn
+version: "0.1.0"
+description: >-
+  Cryptographic provenance for agent tool calls. Wires cairn's begin/end
+  tool-call attestation into Hermes's pre_tool_call / post_tool_call hooks.
+  Enable with `hermes plugins enable observability/cairn`; configure via
+  REGISTA_DSN / CAIRN_PROJECT / REGISTA_KEY_PATH (or key_ref).
+author: hraedon
+hooks:
+  - pre_tool_call
+  - post_tool_call
+  - on_session_start
+  - on_session_end
