@@ -1,3 +1,11 @@
+# PROVISIONAL — unverified hook surface.
+# The hooks list below, the register(ctx)/ctx.register_hook(...) API, and the
+# kwargs contract are an ASSUMED Hermes (Nous Research) plugin surface. They
+# have NOT been validated against the real Hermes harness. Plan 010 WI-5.1
+# (interception-surface research) is still open and is the prerequisite that
+# must confirm the actual hook names, lifecycle events, and manifest format.
+# Expect this file to need adjustment once validated against the real API.
+# Do not ship against a live Hermes until WI-5.1 closes.
 name: cairn
 version: "0.1.0"
 description: >-

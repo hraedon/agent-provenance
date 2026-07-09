@@ -1,5 +1,19 @@
 """cairn — Hermes plugin for tool-call provenance attestation.
 
+.. attention::
+
+   **PROVISIONAL — unverified hook surface.** The ``register(ctx)`` /
+   ``ctx.register_hook(...)`` API, the ``**kwargs`` contract documented
+   below, and ``plugin.yaml`` manifest are an *assumed* Hermes (Nous
+   Research) plugin surface. They have **not** been validated against the
+   real Hermes harness — Plan 010 WI-5.1 (interception-surface research,
+   one WI per harness) is still open and is the prerequisite that must
+   confirm the actual lifecycle events, tool-call interception points,
+   transcript/session-end surface, and delegation semantics Hermes
+   exposes. Expect the hook names, the kwargs shape, and the manifest
+   format to need adjustment once validated against the real API. Do not
+   ship this against a live Hermes until WI-5.1 closes.
+
 Registers ``pre_tool_call`` / ``post_tool_call`` hooks that call cairn's
 :class:`~cairn.adapter.CairnAdapter` in-process (not via stdin bridge).
 
@@ -13,6 +27,13 @@ precedence: process env → legacy alias → ``suite.env`` file).
 Hooks receive ``**kwargs`` including: ``tool_name``, ``args``, ``result``,
 ``session_id``, ``tool_call_id``, ``turn_id``, ``api_request_id``,
 ``duration_ms``, ``status``, ``error_type``, ``error_message``.
+
+Session identity: the real session id is captured on ``on_session_start``
+and threaded through every subsequent tool-call event's ``on_behalf_of``
+delegation chain (mirroring how the opencode plugin threads ``session_id``
+on each ``tool.execute.before``/``after``). The adapter default carries
+only ``principal_id`` — no placeholder session id ever escapes into a
+persisted event.
 """
 
 from __future__ import annotations
@@ -38,6 +59,13 @@ _CFG: Any = None  # CairnEnvConfig | None
 # Maps tool_call_id → work_item_id (uuid.UUID).  Thread-safety: Hermes
 # runs hooks sequentially within a session, but we use a lock for safety.
 _WORK_ITEMS: dict[str, uuid.UUID] = {}
+
+# Real session id (normalized to a UUID string) captured on
+# ``on_session_start`` and reused as the fallback for tool-call events that
+# don't carry their own ``session_id`` kwarg.  This mirrors the opencode
+# plugin, which threads ``session_id`` on every event rather than stashing a
+# placeholder.  ``None`` means no session has started yet.
+_SESSION_ID: str | None = None
 
 
 def _ensure_lock() -> Any:
@@ -117,9 +145,13 @@ def _get_adapter() -> tuple[Any, Any, Any]:
             adapter = CairnAdapter(
                 sub,
                 config=CairnConfig(harness_name, harness_version),
+                # Adapter default carries only principal_id — the real
+                # session_id is threaded per-event via _resolve_session_id
+                # (see on_pre_tool_call / on_post_tool_call). No placeholder
+                # session id ("pending" or otherwise) ever escapes into a
+                # persisted event.
                 on_behalf_of={
                     "principal_id": cfg.principal_id or "human:unknown",
-                    "session_id": "pending",  # updated per-session
                 },
             )
 
@@ -248,6 +280,39 @@ def _normalize_session_id(session_id: str) -> str:
         return str(uuid.uuid5(uuid.NAMESPACE_URL, session_id))
 
 
+def _resolve_session_id(**kwargs: Any) -> str | None:
+    """Resolve the real session id for an event.
+
+    Mirrors the opencode plugin, which threads ``session_id`` on every
+    ``tool.execute.before``/``after`` call: prefer the ``session_id`` kwarg
+    the harness hands us for *this* event, then fall back to the id captured
+    on ``on_session_start``. Returns ``None`` only when neither is available
+    (no session-start fired and the harness omitted the kwarg) — in which
+    case the caller records with ``principal_id`` only rather than emitting
+    a bogus placeholder.
+    """
+    raw = kwargs.get("session_id")
+    if raw is None or not str(raw).strip():
+        return _SESSION_ID
+    return _normalize_session_id(str(raw))
+
+
+def _build_delegation(cfg: Any, **kwargs: Any) -> dict[str, Any]:
+    """Build the ``on_behalf_of`` chain for a tool-call event.
+
+    Always carries ``principal_id``; carries ``session_id`` when a real one
+    can be resolved. A placeholder (``"pending"`` etc.) is never used, so no
+    bogus session id escapes into a persisted event.
+    """
+    delegation: dict[str, Any] = {
+        "principal_id": cfg.principal_id or "human:unknown",
+    }
+    session_id = _resolve_session_id(**kwargs)
+    if session_id is not None:
+        delegation["session_id"] = session_id
+    return delegation
+
+
 def _safe(fn: Any) -> None:
     """Execute ``fn()`` and swallow any exception (fail-open)."""
     try:
@@ -271,7 +336,7 @@ def register(ctx: Any) -> None:
 
 def on_pre_tool_call(**kwargs: Any) -> None:
     """Record the start of a tool call via CairnAdapter.begin_tool_call."""
-    adapter, _regista, _cfg = _get_adapter()
+    adapter, _regista, cfg = _get_adapter()
     if adapter is None:
         return
 
@@ -284,10 +349,16 @@ def on_pre_tool_call(**kwargs: Any) -> None:
     def _record() -> None:
         files = _extract_files(args)
 
+        # Thread the real session_id (from this event's kwargs, else the id
+        # captured on session start) into the delegation chain — never the
+        # adapter default, which carries principal_id only.
+        delegation = _build_delegation(cfg, **kwargs)
+
         wi = adapter.begin_tool_call(
             tool=tool_name,
             tool_args=args,
             files=files,
+            on_behalf_of=delegation,
         )
         work_item_id = wi.work_item_id
 
@@ -301,7 +372,7 @@ def on_pre_tool_call(**kwargs: Any) -> None:
 
 def on_post_tool_call(**kwargs: Any) -> None:
     """Record the completion of a tool call via CairnAdapter.end_tool_call."""
-    adapter, _regista, _cfg = _get_adapter()
+    adapter, _regista, cfg = _get_adapter()
     if adapter is None:
         return
 
@@ -335,6 +406,10 @@ def on_post_tool_call(**kwargs: Any) -> None:
 
         exit_code = 0 if status == "ok" else 1
 
+        # Thread the real session_id into the end event's delegation chain,
+        # matching the begin event (opencode parity).
+        delegation = _build_delegation(cfg, **kwargs)
+
         adapter.end_tool_call(
             work_item_id,
             result_summary={
@@ -342,6 +417,7 @@ def on_post_tool_call(**kwargs: Any) -> None:
                 "stdout": stdout_text,
             },
             error=str(kwargs.get("error_message")) if status != "ok" else None,
+            on_behalf_of=delegation,
         )
 
     _safe(_record)
@@ -357,6 +433,14 @@ def on_session_start(**kwargs: Any) -> None:
 
     def _record() -> None:
         session_id = _normalize_session_id(session_id_raw)
+
+        # Capture the real session id so subsequent tool-call events that
+        # don't carry their own session_id kwarg still attribute correctly
+        # (mirrors opencode, which threads session_id on every event).
+        global _SESSION_ID
+        lock = _ensure_lock()
+        with lock:
+            _SESSION_ID = session_id
 
         harness_name = cfg.harness_name or "hermes"
         harness_version = cfg.harness_version or "unknown"
@@ -385,16 +469,50 @@ def on_session_end(**kwargs: Any) -> None:
             # We clear all entries since Hermes sessions are sequential.
             if session_id:
                 _WORK_ITEMS.clear()
+                # Drop the captured session id — a new session must
+                # re-capture. Only clear when we can identify the ending
+                # session, so a spurious session_end without an id is a
+                # true no-op rather than wiping in-flight attribution.
+                global _SESSION_ID
+                _SESSION_ID = None
 
     _safe(_cleanup)
 
 
 def reset_for_tests() -> None:
     """Reset module state for testing."""
-    global _ADAPTER, _REGISTA, _CFG, _WORK_ITEMS
+    global _ADAPTER, _REGISTA, _CFG, _WORK_ITEMS, _SESSION_ID
     lock = _ensure_lock()
     with lock:
         _ADAPTER = None
         _REGISTA = None
         _CFG = None
         _WORK_ITEMS = {}
+        _SESSION_ID = None
+
+
+# TODO(WI-5.2): delegation depth-2 is not wired here.
+#
+# Plan 010 WI-5.2 requires a depth-2 delegation chain for
+# Hermes → sub-agent (Claude Code / Codex) → tool call, so a sub-agent's
+# tool calls attribute to both the Hermes session and the human principal
+# rather than flattening to "Hermes did it" or orphaning as "Claude did it
+# unsanctioned."
+#
+# The chain is not wired because the (PROVISIONAL, WI-5.1-still-open) Hermes
+# hook surface assumed above does not expose sub-agent delegation context:
+# ``on_pre_tool_call`` / ``on_post_tool_call`` receive only the Hermes
+# session's own ``session_id`` — there is no ``parent_session_id``,
+# ``subagent_id``, ``delegate_of``, or child-session field in the kwargs
+# contract. With no sub-agent context to read, depth-2 cannot be populated
+# without inventing data.
+#
+# Once WI-5.1 confirms the real Hermes delegation hooks (e.g. a
+# ``subagent_start``/``subagent_end`` pair carrying the child session id, or
+# a ``parent_session_id`` field on tool-call events), extend
+# ``_build_delegation`` to emit a multi-level ``on_behalf_of``:
+#   {"principal_id": <human>, "session_id": <hermes>,
+#    "on_behalf_of": {"session_id": <child>, "harness": "claude-code"}}
+# and thread the child context through ``begin_tool_call`` / ``end_tool_call``.
+# The adapter and regista already support arbitrary delegation depth (BC-197);
+# only the harness context is missing.
