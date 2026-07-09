@@ -16,6 +16,7 @@ __all__ = [
     "BundleDiff",
     "BundleDiffEntry",
     "ChainContiguityViolation",
+    "ContentCoverageGap",
     "DelegationChainEntry",
     "FileProvenanceEntry",
     "KeyRevocationEntry",
@@ -191,6 +192,9 @@ class ScopeAttestationEntry:
     harnesses: tuple[dict[str, Any], ...]
     scope_statement: str
     harness_config_digests: dict[str, str] | None = None
+    content_capture: bool = False
+    content_encryption: str = "off"
+    redaction_policy: str | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +208,9 @@ class SessionAttestationEntry:
     harnesses: tuple[dict[str, Any], ...]
     scope_statement: str
     harness_config_digests: dict[str, str] | None = None
+    content_capture: bool = False
+    content_encryption: str = "off"
+    redaction_policy: str | None = None
 
 
 @dataclass(frozen=True)
@@ -365,6 +372,22 @@ class AssuranceEntry:
     detail: str
 
 
+@dataclass(frozen=True)
+class ContentCoverageGap:
+    """A session that declared content capture but has digest-only events.
+
+    Plan 010 WI-6.1: a session attested as ``content_capture=true`` but
+    missing content fields on events that should have them (prompt/response
+    events with only digests).  This is the content-layer analogue of
+    Plan 009's "wired but not attesting."
+    """
+
+    session_id: str
+    event_id: str
+    transition: str
+    detail: str
+
+
 @dataclass
 class VerificationReport:
     total_events: int = 0
@@ -392,6 +415,7 @@ class VerificationReport:
     principal_binding_violations: list[PrincipalBindingViolation] = field(default_factory=list)
     attestation_gaps: list[AttestationGap] = field(default_factory=list)
     assurance_entries: list[AssuranceEntry] = field(default_factory=list)
+    content_coverage_gaps: list[ContentCoverageGap] = field(default_factory=list)
     scheme_counts: dict[str, int] = field(default_factory=dict)
     bundle_hash_ok: bool | None = None
     bundle_hash_detail: str | None = None
@@ -439,6 +463,7 @@ class VerificationReport:
             and len(self.chain_contiguity_violations) == 0
             and len(self.principal_binding_violations) == 0
             and len(self.attestation_gaps) == 0
+            and len(self.content_coverage_gaps) == 0
             and bundle_ok
             and chain_ok
         )

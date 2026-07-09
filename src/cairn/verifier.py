@@ -43,6 +43,7 @@ from cairn.verifier_types import (
     BundleDiff,
     BundleDiffEntry,
     ChainContiguityViolation,
+    ContentCoverageGap,
     DelegationChainEntry,
     FileProvenanceEntry,
     KeyRevocationEntry,
@@ -75,6 +76,7 @@ __all__ = [
     "BundleDiff",
     "BundleDiffEntry",
     "ChainContiguityViolation",
+    "ContentCoverageGap",
     "DelegationChainEntry",
     "FileProvenanceEntry",
     "KeyRevocationEntry",
@@ -250,6 +252,7 @@ class Verifier:
         self._check_scope_coverage(events, report)
         self._check_principal_binding(events, report)
         self._check_attestation_gaps(events, report)
+        self._check_content_coverage_gaps(events, report)
         self._check_temporal_ordering(events, report)
         self._compute_assurance_levels(events, report)
 
@@ -668,6 +671,9 @@ class Verifier:
                 harnesses=tuple(payload.get("harnesses", [])),
                 scope_statement=payload.get("scope_statement", ""),
                 harness_config_digests=payload.get("harness_config_digests"),
+                content_capture=payload.get("content_capture", False),
+                content_encryption=payload.get("content_encryption", "off"),
+                redaction_policy=payload.get("redaction_policy"),
             )
         )
 
@@ -690,6 +696,9 @@ class Verifier:
                 harnesses=tuple(payload.get("harnesses", [])),
                 scope_statement=payload.get("scope_statement", ""),
                 harness_config_digests=payload.get("harness_config_digests"),
+                content_capture=payload.get("content_capture", False),
+                content_encryption=payload.get("content_encryption", "off"),
+                redaction_policy=payload.get("redaction_policy"),
             )
         )
 
@@ -1812,6 +1821,62 @@ class Verifier:
                     ),
                 )
             )
+
+    def _check_content_coverage_gaps(
+        self, events: list[Event], report: VerificationReport
+    ) -> None:
+        """Detect sessions that declared content capture but have digest-only events.
+
+        Plan 010 WI-6.1: a session attested as ``content_capture=true`` but
+        missing content fields on events that should have them (prompt/response
+        events with only digests).  This is the content-layer analogue of
+        Plan 009's "wired but not attesting."
+        """
+        content_sessions: dict[str, bool] = {}
+        for sess_sa in report.session_attestations:
+            if sess_sa.content_capture:
+                content_sessions[sess_sa.session_id] = True
+
+        if not content_sessions:
+            return
+
+        content_transitions = {
+            "user_message",
+            "assistant_message",
+            "transcript_attestation",
+        }
+        for ev in events:
+            transition = ev.transition or ""
+            if transition not in content_transitions:
+                continue
+            payload = ev.payload or {}
+            session_id = payload.get("session_id")
+            if not session_id:
+                if ev.on_behalf_of:
+                    session_id = ev.on_behalf_of.get("session_id")
+            if not session_id or session_id not in content_sessions:
+                continue
+
+            has_digest = "message_digest" in payload or "transcript_digest" in payload
+            has_content = (
+                "message_content" in payload
+                or "transcript_content" in payload
+            )
+            if has_digest and not has_content:
+                report.content_coverage_gaps.append(
+                    ContentCoverageGap(
+                        session_id=str(session_id),
+                        event_id=str(ev.event_id),
+                        transition=transition,
+                        detail=(
+                            f"Session {session_id} declared content_capture=true "
+                            f"but event {ev.event_id} ({transition}) has only a "
+                            f"digest — content field is missing. The session "
+                            f"declared content capture but this event was "
+                            f"recorded digest-only."
+                        ),
+                    )
+                )
 
     def _accumulate_key_revocations(self, report: VerificationReport, ev: Event) -> None:
         """Detect key_revocation events and flag events signed after revocation.

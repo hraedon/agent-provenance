@@ -98,6 +98,9 @@ class CairnEnvConfig:
     principal_id: str | None = None
     state_dir: str = _DEFAULT_STATE_DIR
     disabled: bool = False
+    content_key_ref: str | None = None
+    content_key_path: str | None = None
+    content_encryption: str = "on"
 
     @property
     def is_configured(self) -> bool:
@@ -154,6 +157,23 @@ def resolve_config() -> CairnEnvConfig:
     )
     disabled = _parse_bool(os.environ.get("CAIRN_DISABLE"))
 
+    content_key_ref = (
+        os.environ.get("CAIRN_CONTENT_KEY_REF")
+        or suite_env.get("CAIRN_CONTENT_KEY_REF")
+    )
+    content_key_path = (
+        os.environ.get("CAIRN_CONTENT_KEY_PATH")
+        or suite_env.get("CAIRN_CONTENT_KEY_PATH")
+    )
+    content_encryption_raw = (
+        os.environ.get("CAIRN_CONTENT_ENCRYPTION")
+        or suite_env.get("CAIRN_CONTENT_ENCRYPTION")
+        or "on"
+    )
+    content_encryption = content_encryption_raw.strip().lower()
+    if content_encryption not in ("on", "off", "external"):
+        content_encryption = "on"
+
     return CairnEnvConfig(
         dsn=dsn,
         key_path=key_path,
@@ -164,4 +184,7 @@ def resolve_config() -> CairnEnvConfig:
         principal_id=principal_id,
         state_dir=state_dir,
         disabled=disabled,
+        content_key_ref=content_key_ref,
+        content_key_path=content_key_path,
+        content_encryption=content_encryption,
     )

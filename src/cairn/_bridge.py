@@ -165,7 +165,15 @@ def main() -> None:
     action = msg.get("action")
     files = [f for f in (msg.get("files") or []) if isinstance(f, str)]
 
-    if action not in ("attest_scope", "attest_session", "begin", "end"):
+    if action not in (
+        "attest_scope",
+        "attest_session",
+        "begin",
+        "end",
+        "user_message",
+        "assistant_message",
+        "transcript_attestation",
+    ):
         sys.stderr.write(f"cairn_bridge: unknown action {action!r}\n")
         sys.exit(1)
 
@@ -269,6 +277,39 @@ def _dispatch(
             result_summary=msg.get("result_summary"),
             files=files,
             error=msg.get("error"),
+        )
+        return {"status": "ok", "event_id": str(event.event_id)}
+
+    if action == "user_message":
+        message = msg.get("message", "")
+        content_capture = msg.get("content_capture", True)
+        event = adapter.record_user_message(
+            session_id=session_id,
+            message=message,
+            sequence=msg.get("sequence"),
+            content_capture=content_capture,
+        )
+        return {"status": "ok", "event_id": str(event.event_id)}
+
+    if action == "assistant_message":
+        message = msg.get("message", "")
+        content_capture = msg.get("content_capture", True)
+        event = adapter.record_assistant_message(
+            session_id=session_id,
+            message=message,
+            sequence=msg.get("sequence"),
+            content_capture=content_capture,
+        )
+        return {"status": "ok", "event_id": str(event.event_id)}
+
+    if action == "transcript_attestation":
+        transcript = msg.get("transcript", "")
+        content_capture = msg.get("content_capture", True)
+        event = adapter.attest_transcript(
+            session_id=session_id,
+            transcript=transcript,
+            event_count=msg.get("event_count"),
+            content_capture=content_capture,
         )
         return {"status": "ok", "event_id": str(event.event_id)}
 

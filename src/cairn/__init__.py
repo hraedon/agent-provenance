@@ -8,6 +8,10 @@ from importlib.metadata import version as _pkg_version
 from .adapter import CairnAdapter
 from .client import CairnClient, ToolCallContext
 from .schema import (
+    CONTENT_ENCRYPTION_EXTERNAL,
+    CONTENT_ENCRYPTION_OFF,
+    CONTENT_ENCRYPTION_ON,
+    AssistantMessagePayload,
     CairnConfig,
     FileDigest,
     ResultSummary,
@@ -16,6 +20,8 @@ from .schema import (
     ToolCallBegin,
     ToolCallEnd,
     ToolCallEvent,
+    TranscriptAttestationPayload,
+    UserMessagePayload,
     check_key_file_permissions,
 )
 from .verifier import SessionAttestationEntry
@@ -31,6 +37,10 @@ def _get_version() -> str:
 __version__ = _get_version()
 
 __all__ = [
+    "CONTENT_ENCRYPTION_EXTERNAL",
+    "CONTENT_ENCRYPTION_OFF",
+    "CONTENT_ENCRYPTION_ON",
+    "AssistantMessagePayload",
     "CairnAdapter",
     "CairnClient",
     "CairnConfig",
@@ -43,6 +53,8 @@ __all__ = [
     "ToolCallContext",
     "ToolCallEnd",
     "ToolCallEvent",
+    "TranscriptAttestationPayload",
+    "UserMessagePayload",
     "__version__",
     "check_key_file_permissions",
 ]

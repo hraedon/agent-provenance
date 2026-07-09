@@ -231,6 +231,17 @@ def digest_file(path: str) -> str | None:
         return None
 
 
+CONTENT_ENCRYPTION_ON = "on"
+CONTENT_ENCRYPTION_OFF = "off"
+CONTENT_ENCRYPTION_EXTERNAL = "external"
+
+_CONTENT_ENCRYPTION_VALID = frozenset({
+    CONTENT_ENCRYPTION_ON,
+    CONTENT_ENCRYPTION_OFF,
+    CONTENT_ENCRYPTION_EXTERNAL,
+})
+
+
 @dataclass(frozen=True)
 class ScopeAttestationPayload:
     version: str
@@ -239,6 +250,9 @@ class ScopeAttestationPayload:
     harnesses: list[dict[str, Any]]
     scope_statement: str
     harness_config_digests: dict[str, str] | None = None
+    content_capture: bool = False
+    content_encryption: str = CONTENT_ENCRYPTION_OFF
+    redaction_policy: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -250,6 +264,10 @@ class ScopeAttestationPayload:
         }
         if self.harness_config_digests is not None:
             d["harness_config_digests"] = self.harness_config_digests
+        d["content_capture"] = self.content_capture
+        d["content_encryption"] = self.content_encryption
+        if self.redaction_policy is not None:
+            d["redaction_policy"] = self.redaction_policy
         return d
 
     @classmethod
@@ -261,6 +279,9 @@ class ScopeAttestationPayload:
             harnesses=data["harnesses"],
             scope_statement=data["scope_statement"],
             harness_config_digests=data.get("harness_config_digests"),
+            content_capture=data.get("content_capture", False),
+            content_encryption=data.get("content_encryption", CONTENT_ENCRYPTION_OFF),
+            redaction_policy=data.get("redaction_policy"),
         )
 
 
@@ -273,6 +294,9 @@ class SessionAttestationPayload:
     harnesses: list[dict[str, Any]]
     scope_statement: str
     harness_config_digests: dict[str, str] | None = None
+    content_capture: bool = False
+    content_encryption: str = CONTENT_ENCRYPTION_OFF
+    redaction_policy: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -285,6 +309,10 @@ class SessionAttestationPayload:
         }
         if self.harness_config_digests is not None:
             d["harness_config_digests"] = self.harness_config_digests
+        d["content_capture"] = self.content_capture
+        d["content_encryption"] = self.content_encryption
+        if self.redaction_policy is not None:
+            d["redaction_policy"] = self.redaction_policy
         return d
 
     @classmethod
@@ -297,6 +325,140 @@ class SessionAttestationPayload:
             harnesses=data["harnesses"],
             scope_statement=data["scope_statement"],
             harness_config_digests=data.get("harness_config_digests"),
+            content_capture=data.get("content_capture", False),
+            content_encryption=data.get("content_encryption", CONTENT_ENCRYPTION_OFF),
+            redaction_policy=data.get("redaction_policy"),
+        )
+
+
+@dataclass(frozen=True)
+class UserMessagePayload:
+    """The human's prompt/message to the agent (Plan 010 WI-2.1).
+
+    The ``message_digest`` is always present (integrity).  The
+    ``message_content`` is present only when ``content_capture=true`` (v2);
+    it is encrypted at rest when content encryption is on.
+    """
+
+    message_digest: str
+    message_content: str | dict[str, Any] | None = None
+    role: str = "user"
+    sequence: int | None = None
+    on_behalf_of: dict[str, Any] | None = None
+    harness: CairnConfig | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "message_digest": self.message_digest,
+            "role": self.role,
+        }
+        if self.message_content is not None:
+            d["message_content"] = self.message_content
+        if self.sequence is not None:
+            d["sequence"] = self.sequence
+        if self.on_behalf_of is not None:
+            d["on_behalf_of"] = self.on_behalf_of
+        if self.harness is not None:
+            d["harness"] = self.harness.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> UserMessagePayload:
+        return cls(
+            message_digest=data["message_digest"],
+            message_content=data.get("message_content"),
+            role=data.get("role", "user"),
+            sequence=data.get("sequence"),
+            on_behalf_of=data.get("on_behalf_of"),
+            harness=CairnConfig.from_dict(data["harness"]) if "harness" in data else None,
+        )
+
+
+@dataclass(frozen=True)
+class AssistantMessagePayload:
+    """The model's response/reasoning (Plan 010 WI-2.1).
+
+    The ``message_digest`` is always present (integrity).  The
+    ``message_content`` is present only when ``content_capture=true`` (v2);
+    it is encrypted at rest when content encryption is on.
+    """
+
+    message_digest: str
+    message_content: str | dict[str, Any] | None = None
+    role: str = "assistant"
+    sequence: int | None = None
+    on_behalf_of: dict[str, Any] | None = None
+    harness: CairnConfig | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "message_digest": self.message_digest,
+            "role": self.role,
+        }
+        if self.message_content is not None:
+            d["message_content"] = self.message_content
+        if self.sequence is not None:
+            d["sequence"] = self.sequence
+        if self.on_behalf_of is not None:
+            d["on_behalf_of"] = self.on_behalf_of
+        if self.harness is not None:
+            d["harness"] = self.harness.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AssistantMessagePayload:
+        return cls(
+            message_digest=data["message_digest"],
+            message_content=data.get("message_content"),
+            role=data.get("role", "assistant"),
+            sequence=data.get("sequence"),
+            on_behalf_of=data.get("on_behalf_of"),
+            harness=CairnConfig.from_dict(data["harness"]) if "harness" in data else None,
+        )
+
+
+@dataclass(frozen=True)
+class TranscriptAttestationPayload:
+    """A whole-session or segment digest + optional content (Plan 010 WI-2.1).
+
+    Upgraded from digest-only (Plan 009 WI-3.2) to content-optional.
+    The ``transcript_digest`` is always present (integrity).  The
+    ``transcript_content`` is present only when ``content_capture=true`` (v2);
+    it is encrypted at rest when content encryption is on.
+    """
+
+    transcript_digest: str
+    transcript_content: str | dict[str, Any] | None = None
+    event_count: int | None = None
+    session_id: str | None = None
+    on_behalf_of: dict[str, Any] | None = None
+    harness: CairnConfig | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "transcript_digest": self.transcript_digest,
+        }
+        if self.transcript_content is not None:
+            d["transcript_content"] = self.transcript_content
+        if self.event_count is not None:
+            d["event_count"] = self.event_count
+        if self.session_id is not None:
+            d["session_id"] = self.session_id
+        if self.on_behalf_of is not None:
+            d["on_behalf_of"] = self.on_behalf_of
+        if self.harness is not None:
+            d["harness"] = self.harness.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TranscriptAttestationPayload:
+        return cls(
+            transcript_digest=data["transcript_digest"],
+            transcript_content=data.get("transcript_content"),
+            event_count=data.get("event_count"),
+            session_id=data.get("session_id"),
+            on_behalf_of=data.get("on_behalf_of"),
+            harness=CairnConfig.from_dict(data["harness"]) if "harness" in data else None,
         )
 
 

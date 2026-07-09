@@ -485,6 +485,78 @@ def handle_session_end() -> None:
             pass
 
 
+def handle_message_display() -> None:
+    """Capture assistant message content (Plan 010 WI-2.2).
+
+    Claude Code's ``MessageDisplay`` hook fires when the model produces
+    output.  We capture the assistant's message content as a signed
+    event — this is the v2 content-capture surface.
+    """
+    raw = sys.stdin.read()
+    _capture_raw("message-display", raw)
+    hook_input = json.loads(raw)
+    session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
+
+    message = ""
+    if "message" in hook_input:
+        msg_val = hook_input["message"]
+        if isinstance(msg_val, str):
+            message = msg_val
+        elif isinstance(msg_val, dict):
+            content = msg_val.get("content")
+            if isinstance(content, list):
+                parts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        parts.append(block["text"])
+                if parts:
+                    message = "\n".join(parts)
+            elif isinstance(content, str):
+                message = content
+            else:
+                message = json.dumps(msg_val, sort_keys=True, ensure_ascii=False)
+        else:
+            message = str(msg_val)
+    elif "text" in hook_input:
+        message = str(hook_input["text"])
+
+    if not message:
+        return
+
+    reply = _run_bridge(
+        {
+            "action": "assistant_message",
+            "session_id": session_id,
+            "message": message,
+        }
+    )
+    if not reply or reply.get("status") != "ok":
+        _mark_degraded(session_id, "message_display", "assistant message bridge call failed")
+
+
+def handle_stop() -> None:
+    """Capture transcript attestation on session stop (Plan 010 WI-2.2).
+
+    When Claude Code emits a ``Stop`` event, we attest the session
+    transcript.  The transcript is the concatenation of all captured
+    messages in order — the digest is computed over the full transcript.
+    """
+    raw = sys.stdin.read()
+    _capture_raw("stop", raw)
+    hook_input = json.loads(raw)
+    session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
+
+    reply = _run_bridge(
+        {
+            "action": "transcript_attestation",
+            "session_id": session_id,
+            "transcript": raw,
+        }
+    )
+    if not reply or reply.get("status") != "ok":
+        _mark_degraded(session_id, "stop", "transcript attestation bridge call failed")
+
+
 def _env_truthy(name: str) -> bool:
     val = os.environ.get(name)
     if val is None:
@@ -498,7 +570,8 @@ def main() -> None:
 
     if len(sys.argv) < 2:
         print(
-            "Usage: cairn_hook.py <pre|post|post-failure|session-start|session-end>",
+            "Usage: cairn_hook.py <pre|post|post-failure|session-start|session-end"
+            "|message-display|stop>",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -516,6 +589,10 @@ def main() -> None:
             handle_session_start()
         elif action == "session-end":
             handle_session_end()
+        elif action == "message-display":
+            handle_message_display()
+        elif action == "stop":
+            handle_stop()
         else:
             print(f"Unknown action: {action}", file=sys.stderr)
             sys.exit(1)

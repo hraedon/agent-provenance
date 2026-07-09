@@ -45,6 +45,8 @@ HOOK_EVENTS: dict[str, str] = {
     "PostToolUseFailure": "post-failure",
     "SessionStart": "session-start",
     "SessionEnd": "session-end",
+    "MessageDisplay": "message-display",
+    "Stop": "stop",
 }
 
 _ENV_VARS = [
@@ -729,6 +731,20 @@ def run_install_harness(
             results.append(_install_opencode(cfg, dry_run=dry_run, uninstall=uninstall, user=user))
         elif t == "hermes":
             results.append(_install_hermes(cfg, dry_run=dry_run, uninstall=uninstall, user=user))
+        elif t in ("agy", "codex"):
+            results.append(InstallResult(
+                harness=t,
+                user=user,
+                no_op=True,
+                actions=[
+                    InstallAction(
+                        "skip",
+                        "",
+                        f"{t} adapter not yet implemented "
+                        f"(Plan 010 WI-5.{'3' if t == 'agy' else '4'} deferred)",
+                    )
+                ],
+            ))
     return results
 
 

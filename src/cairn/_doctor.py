@@ -184,6 +184,46 @@ def _check_bridge() -> dict[str, Any]:
     }
 
 
+def _check_content_encryption(cfg: Any) -> dict[str, Any]:
+    """Check content-encryption stance (Plan 010 WI-3.1).
+
+    When content encryption is off, emit a WARNING — the log now holds
+    every secret/PII that passed through the session.
+    """
+    stance = getattr(cfg, "content_encryption", "on")
+    if stance == "off":
+        return {
+            "name": "content_encryption",
+            "status": "warn",
+            "detail": (
+                "Content encryption is OFF — session content is stored in "
+                "plaintext. The log itself is now a sensitive artifact."
+            ),
+        }
+    if stance == "external":
+        return {
+            "name": "content_encryption",
+            "status": "ok",
+            "detail": "Content encryption delegated to lower layer (external)",
+        }
+    key_ref = getattr(cfg, "content_key_ref", None) or getattr(cfg, "content_key_path", None)
+    if not key_ref:
+        return {
+            "name": "content_encryption",
+            "status": "warn",
+            "detail": (
+                "Content encryption is ON but no content key configured "
+                "(CAIRN_CONTENT_KEY_REF / CAIRN_CONTENT_KEY_PATH). "
+                "Content capture will store plaintext until a key is set."
+            ),
+        }
+    return {
+        "name": "content_encryption",
+        "status": "ok",
+        "detail": f"Content encryption ON (key: {key_ref[:40]}...)",
+    }
+
+
 def run_doctor(*, json_output: bool = False) -> int:
     cfg = resolve_config()
 
@@ -193,6 +233,7 @@ def run_doctor(*, json_output: bool = False) -> int:
         _check_regista(cfg),
         _check_harness_wired(cfg),
         _check_bridge(),
+        _check_content_encryption(cfg),
     ]
 
     regista_check = next((c for c in checks if c["name"] == "regista"), None)

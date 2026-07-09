@@ -39,7 +39,9 @@ from typing import Any
 import structlog
 from regista import Regista
 
+from ._content_crypto import encrypt_content_fields, resolve_content_encryption_stance
 from .schema import (
+    AssistantMessagePayload,
     CairnConfig,
     FileDigest,
     ResultSummary,
@@ -47,6 +49,8 @@ from .schema import (
     SessionAttestationPayload,
     ToolCallBegin,
     ToolCallEnd,
+    TranscriptAttestationPayload,
+    UserMessagePayload,
     build_redacted_args,
     digest_file,
     digest_string,
@@ -108,6 +112,9 @@ class CairnAdapter:
         attested_at: str | None = None,
         actor_id: str | None = None,
         event_id: uuid.UUID | None = None,
+        content_capture: bool = False,
+        content_encryption: str | None = None,
+        redaction_policy: str | None = None,
     ) -> Any:
         """Record a signed scope-attestation event.
 
@@ -127,19 +134,28 @@ class CairnAdapter:
             attested_at: ISO-8601 timestamp (defaults to now).
             actor_id: Actor for this event (defaults to adapter default).
             event_id: Explicit UUID for idempotency.
+            content_capture: Whether this session captures content (v2).
+            content_encryption: ``"on"`` | ``"off"`` | ``"external"``.
+                Defaults to resolving from the environment.
+            redaction_policy: Name/digest of the active redaction policy.
 
         Returns:
             The :class:`~regista.Event` that records the attestation.
         """
         actor = actor_id or self._actor_id
         ts = attested_at or datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+        if content_encryption is None:
+            content_encryption = resolve_content_encryption_stance()
         payload = ScopeAttestationPayload(
-            version="1",
+            version="2" if content_capture else "1",
             principal_id=principal_id,
             attested_at=ts,
             harnesses=harnesses,
             scope_statement=scope_statement,
             harness_config_digests=harness_config_digests,
+            content_capture=content_capture,
+            content_encryption=content_encryption,
+            redaction_policy=redaction_policy,
         ).to_dict()
 
         wi, _creation_event = self._sub.create_work_item(
@@ -191,6 +207,9 @@ class CairnAdapter:
         attested_at: str | None = None,
         actor_id: str | None = None,
         event_id: uuid.UUID | None = None,
+        content_capture: bool = False,
+        content_encryption: str | None = None,
+        redaction_policy: str | None = None,
     ) -> Any:
         """Record a session-level attestation as a non-work-item entity.
 
@@ -206,20 +225,29 @@ class CairnAdapter:
             attested_at: ISO-8601 timestamp (defaults to now).
             actor_id: Actor for this event (defaults to adapter default).
             event_id: Explicit UUID for idempotency.
+            content_capture: Whether this session captures content (v2).
+            content_encryption: ``"on"`` | ``"off"`` | ``"external"``.
+                Defaults to resolving from the environment.
+            redaction_policy: Name/digest of the active redaction policy.
 
         Returns:
             The appended Event recording the attestation.
         """
         actor = actor_id or self._actor_id
         ts = attested_at or datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+        if content_encryption is None:
+            content_encryption = resolve_content_encryption_stance()
         payload = SessionAttestationPayload(
-            version="1",
+            version="2" if content_capture else "1",
             principal_id=principal_id,
             session_id=session_id,
             attested_at=ts,
             harnesses=harnesses,
             scope_statement=scope_statement,
             harness_config_digests=harness_config_digests,
+            content_capture=content_capture,
+            content_encryption=content_encryption,
+            redaction_policy=redaction_policy,
         ).to_dict()
 
         try:
@@ -403,6 +431,200 @@ class CairnAdapter:
             error=error,
         )
         return event
+
+    # ----------------------------------------------------------------------
+    # Content capture (Plan 010 WI-2.1)
+    # ----------------------------------------------------------------------
+
+    def record_user_message(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        sequence: int | None = None,
+        on_behalf_of: dict[str, Any] | None = None,
+        actor_id: str | None = None,
+        event_id: uuid.UUID | None = None,
+        content_capture: bool = True,
+    ) -> Any:
+        """Record a user message (the human's prompt) as a signed event.
+
+        The message digest is always computed (integrity).  When
+        ``content_capture`` is true, the message content is also stored,
+        encrypted at rest when content encryption is on (WI-3.2).
+        """
+        actor = actor_id or self._actor_id
+        delegation = on_behalf_of or self._on_behalf_of
+        message_digest = digest_string(message) or ""
+
+        content: str | None = message if content_capture else None
+        payload = UserMessagePayload(
+            message_digest=message_digest,
+            message_content=content,
+            sequence=sequence,
+            on_behalf_of=delegation,
+            harness=self._config,
+        ).to_dict()
+
+        if content_capture:
+            payload = encrypt_content_fields(payload)
+
+        entity_id = uuid.UUID(session_id) if isinstance(session_id, str) else session_id
+        event = self._sub.append_event(
+            work_item_id=entity_id,
+            actor_id=actor,
+            actor_kind=self._actor_kind,
+            actor_metadata={"role": "agent", "phase": "user_message"},
+            transition="user_message",
+            payload=payload,
+            on_behalf_of=delegation,
+            entity_kind="session",
+            event_id=event_id,
+        )
+        log.info("cairn.user_message", session_id=session_id, actor=actor)
+        return event
+
+    def record_assistant_message(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        sequence: int | None = None,
+        on_behalf_of: dict[str, Any] | None = None,
+        actor_id: str | None = None,
+        event_id: uuid.UUID | None = None,
+        content_capture: bool = True,
+    ) -> Any:
+        """Record an assistant message (the model's response) as a signed event.
+
+        The message digest is always computed (integrity).  When
+        ``content_capture`` is true, the message content is also stored,
+        encrypted at rest when content encryption is on (WI-3.2).
+        """
+        actor = actor_id or self._actor_id
+        delegation = on_behalf_of or self._on_behalf_of
+        message_digest = digest_string(message) or ""
+
+        content: str | None = message if content_capture else None
+        payload = AssistantMessagePayload(
+            message_digest=message_digest,
+            message_content=content,
+            sequence=sequence,
+            on_behalf_of=delegation,
+            harness=self._config,
+        ).to_dict()
+
+        if content_capture:
+            payload = encrypt_content_fields(payload)
+
+        entity_id = uuid.UUID(session_id) if isinstance(session_id, str) else session_id
+        event = self._sub.append_event(
+            work_item_id=entity_id,
+            actor_id=actor,
+            actor_kind=self._actor_kind,
+            actor_metadata={"role": "agent", "phase": "assistant_message"},
+            transition="assistant_message",
+            payload=payload,
+            on_behalf_of=delegation,
+            entity_kind="session",
+            event_id=event_id,
+        )
+        log.info("cairn.assistant_message", session_id=session_id, actor=actor)
+        return event
+
+    def attest_transcript(
+        self,
+        session_id: str,
+        transcript: str,
+        *,
+        event_count: int | None = None,
+        on_behalf_of: dict[str, Any] | None = None,
+        actor_id: str | None = None,
+        event_id: uuid.UUID | None = None,
+        content_capture: bool = True,
+    ) -> Any:
+        """Record a transcript attestation (whole-session or segment).
+
+        Upgraded from digest-only (Plan 009 WI-3.2) to content-optional.
+        The transcript digest is always present (integrity).  When
+        ``content_capture`` is true, the transcript content is also
+        stored, encrypted at rest when content encryption is on (WI-3.2).
+        """
+        actor = actor_id or self._actor_id
+        delegation = on_behalf_of or self._on_behalf_of
+        transcript_digest = digest_string(transcript) or ""
+
+        content: str | None = transcript if content_capture else None
+        payload = TranscriptAttestationPayload(
+            transcript_digest=transcript_digest,
+            transcript_content=content,
+            event_count=event_count,
+            session_id=session_id,
+            on_behalf_of=delegation,
+            harness=self._config,
+        ).to_dict()
+
+        if content_capture:
+            payload = encrypt_content_fields(payload)
+
+        entity_id = uuid.UUID(session_id) if isinstance(session_id, str) else session_id
+        event = self._sub.append_event(
+            work_item_id=entity_id,
+            actor_id=actor,
+            actor_kind=self._actor_kind,
+            actor_metadata={"role": "agent", "phase": "transcript_attestation"},
+            transition="transcript_attestation",
+            payload=payload,
+            on_behalf_of=delegation,
+            entity_kind="session",
+            event_id=event_id,
+        )
+        log.info("cairn.transcript_attestation", session_id=session_id, actor=actor)
+        return event
+
+    # ----------------------------------------------------------------------
+    # Delegation depth (Plan 010 WI-2.3)
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def build_delegation_chain(
+        principal_id: str,
+        *session_chain: str,
+        authenticated_at: str | None = None,
+        scope: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Build a multi-level delegation chain (WI-2.3).
+
+        For a Hermes→Claude Code→Edit session, the chain is::
+
+            principal_id (human) → session_id (Hermes) → session_id (Claude Code)
+
+        The full chain is threaded as ``on_behalf_of`` on every event,
+        so a sub-agent's tool calls attribute correctly to both the
+        parent session and the human principal.  A flat "Hermes did it"
+        or orphaned "Claude did it" is impossible.
+
+        Args:
+            principal_id: The human principal.
+            *session_chain: Session IDs from outermost to innermost
+                (e.g. ``hermes_session, claude_session``).
+            authenticated_at: When the principal was authenticated.
+            scope: The scope of the delegation.
+
+        Returns:
+            A delegation chain dict suitable for ``on_behalf_of``.
+        """
+        chain: dict[str, Any] = {
+            "principal_id": principal_id,
+        }
+        if session_chain:
+            chain["session_id"] = session_chain[-1]
+            chain["delegation_chain"] = list(session_chain)
+        if authenticated_at:
+            chain["authenticated_at"] = authenticated_at
+        if scope:
+            chain["scope"] = scope
+        return chain
 
     # ----------------------------------------------------------------------
     # Helpers

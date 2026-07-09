@@ -755,7 +755,7 @@ def timestamp(
 @main.command("install-harness")
 @click.argument(
     "harness",
-    type=click.Choice(["claude", "opencode", "all"]),
+    type=click.Choice(["claude", "opencode", "hermes", "agy", "codex", "all"]),
 )
 @click.option("--dry-run", is_flag=True, help="Print planned changes; act on nothing")
 @click.option("--uninstall", is_flag=True, help="Reverse a prior install-harness")
@@ -785,7 +785,7 @@ def install_harness(
 @main.command("uninstall-harness")
 @click.argument(
     "harness",
-    type=click.Choice(["claude", "opencode", "all"]),
+    type=click.Choice(["claude", "opencode", "hermes", "agy", "codex", "all"]),
 )
 @click.option("--dry-run", is_flag=True)
 @click.option("--json", "json_output", is_flag=True)
@@ -811,6 +811,53 @@ def doctor(json_output: bool) -> None:
     from ._doctor import run_doctor
 
     sys.exit(run_doctor(json_output=json_output))
+
+
+@main.command()
+@click.option("--bundle-path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--content-key-ref",
+    default=None,
+    help="Secret-ref for the content-encryption key (e.g. file:/path/to/key). "
+    "When omitted, resolves from CAIRN_CONTENT_KEY_REF.",
+)
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "html"]),
+    default="text",
+    help="Portal format: text (terminal) or HTML (browser)",
+)
+@click.option("--output", type=click.Path(path_type=Path), default=None)
+def portal(
+    bundle_path: Path,
+    content_key_ref: str | None,
+    fmt: str,
+    output: Path | None,
+) -> None:
+    """Render session content from a signed bundle (Plan 010 portal).
+
+    The portal surfaces the prompt/response transcript interleaved with
+    tool calls, file provenance, and attestation gaps.  Content is
+    decrypted when a content key is available; without the key, encrypted
+    fields are shown as ``[encrypted — content key not available]``.
+
+    For an external auditor, the offline bundle + ``cairn verify`` remains
+    the artifact; the portal is for authorized internal users.
+    """
+    from ._portal import render_portal
+
+    result = render_portal(
+        bundle_path,
+        content_key_ref=content_key_ref,
+        fmt=fmt,
+    )
+
+    if output:
+        output.write_text(result)
+        click.echo(f"Portal written to {output}")
+    else:
+        click.echo(result, nl=False)
 
 
 if __name__ == "__main__":

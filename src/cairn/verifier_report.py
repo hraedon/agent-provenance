@@ -150,6 +150,11 @@ def format_report(report: VerificationReport) -> str:
             if sa.harness_config_digests:
                 for name, digest in sa.harness_config_digests.items():
                     lines.append(f"      {name}: {digest[:16]}...")
+            scope_label = "v2 (content captured)" if sa.content_capture else "v1 (digests only)"
+            lines.append(f"    scope_version: {scope_label}")
+            lines.append(f"    content_encryption: {sa.content_encryption}")
+            if sa.redaction_policy:
+                lines.append(f"    redaction_policy: {sa.redaction_policy}")
         lines.append("")
 
     if report.session_attestations:
@@ -164,6 +169,20 @@ def format_report(report: VerificationReport) -> str:
             lines.append(f"    scope       : {sess_sa.scope_statement}")
             harness_names = ", ".join(h.get("name", "?") for h in sess_sa.harnesses)
             lines.append(f"    harnesses   : {harness_names}")
+            scope_label = (
+                "v2 (content captured)"
+                if sess_sa.content_capture
+                else "v1 (digests only)"
+            )
+            lines.append(f"    scope_version: {scope_label}")
+            lines.append(f"    content_encryption: {sess_sa.content_encryption}")
+            if sess_sa.redaction_policy:
+                lines.append(f"    redaction_policy: {sess_sa.redaction_policy}")
+            if sess_sa.content_capture and sess_sa.content_encryption == "off":
+                lines.append(
+                    "    WARNING: Content captured without encryption at rest —"
+                    " the log itself is now a sensitive artifact."
+                )
         lines.append("")
 
     if report.key_rotations:
@@ -353,6 +372,14 @@ def format_report(report: VerificationReport) -> str:
             lines.append(f"    -> {ag.detail}")
         lines.append("")
 
+    if report.content_coverage_gaps:
+        lines.append("CONTENT COVERAGE GAPS")
+        lines.append("-" * 40)
+        for cg in report.content_coverage_gaps:
+            lines.append(f"  session {cg.session_id} event {cg.event_id} ({cg.transition})")
+            lines.append(f"    -> {cg.detail}")
+        lines.append("")
+
     if report.assurance_entries:
         lines.append("REVIEW ASSURANCE LEVELS")
         lines.append("-" * 40)
@@ -463,6 +490,9 @@ def format_report_json(report: VerificationReport) -> dict[str, Any]:
                 "harnesses": s.harnesses,
                 "scope_statement": s.scope_statement,
                 "harness_config_digests": s.harness_config_digests,
+                "content_capture": s.content_capture,
+                "content_encryption": s.content_encryption,
+                "redaction_policy": s.redaction_policy,
             }
             for s in report.scope_attestations
         ],
@@ -477,6 +507,9 @@ def format_report_json(report: VerificationReport) -> dict[str, Any]:
                 "harnesses": list(s.harnesses),
                 "scope_statement": s.scope_statement,
                 "harness_config_digests": s.harness_config_digests,
+                "content_capture": s.content_capture,
+                "content_encryption": s.content_encryption,
+                "redaction_policy": s.redaction_policy,
             }
             for s in report.session_attestations
         ],
@@ -631,6 +664,15 @@ def format_report_json(report: VerificationReport) -> dict[str, Any]:
                 "detail": ag.detail,
             }
             for ag in report.attestation_gaps
+        ],
+        "content_coverage_gaps": [
+            {
+                "session_id": cg.session_id,
+                "event_id": cg.event_id,
+                "transition": cg.transition,
+                "detail": cg.detail,
+            }
+            for cg in report.content_coverage_gaps
         ],
         "assurance_entries": [
             {
