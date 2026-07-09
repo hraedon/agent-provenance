@@ -169,7 +169,9 @@ def _render_text(
             for msg in sess["messages"]:
                 role = msg["role"]
                 content = msg.get("content")
-                if content is None:
+                if content is None or (
+                    isinstance(content, dict) and content.get("encrypted") is True
+                ):
                     content = "[encrypted — content key not available]"
                 elif not isinstance(content, str):
                     content = json.dumps(content, indent=2, ensure_ascii=False)
@@ -219,7 +221,9 @@ def _render_html(
         for msg in sess["messages"]:
             role = msg["role"]
             content = msg.get("content")
-            if content is None:
+            if content is None or (
+                isinstance(content, dict) and content.get("encrypted") is True
+            ):
                 content_display = '<em>[encrypted — content key not available]</em>'
             elif not isinstance(content, str):
                 content_display = f"<pre>{_esc(json.dumps(content, indent=2))}</pre>"
