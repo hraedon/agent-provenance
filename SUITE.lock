@@ -10,7 +10,7 @@ version: "0.1.0"
 python: ">=3.11"
 
 regista:
-  ref: 07a0b861a7305cefadfb722d557164ce1a6e49be
+  ref: dd22197eaafe11afabdae488b6908a5729b3b343
   source: github.com/hraedon/regista
   version: ">=0.4.0"
   # Pin to a commit SHA, never a branch.  cairn and regista are a

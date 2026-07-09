@@ -96,7 +96,7 @@ requires-dist = [
     { name = "pynacl", marker = "extra == 'dev'", specifier = ">=1.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
-    { name = "regista", git = "https://github.com/hraedon/regista.git?rev=d7d156c3841f7d0137c91be2f0558e697c35f4cc" },
+    { name = "regista", git = "https://github.com/hraedon/regista.git?rev=dd22197eaafe11afabdae488b6908a5729b3b343" },
     { name = "rfc8785", specifier = ">=0.1.4" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "structlog", specifier = ">=24.1" },
@@ -823,7 +823,7 @@ wheels = [
 [[package]]
 name = "regista"
 version = "0.5.0"
-source = { git = "https://github.com/hraedon/regista.git?rev=d7d156c3841f7d0137c91be2f0558e697c35f4cc#d7d156c3841f7d0137c91be2f0558e697c35f4cc" }
+source = { git = "https://github.com/hraedon/regista.git?rev=dd22197eaafe11afabdae488b6908a5729b3b343#dd22197eaafe11afabdae488b6908a5729b3b343" }
 dependencies = [
     { name = "jsonschema" },
     { name = "prometheus-client" },
