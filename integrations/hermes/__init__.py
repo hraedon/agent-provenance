@@ -200,6 +200,10 @@ def _resolve_key_path(cfg: Any) -> str:
     try:
         key_data = json.loads(raw)
         if isinstance(key_data, dict) and "keys" in key_data:
+            # NOTE: a keyset resolved to inline secret material (not a
+            # secret_ref) lands verbatim in a 0o600 temp file cleaned at
+            # exit. Fail-closed key hygiene would refuse inline secrets and
+            # require secret_ref; revisit once WI-5.1 validates the backend.
             key_set = key_data
         else:
             key_set = {
@@ -466,7 +470,9 @@ def on_session_end(**kwargs: Any) -> None:
         lock = _ensure_lock()
         with lock:
             # Work items are keyed by tool_call_id, not session_id.
-            # We clear all entries since Hermes sessions are sequential.
+            # We clear all entries since Hermes sessions are assumed sequential
+            # (PROVISIONAL — WI-5.1 unverified). Concurrent sessions would need
+            # session-scoped tracking instead of a global clear.
             if session_id:
                 _WORK_ITEMS.clear()
                 # Drop the captured session id — a new session must

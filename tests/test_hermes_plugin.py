@@ -204,7 +204,7 @@ def test_disabled_makes_hooks_noop(monkeypatch, wired):
     assert hermes._WORK_ITEMS == {}
     assert hermes._SESSION_ID is None
     # No events of any kind were appended.
-    assert list(wired.sub.list_projects()) or True  # sub is alive but empty of events
+    assert wired.sub.query_work_items().items == []  # no work items created
 
 
 # ----------------------------------------------------------------------
