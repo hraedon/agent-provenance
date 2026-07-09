@@ -20,9 +20,26 @@ Environment (resolved via cairn._config — REGISTA_* preferred, CAIRN_* fallbac
     CAIRN_PROJECT                      Regista project name
     CAIRN_STATE_DIR                    Directory for session state (default: /tmp/cairn-sessions)
     CAIRN_DISABLE                      If set, silently exits 0
+    CAIRN_CAPTURE_DIR                   If set, raw stdin of every hook invocation
+                                      is written verbatim here (Plan 009 WI-1.1
+                                      capture mode — for recording real payloads
+                                      to use as test fixtures).
     PRINCIPAL_ID                       Human principal (default: OS user)
     CAIRN_HARNESS_NAME                 Harness name (default: claude-code)
     CAIRN_HARNESS_VERSION              Harness version (default: unknown)
+
+Capture correctness (Plan 009):
+  - ``tool_response`` is the canonical field Claude Code 2.1.200+ sends
+    (``tool_output`` is kept as a legacy fallback).
+  - The output digest is computed over the FULL untruncated output (UTF-8
+    bytes) before truncating for transport.  See
+    ``docs/digest-preimage-definition.md``.
+
+TODO(Plan 009 WI-3.1): Claude Code now emits additional lifecycle events
+(``PostToolBatch``, ``SubagentStart``/``SubagentStop``, ``MessageDisplay``,
+``Stop``/``StopFailure``, ``PostCompact``).  These are not yet handled —
+subagent attribution, batch coverage, and compaction attestation are
+deferred to Plan 009 Phase 3.
 """
 
 from __future__ import annotations
@@ -41,6 +58,110 @@ from typing import Any, cast
 _DEFAULT_STATE_DIR = str(Path(tempfile.gettempdir()) / "cairn-sessions")
 _FALLBACK_SESSION_ID = "unknown"
 _FALLBACK_TOOL_NAME = "unknown"
+
+# Maximum characters of tool output transported to the bridge for human
+# review.  The *digest* (WI-1.2) is always computed over the FULL output
+# before this cap is applied — the cap only limits the transported text,
+# not the audited preimage.
+_TRANSPORT_CAP = 2000
+
+# Canonical field name sent by Claude Code 2.1.200+ (verified by ``strings``
+# on the harness binary: 16 hits for ``tool_response``, zero for
+# ``tool_output``).  We keep ``tool_output`` as a legacy fallback for older
+# harness releases (Plan 009 WI-1.1).
+_CANONICAL_RESPONSE_FIELD = "tool_response"
+_LEGACY_RESPONSE_FIELD = "tool_output"
+
+
+def _capture_raw(action: str, hook_input_str: str) -> None:
+    """When ``CAIRN_CAPTURE_DIR`` is set, write the raw hook stdin verbatim.
+
+    Plan 009 WI-1.1: a capture mode lets the operator record real harness
+    payloads from a live Claude Code session, which are then sanitized and
+    committed as test fixtures (``tests/fixtures/hook_payloads/``).  This
+    is how we test against recorded reality rather than hand-written
+    payloads.
+    """
+    capture_dir = os.environ.get("CAIRN_CAPTURE_DIR")
+    if not capture_dir:
+        return
+    cdir = Path(capture_dir)
+    cdir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%S%f")
+    dest = cdir / f"{ts}_{action}.json"
+    try:
+        dest.write_text(hook_input_str)
+    except OSError:
+        pass
+
+
+def _normalize_response(value: Any) -> str:
+    """Normalize a ``tool_response`` / ``tool_output`` value to text.
+
+    Claude Code's ``tool_response`` field can arrive in several shapes
+    depending on the tool (string, ``{"content": [...]}`` content-block
+    array, or a free-form dict).  This helper extracts a plain text
+    representation suitable for digesting.
+
+    The preimage contract (Plan 009 WI-1.2): the digest covers the UTF-8
+    encoding of the string returned here.  An auditor reproduces the digest
+    by applying the same normalization to the real output, then encoding to
+    UTF-8.  See ``docs/digest-preimage-definition.md``.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        # Anthropic content-block array: {"content": [{"type":"text","text":"..."}]}
+        content = value.get("content")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    if isinstance(block.get("text"), str):
+                        parts.append(block["text"])
+                elif isinstance(block, str):
+                    parts.append(block)
+            if parts:
+                return "\n".join(parts)
+        # Bash-style: {"stdout": "...", "stderr": "..."}
+        for key in ("stdout", "output", "result", "text"):
+            v = value.get(key)
+            if isinstance(v, str):
+                return v
+        # Free-form dict — canonical JSON.
+        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+    if isinstance(value, list):
+        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+    return str(value)
+
+
+def _extract_tool_response(hook_input: dict[str, Any]) -> str:
+    """Read the tool result from the hook input (Plan 009 WI-1.1).
+
+    Claude Code 2.1.200 sends ``tool_response``; older releases sent
+    ``tool_output``.  We prefer the canonical field and fall back to the
+    legacy field for one release of backward compatibility.
+    """
+    if _CANONICAL_RESPONSE_FIELD in hook_input:
+        return _normalize_response(hook_input[_CANONICAL_RESPONSE_FIELD])
+    if _LEGACY_RESPONSE_FIELD in hook_input:
+        return _normalize_response(hook_input[_LEGACY_RESPONSE_FIELD])
+    return ""
+
+
+def _compute_output_digest(text: str) -> tuple[str, int]:
+    """Compute the SHA-256 digest and byte length of the full output.
+
+    Returns ``(digest_hex, bytes_total)`` where ``digest_hex`` is the bare
+    hex SHA-256 of the UTF-8 encoding of ``text``, and ``bytes_total`` is
+    the number of UTF-8 bytes.  This is the preimage contract: an auditor
+    holding the real output computes ``sha256(output.encode("utf-8"))`` and
+    compares the hex digest.  See ``docs/digest-preimage-definition.md``.
+    """
+    full_bytes = text.encode("utf-8")
+    return hashlib.sha256(full_bytes).hexdigest(), len(full_bytes)
 
 
 def _safe_session_id(session_id: str) -> str:
@@ -187,7 +308,9 @@ def _extract_files(tool_name: str, tool_input: dict[str, Any]) -> list[str]:
 
 
 def handle_pre() -> None:
-    hook_input = json.loads(sys.stdin.read())
+    raw = sys.stdin.read()
+    _capture_raw("pre", raw)
+    hook_input = json.loads(raw)
     tool_name = hook_input.get("tool_name", _FALLBACK_TOOL_NAME)
     tool_input = hook_input.get("tool_input", {})
     session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
@@ -224,11 +347,23 @@ def handle_pre() -> None:
 
 
 def handle_post(*, failure: bool = False) -> None:
-    hook_input = json.loads(sys.stdin.read())
+    raw = sys.stdin.read()
+    _capture_raw("post-failure" if failure else "post", raw)
+    hook_input = json.loads(raw)
     tool_name = hook_input.get("tool_name", _FALLBACK_TOOL_NAME)
     tool_input = hook_input.get("tool_input", {})
     session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
-    tool_output = hook_input.get("tool_output", "")
+
+    # WI-1.1: read tool_response (canonical for Claude Code 2.1.200+) with
+    # tool_output as a legacy fallback.
+    full_output = _extract_tool_response(hook_input)
+
+    # WI-1.2: digest the FULL untruncated output before truncating for
+    # transport.  An auditor reproduces this digest against the complete
+    # real output; the truncated text is only for human review.
+    stdout_digest, bytes_total = _compute_output_digest(full_output)
+    truncated = len(full_output) > _TRANSPORT_CAP
+    stdout_text = full_output[:_TRANSPORT_CAP]
 
     key = _call_key(tool_name, tool_input)
     state_file = _oldest_state_file(_state_dir(session_id), key)
@@ -259,13 +394,7 @@ def handle_post(*, failure: bool = False) -> None:
 
     error = None
     if failure:
-        error = str(tool_output)[:500] if tool_output else "tool call failed"
-
-    stdout_text = ""
-    if isinstance(tool_output, str):
-        stdout_text = tool_output[:2000]
-    elif isinstance(tool_output, dict):
-        stdout_text = json.dumps(tool_output)[:2000]
+        error = full_output[:500] if full_output else "tool call failed"
 
     reply = _run_bridge(
         {
@@ -275,6 +404,10 @@ def handle_post(*, failure: bool = False) -> None:
             "result_summary": {
                 "exit_code": 1 if failure else 0,
                 "stdout": stdout_text,
+                "stdout_digest": stdout_digest,
+                "stdout_digest_alg": "sha256",
+                "stdout_bytes_total": bytes_total,
+                "stdout_truncated": truncated,
             },
             "files": files,
             "error": error,
@@ -303,7 +436,9 @@ def _resolve_settings_digest() -> str | None:
 
 
 def handle_session_start() -> None:
-    hook_input = json.loads(sys.stdin.read())
+    raw = sys.stdin.read()
+    _capture_raw("session-start", raw)
+    hook_input = json.loads(raw)
     session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
 
     harness_name = os.environ.get("CAIRN_HARNESS_NAME", "claude-code")
@@ -328,7 +463,9 @@ def handle_session_start() -> None:
 
 
 def handle_session_end() -> None:
-    hook_input = json.loads(sys.stdin.read())
+    raw = sys.stdin.read()
+    _capture_raw("session-end", raw)
+    hook_input = json.loads(raw)
     session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
     state = _state_dir(session_id)
     if not state.exists():

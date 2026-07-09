@@ -161,6 +161,28 @@ def test_result_summary_round_trip():
     assert rs2 == rs
 
 
+def test_result_summary_digest_semantics_fields_round_trip():
+    """Plan 009 WI-1.2: bytes_total, truncated, and digest_alg round-trip."""
+    rs = ResultSummary(
+        exit_code=0,
+        stdout_digest="abc123",
+        stdout_digest_alg="sha256",
+        stdout_bytes_total=4096,
+        stdout_truncated=True,
+        error=None,
+    )
+    d = rs.to_dict()
+    assert d == {
+        "exit_code": 0,
+        "stdout_digest": "abc123",
+        "stdout_digest_alg": "sha256",
+        "stdout_bytes_total": 4096,
+        "stdout_truncated": True,
+    }
+    rs2 = ResultSummary.from_dict(d)
+    assert rs2 == rs
+
+
 # ----------------------------------------------------------------------
 # ToolCallBegin / ToolCallEnd round-trip
 # ----------------------------------------------------------------------

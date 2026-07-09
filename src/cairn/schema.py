@@ -39,6 +39,9 @@ class FileDigest:
 class ResultSummary:
     exit_code: int | None = None
     stdout_digest: str | None = None
+    stdout_digest_alg: str | None = None
+    stdout_bytes_total: int | None = None
+    stdout_truncated: bool | None = None
     stderr_digest: str | None = None
     error: str | None = None
 
@@ -48,6 +51,12 @@ class ResultSummary:
             d["exit_code"] = self.exit_code
         if self.stdout_digest is not None:
             d["stdout_digest"] = self.stdout_digest
+        if self.stdout_digest_alg is not None:
+            d["stdout_digest_alg"] = self.stdout_digest_alg
+        if self.stdout_bytes_total is not None:
+            d["stdout_bytes_total"] = self.stdout_bytes_total
+        if self.stdout_truncated is not None:
+            d["stdout_truncated"] = self.stdout_truncated
         if self.stderr_digest is not None:
             d["stderr_digest"] = self.stderr_digest
         if self.error is not None:
@@ -59,6 +68,9 @@ class ResultSummary:
         return cls(
             exit_code=data.get("exit_code"),
             stdout_digest=data.get("stdout_digest"),
+            stdout_digest_alg=data.get("stdout_digest_alg"),
+            stdout_bytes_total=data.get("stdout_bytes_total"),
+            stdout_truncated=data.get("stdout_truncated"),
             stderr_digest=data.get("stderr_digest"),
             error=data.get("error"),
         )

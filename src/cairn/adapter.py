@@ -370,12 +370,7 @@ class CairnAdapter:
         delegation = on_behalf_of or self._on_behalf_of
 
         file_digests = self._digest_files(files, post=True)
-        rs = ResultSummary(
-            exit_code=result_summary.get("exit_code") if result_summary else None,
-            stdout_digest=digest_string(result_summary.get("stdout")) if result_summary else None,
-            stderr_digest=digest_string(result_summary.get("stderr")) if result_summary else None,
-            error=error,
-        )
+        rs = self._build_result_summary(result_summary, error=error)
 
         # We need the original tool name / hash from the begin event
         begin_payload = self._resolve_begin_payload(work_item_id)
@@ -412,6 +407,42 @@ class CairnAdapter:
     # ----------------------------------------------------------------------
     # Helpers
     # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _build_result_summary(
+        result_summary: dict[str, Any] | None, *, error: str | None
+    ) -> ResultSummary:
+        """Build a :class:`ResultSummary` from the bridge payload.
+
+        Digest semantics (Plan 009 WI-1.2): when the capture boundary (the
+        Claude Code hook) pre-computes ``stdout_digest`` over the *full*
+        untruncated output, we use it verbatim — the auditor reproduces it
+        against the complete real output.  When only the (possibly
+        truncated) ``stdout`` text is present (legacy / OpenCode path), we
+        fall back to computing the digest from that text, preserving
+        backward compatibility while that path catches up to the new
+        contract.
+        """
+        if not result_summary:
+            return ResultSummary(error=error)
+
+        stdout_digest = result_summary.get("stdout_digest")
+        stdout_digest_alg = result_summary.get("stdout_digest_alg")
+        stdout_bytes_total = result_summary.get("stdout_bytes_total")
+        stdout_truncated = result_summary.get("stdout_truncated")
+
+        if stdout_digest is None and result_summary.get("stdout") is not None:
+            stdout_digest = digest_string(result_summary.get("stdout"))
+
+        return ResultSummary(
+            exit_code=result_summary.get("exit_code"),
+            stdout_digest=stdout_digest,
+            stdout_digest_alg=stdout_digest_alg,
+            stdout_bytes_total=stdout_bytes_total,
+            stdout_truncated=stdout_truncated,
+            stderr_digest=digest_string(result_summary.get("stderr")),
+            error=error,
+        )
 
     def _digest_files(self, paths: list[str] | None, *, post: bool) -> list[FileDigest] | None:
         """Compute pre or post digests for a list of file paths."""

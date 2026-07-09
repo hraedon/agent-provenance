@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -12,10 +13,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cairn._claude_hook import (
+    _CANONICAL_RESPONSE_FIELD,
+    _LEGACY_RESPONSE_FIELD,
+    _TRANSPORT_CAP,
     _call_key,
+    _compute_output_digest,
     _extract_files,
+    _extract_tool_response,
     _mark_degraded,
     _next_state_file,
+    _normalize_response,
     _oldest_state_file,
     _resolve_settings_digest,
     _state_dir,
@@ -35,9 +42,9 @@ def _clear_env(tmp_path: Path):
             "CAIRN_PROJECT",
             "CAIRN_KEY_PATH",
             "CAIRN_DISABLE",
-            "PRINCIPAL_ID",
             "CAIRN_STATE_DIR",
             "CAIRN_BRIDGE_PATH",
+            "CAIRN_CAPTURE_DIR",
         ]
     }
     os.environ["CAIRN_STATE_DIR"] = str(tmp_path / "cairn-state")
@@ -162,12 +169,13 @@ def test_handle_post_reads_state_and_calls_end(mock_bridge: MagicMock, state_dir
 
     mock_bridge.return_value = {"status": "ok", "event_id": str(uuid.uuid4())}
 
+    tool_output_text = "edited successfully"
     hook_input = json.dumps(
         {
             "tool_name": "Edit",
             "tool_input": tool_input,
             "session_id": "test-session",
-            "tool_output": "edited successfully",
+            "tool_response": tool_output_text,
         }
     )
 
@@ -180,6 +188,41 @@ def test_handle_post_reads_state_and_calls_end(mock_bridge: MagicMock, state_dir
     assert call_args["work_item_id"] == wi_id
     assert call_args["error"] is None
     assert not state_file.exists()
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_handle_post_digest_is_reproducible(mock_bridge: MagicMock, state_dir: Path) -> None:
+    """WI-1.2/WI-1.3: the attested digest equals an independently computed
+    sha256 of the real (full, untruncated) tool output."""
+    wi_id = str(uuid.uuid4())
+    tool_input = {"command": "echo hello"}
+    key = _call_key("Bash", tool_input)
+    state_file = _next_state_file(state_dir, key)
+    state_file.write_text(
+        json.dumps({"work_item_id": wi_id, "session_id": "test-session", "tool": "Bash"})
+    )
+    mock_bridge.return_value = {"status": "ok", "event_id": str(uuid.uuid4())}
+
+    real_output = "line one\nline two\nline three\n"
+    hook_input = json.dumps(
+        {
+            "tool_name": "Bash",
+            "tool_input": tool_input,
+            "session_id": "test-session",
+            "tool_response": real_output,
+        }
+    )
+
+    with patch("sys.stdin", StringIO(hook_input)):
+        handle_post()
+
+    call_args = mock_bridge.call_args[0][0]
+    rs = call_args["result_summary"]
+    expected_digest = hashlib.sha256(real_output.encode("utf-8")).hexdigest()
+    assert rs["stdout_digest"] == expected_digest
+    assert rs["stdout_digest_alg"] == "sha256"
+    assert rs["stdout_bytes_total"] == len(real_output.encode("utf-8"))
+    assert rs["stdout_truncated"] is False
 
 
 @patch("cairn._claude_hook._run_bridge")
@@ -205,7 +248,7 @@ def test_handle_post_failure_passes_error(mock_bridge: MagicMock, state_dir: Pat
             "tool_name": "Bash",
             "tool_input": tool_input,
             "session_id": "test-session",
-            "tool_output": "permission denied",
+            "tool_response": "permission denied",
         }
     )
 
@@ -223,7 +266,7 @@ def test_handle_post_no_state_does_nothing(mock_bridge: MagicMock, state_dir: Pa
             "tool_name": "Edit",
             "tool_input": {"filePath": "/tmp/nonexistent.py"},
             "session_id": "test-session",
-            "tool_output": "ok",
+            "tool_response": "ok",
         }
     )
 
@@ -369,7 +412,7 @@ def test_handle_post_bridge_failure_creates_degradation(
             "tool_name": "Edit",
             "tool_input": tool_input,
             "session_id": "test-session",
-            "tool_output": "ok",
+            "tool_response": "ok",
         }
     )
 
@@ -495,7 +538,7 @@ def test_repeated_identical_tool_calls_dont_collide(
             "tool_name": "Edit",
             "tool_input": tool_input,
             "session_id": "test-session",
-            "tool_output": "ok",
+            "tool_response": "ok",
         }
     )
 
@@ -512,3 +555,291 @@ def test_repeated_identical_tool_calls_dont_collide(
     assert len(end_calls) == 2
     assert end_calls[0]["work_item_id"] == wi1
     assert end_calls[1]["work_item_id"] == wi2
+
+
+# ----------------------------------------------------------------------
+# Plan 009 WI-1.1: tool_response field + normalization
+# ----------------------------------------------------------------------
+
+
+def test_extract_tool_response_prefers_canonical_field() -> None:
+    """The canonical field (tool_response) is preferred over tool_output."""
+    payload = {
+        _CANONICAL_RESPONSE_FIELD: "canonical",
+        _LEGACY_RESPONSE_FIELD: "legacy",
+    }
+    assert _extract_tool_response(payload) == "canonical"
+
+
+def test_extract_tool_response_falls_back_to_legacy() -> None:
+    """Legacy tool_output is used when tool_response is absent."""
+    payload = {_LEGACY_RESPONSE_FIELD: "legacy"}
+    assert _extract_tool_response(payload) == "legacy"
+
+
+def test_extract_tool_response_empty_when_neither_present() -> None:
+    assert _extract_tool_response({}) == ""
+
+
+def test_normalize_response_string() -> None:
+    assert _normalize_response("hello") == "hello"
+
+
+def test_normalize_response_none() -> None:
+    assert _normalize_response(None) == ""
+
+
+def test_normalize_response_content_array() -> None:
+    """Anthropic content-block array shape: {"content": [{"type":"text","text":"..."}]}"""
+    value = {"content": [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}]}
+    assert _normalize_response(value) == "first\nsecond"
+
+
+def test_normalize_response_bash_style() -> None:
+    value = {"stdout": "cmd output", "stderr": "errors", "exit_code": 0}
+    assert _normalize_response(value) == "cmd output"
+
+
+def test_normalize_response_freeform_dict() -> None:
+    value = {"foo": "bar", "n": 42}
+    result = _normalize_response(value)
+    assert json.loads(result) == value
+
+
+# ----------------------------------------------------------------------
+# Plan 009 WI-1.2: digest semantics under truncation
+# ----------------------------------------------------------------------
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_handle_post_digest_covers_full_output_when_truncated(
+    mock_bridge: MagicMock, state_dir: Path
+) -> None:
+    """WI-1.2: when output exceeds the transport cap, the digest still
+    covers the FULL output — an auditor holding the real output can
+    reproduce it.  truncated=True and bytes_total reflects the full size."""
+    wi_id = str(uuid.uuid4())
+    tool_input = {"command": "yes | head -5000"}
+    key = _call_key("Bash", tool_input)
+    state_file = _next_state_file(state_dir, key)
+    state_file.write_text(
+        json.dumps({"work_item_id": wi_id, "session_id": "test-session", "tool": "Bash"})
+    )
+    mock_bridge.return_value = {"status": "ok", "event_id": str(uuid.uuid4())}
+
+    # Output larger than the 2000-char transport cap.
+    real_output = "x" * (_TRANSPORT_CAP + 5000)
+    hook_input = json.dumps(
+        {
+            "tool_name": "Bash",
+            "tool_input": tool_input,
+            "session_id": "test-session",
+            "tool_response": real_output,
+        }
+    )
+
+    with patch("sys.stdin", StringIO(hook_input)):
+        handle_post()
+
+    call_args = mock_bridge.call_args[0][0]
+    rs = call_args["result_summary"]
+    # Digest covers the FULL output.
+    expected = hashlib.sha256(real_output.encode("utf-8")).hexdigest()
+    assert rs["stdout_digest"] == expected
+    assert rs["stdout_bytes_total"] == len(real_output.encode("utf-8"))
+    assert rs["stdout_truncated"] is True
+    # Transported text is capped.
+    assert len(rs["stdout"]) == _TRANSPORT_CAP
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_handle_post_digest_not_truncated_for_small_output(
+    mock_bridge: MagicMock, state_dir: Path
+) -> None:
+    """WI-1.2: small output — truncated=False, digest matches."""
+    wi_id = str(uuid.uuid4())
+    tool_input = {"command": "echo hi"}
+    key = _call_key("Bash", tool_input)
+    state_file = _next_state_file(state_dir, key)
+    state_file.write_text(
+        json.dumps({"work_item_id": wi_id, "session_id": "test-session", "tool": "Bash"})
+    )
+    mock_bridge.return_value = {"status": "ok", "event_id": str(uuid.uuid4())}
+
+    real_output = "hi\n"
+    hook_input = json.dumps(
+        {
+            "tool_name": "Bash",
+            "tool_input": tool_input,
+            "session_id": "test-session",
+            "tool_response": real_output,
+        }
+    )
+
+    with patch("sys.stdin", StringIO(hook_input)):
+        handle_post()
+
+    rs = mock_bridge.call_args[0][0]["result_summary"]
+    assert rs["stdout_digest"] == hashlib.sha256(real_output.encode("utf-8")).hexdigest()
+    assert rs["stdout_truncated"] is False
+    assert rs["stdout_bytes_total"] == len(real_output.encode("utf-8"))
+
+
+def test_compute_output_digest_matches_independent_sha256() -> None:
+    """The helper produces the same digest as an independent sha256."""
+    text = "some tool output\nwith multiple lines\n"
+    digest, total = _compute_output_digest(text)
+    assert digest == hashlib.sha256(text.encode("utf-8")).hexdigest()
+    assert total == len(text.encode("utf-8"))
+
+
+def test_compute_output_digest_multibyte_utf8() -> None:
+    """bytes_total counts UTF-8 bytes, not characters."""
+    text = "café ☕ 日本語"  # multibyte chars
+    digest, total = _compute_output_digest(text)
+    assert digest == hashlib.sha256(text.encode("utf-8")).hexdigest()
+    assert total == len(text.encode("utf-8"))
+    assert total > len(text)  # multibyte
+
+
+# ----------------------------------------------------------------------
+# Plan 009 WI-1.3: recorded-reality fixtures (tool_response shapes)
+# ----------------------------------------------------------------------
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_handle_post_with_content_array_response(mock_bridge: MagicMock, state_dir: Path) -> None:
+    """Fixture mirroring real Claude Code tool_response shape:
+    {"content": [{"type":"text","text":"..."}]}.
+
+    The digest covers the extracted text, not the raw JSON."""
+    wi_id = str(uuid.uuid4())
+    tool_input = {"filePath": "/tmp/read.py"}
+    key = _call_key("Read", tool_input)
+    state_file = _next_state_file(state_dir, key)
+    state_file.write_text(
+        json.dumps({"work_item_id": wi_id, "session_id": "test-session", "tool": "Read"})
+    )
+    mock_bridge.return_value = {"status": "ok", "event_id": str(uuid.uuid4())}
+
+    file_content = "def hello():\n    print('world')\n"
+    hook_input = json.dumps(
+        {
+            "tool_name": "Read",
+            "tool_input": tool_input,
+            "session_id": "test-session",
+            "tool_response": {
+                "content": [{"type": "text", "text": file_content}],
+            },
+        }
+    )
+
+    with patch("sys.stdin", StringIO(hook_input)):
+        handle_post()
+
+    rs = mock_bridge.call_args[0][0]["result_summary"]
+    # Digest is over the extracted text, not the raw dict.
+    assert rs["stdout_digest"] == hashlib.sha256(file_content.encode("utf-8")).hexdigest()
+    assert rs["stdout_bytes_total"] == len(file_content.encode("utf-8"))
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_handle_post_failure_with_content_array(mock_bridge: MagicMock, state_dir: Path) -> None:
+    """PostToolUseFailure with a content-array tool_response: the error
+    field carries the real failure detail, not just 'tool call failed'."""
+    wi_id = str(uuid.uuid4())
+    tool_input = {"command": "false"}
+    key = _call_key("Bash", tool_input)
+    state_file = _next_state_file(state_dir, key)
+    state_file.write_text(
+        json.dumps({"work_item_id": wi_id, "session_id": "test-session", "tool": "Bash"})
+    )
+    mock_bridge.return_value = {"status": "ok", "event_id": str(uuid.uuid4())}
+
+    error_detail = "command exited with code 1"
+    hook_input = json.dumps(
+        {
+            "tool_name": "Bash",
+            "tool_input": tool_input,
+            "session_id": "test-session",
+            "tool_response": {
+                "content": [{"type": "text", "text": error_detail}],
+            },
+        }
+    )
+
+    with patch("sys.stdin", StringIO(hook_input)):
+        handle_post(failure=True)
+
+    call_args = mock_bridge.call_args[0][0]
+    assert call_args["error"] == error_detail
+    rs = call_args["result_summary"]
+    assert rs["stdout_digest"] == hashlib.sha256(error_detail.encode("utf-8")).hexdigest()
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_handle_post_legacy_tool_output_fallback(mock_bridge: MagicMock, state_dir: Path) -> None:
+    """Legacy harnesses that still send tool_output (no tool_response) are
+    handled — the fallback produces a correct digest over the real output."""
+    wi_id = str(uuid.uuid4())
+    tool_input = {"command": "echo legacy"}
+    key = _call_key("Bash", tool_input)
+    state_file = _next_state_file(state_dir, key)
+    state_file.write_text(
+        json.dumps({"work_item_id": wi_id, "session_id": "test-session", "tool": "Bash"})
+    )
+    mock_bridge.return_value = {"status": "ok", "event_id": str(uuid.uuid4())}
+
+    real_output = "legacy output\n"
+    hook_input = json.dumps(
+        {
+            "tool_name": "Bash",
+            "tool_input": tool_input,
+            "session_id": "test-session",
+            _LEGACY_RESPONSE_FIELD: real_output,
+        }
+    )
+
+    with patch("sys.stdin", StringIO(hook_input)):
+        handle_post()
+
+    rs = mock_bridge.call_args[0][0]["result_summary"]
+    assert rs["stdout_digest"] == hashlib.sha256(real_output.encode("utf-8")).hexdigest()
+
+
+# ----------------------------------------------------------------------
+# Plan 009 WI-1.1: capture mode (CAIRN_CAPTURE_DIR)
+# ----------------------------------------------------------------------
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_capture_mode_writes_raw_payload(mock_bridge: MagicMock, tmp_path: Path) -> None:
+    """When CAIRN_CAPTURE_DIR is set, the raw hook stdin is written verbatim."""
+    mock_bridge.return_value = {"status": "ok", "work_item_id": str(uuid.uuid4()), "args_hash": "x"}
+    capture_dir = tmp_path / "captures"
+    hook_input = json.dumps(
+        {"tool_name": "Edit", "tool_input": {"filePath": "/tmp/x.py"}, "session_id": "cap-session"}
+    )
+
+    with patch.dict(os.environ, {"CAIRN_CAPTURE_DIR": str(capture_dir)}):
+        with patch("sys.stdin", StringIO(hook_input)):
+            handle_pre()
+
+    files = list(capture_dir.glob("*.json"))
+    assert len(files) == 1
+    assert json.loads(files[0].read_text())["tool_name"] == "Edit"
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_capture_mode_off_by_default(mock_bridge: MagicMock, tmp_path: Path) -> None:
+    """Without CAIRN_CAPTURE_DIR, no capture files are written."""
+    mock_bridge.return_value = {"status": "ok", "work_item_id": str(uuid.uuid4()), "args_hash": "x"}
+    capture_dir = tmp_path / "captures"
+    hook_input = json.dumps(
+        {"tool_name": "Edit", "tool_input": {"filePath": "/tmp/x.py"}, "session_id": "cap2-session"}
+    )
+
+    with patch("sys.stdin", StringIO(hook_input)):
+        handle_pre()
+
+    assert not capture_dir.exists()
