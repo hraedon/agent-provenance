@@ -279,6 +279,13 @@ landed; this plan reuses it.
 
 ## Phase 5 — New harness adapters (Hermes, Agy, Codex)
 
+> **Codex scope moved 2026-07-10:** Plan 011 owns Codex lifecycle/tool-call
+> provenance now that Codex has a documented hook protocol. Its focused work is
+> independent of this plan's prompt/response content capture and portal. The
+> Codex portions of WI-5.1, WI-5.4, and WI-5.5 below are superseded by Plan 011;
+> they remain here as historical planning context. Hermes and Agy remain in
+> this phase.
+
 ### WI-5.1 — Interception-surface research (one WI per harness)
 - For each of Hermes, Agy, Codex: research and document the hook/plugin/
   skill interception surface. Produce a short design note (in `docs/`)
