@@ -46,6 +46,8 @@ Authoritative reference: https://learn.chatgpt.com/docs/hooks
    manifest. Managed enterprise hooks are documented, not modified.
 7. Scope attestations name both captured and uncaptured tool paths and the
    running Codex version.
+8. Follow agent-suite Plan 007 for stable `all` semantics and positional
+   installer invocation.
 
 ## Phase 1 — Contract fixtures
 
@@ -179,4 +181,3 @@ tool matrix is versioned and linked to the proof.
 - External wake/turn injection (agent-wake 006).
 - Hosted Codex tasks until their hook/config/network contract is separately
   proven.
-
