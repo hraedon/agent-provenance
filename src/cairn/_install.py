@@ -166,8 +166,12 @@ def _hermes_plugin_dir() -> Path:
 
 def _hermes_source_plugin_dir() -> Path:
     """Return the source plugin directory in the repo or installed package."""
-    root = Path(__file__).resolve().parent
-    return root / "integrations" / "hermes"
+    # In an installed wheel, integrations/ is inside the package dir.
+    pkg_path = Path(__file__).resolve().parent / "integrations" / "hermes"
+    if pkg_path.is_dir():
+        return pkg_path
+    # In a source checkout, integrations/ is at the repo root.
+    return Path(__file__).resolve().parent.parent.parent / "integrations" / "hermes"
 
 
 # Sentinel comments for the managed env block in ~/.hermes/.env.
