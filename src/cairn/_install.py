@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,6 +61,44 @@ _ENV_VARS = [
 ]
 
 CAIRN_SENTINEL = "// cairn-managed"
+
+
+def _detect_harness_version(harness: str) -> str | None:
+    """Detect the installed harness version (Plan 009 WI-1.3).
+
+    Runs ``<harness> --version`` and parses the output. Returns the
+    version string (e.g. ``"2.1.206"``) or ``None`` if the harness
+    binary is not found or the version can't be parsed.
+
+    This prevents the synthetic ``"unknown"`` / ``"1.0.42"`` pattern:
+    the real version is resolved at install time and recorded into the
+    wiring (settings.json env block), so every attestation carries the
+    true harness identity.
+    """
+    commands: dict[str, list[str]] = {
+        "claude": ["claude", "--version"],
+        "claude-code": ["claude", "--version"],
+        "opencode": ["opencode", "--version"],
+        "hermes": ["hermes", "--version"],
+    }
+    cmd = commands.get(harness)
+    if not cmd:
+        return None
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return None
+        output = result.stdout.strip()
+        if not output:
+            return None
+        # Claude Code: "2.1.206 (Claude Code)" → "2.1.206"
+        # opencode: typically "opencode version X.Y.Z" or just "X.Y.Z"
+        first_token = output.split()[0]
+        return first_token
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
 
 
 @dataclass
@@ -126,8 +165,8 @@ def _hermes_plugin_dir() -> Path:
 
 
 def _hermes_source_plugin_dir() -> Path:
-    """Return the source plugin directory in the repo."""
-    root = Path(__file__).resolve().parent.parent.parent
+    """Return the source plugin directory in the repo or installed package."""
+    root = Path(__file__).resolve().parent
     return root / "integrations" / "hermes"
 
 
@@ -211,6 +250,14 @@ def _install_hermes(
     # --- Env wiring ---
     lines = _parse_env_file(env_path)
     desired_env = _env_values(cfg, "hermes")
+
+    # WI-1.3: resolve the real harness version if not already configured.
+    hv = desired_env.get("CAIRN_HARNESS_VERSION")
+    if not hv or hv == "unknown":
+        detected = _detect_harness_version("hermes")
+        if detected:
+            desired_env["CAIRN_HARNESS_VERSION"] = detected
+
     managed_block = _find_managed_block(lines)
 
     changed = False
@@ -456,6 +503,21 @@ def _install_claude(
     if user:
         desired_env["PRINCIPAL_ID"] = user
 
+    # WI-1.3: resolve the real harness version if not already configured.
+    hv = desired_env.get("CAIRN_HARNESS_VERSION")
+    if not hv or hv == "unknown":
+        detected = _detect_harness_version("claude")
+        if detected:
+            desired_env["CAIRN_HARNESS_VERSION"] = detected
+            result.actions.append(
+                InstallAction(
+                    "detected",
+                    "claude --version",
+                    f"resolved harness version: {detected}",
+                    keys=["env.CAIRN_HARNESS_VERSION"],
+                )
+            )
+
     for key, val in desired_env.items():
         current = env.get(key)
         if current and current != val:
@@ -592,6 +654,13 @@ def _install_opencode(
     desired_env = _env_values(cfg, "opencode")
     if user:
         desired_env["PRINCIPAL_ID"] = user
+
+    # WI-1.3: resolve the real harness version if not already configured.
+    hv = desired_env.get("CAIRN_HARNESS_VERSION")
+    if not hv or hv == "unknown":
+        detected = _detect_harness_version("opencode")
+        if detected:
+            desired_env["CAIRN_HARNESS_VERSION"] = detected
 
     changed = False
     for key, val in desired_env.items():
