@@ -75,6 +75,19 @@ These shapes were verified from real Claude Code 2.1.206 captures
 (Plan 009 WI-1.1). Sanitized payloads are committed in
 `tests/fixtures/hook_payloads/`.
 
+**Trailing-newline caveat (verified live, 2.1.207):** for Bash, the harness
+strips the trailing newline from `tool_response.stdout` before sending it to
+the hook. An auditor reproducing the digest from the raw command output must
+digest the value the harness delivered (no trailing `\n`), not the raw
+terminal bytes. The preimage is always the harness-delivered, normalized
+`tool_response` — this is a property of the capture boundary, not a cairn
+transformation.
+
+Tool calls executed inside a subagent carry a `subagent` object
+(`agent_id`, `agent_type`) on their `tool_call_begin`/`tool_call_end`
+payloads (Plan 009 WI-3.1). The digest contract is unchanged; the field only
+attributes the call.
+
 ## Legacy fallback
 
 If the `tool_response` field is absent (older Claude Code releases that

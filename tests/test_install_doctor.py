@@ -485,3 +485,163 @@ def test_install_claude_detects_version_when_unknown(
     hv = env.get("CAIRN_HARNESS_VERSION")
     if hv is not None:
         assert hv != "unknown"
+
+
+# ----------------------------------------------------------------------
+# Plan 009 WI-4.1: attestation freshness — silence is a finding
+# ----------------------------------------------------------------------
+
+
+def _configured_cfg() -> CairnEnvConfig:
+    return CairnEnvConfig(
+        dsn="postgresql://x@h/db",
+        key_path="/nonexistent.json",
+        project="test",
+    )
+
+
+def _make_transcript(base, session_id: str, age_secs: float) -> None:
+    """Write a fake session transcript with a given age."""
+    import time
+
+    proj = base / "-home-operator-work"
+    proj.mkdir(parents=True, exist_ok=True)
+    f = proj / f"{session_id}.jsonl"
+    f.write_text("{}\n")
+    ts = time.time() - age_secs
+    os.utime(f, (ts, ts))
+
+
+def test_freshness_skips_when_not_configured(monkeypatch, tmp_path):
+    from cairn._doctor import _check_attestation_freshness
+
+    cfg = CairnEnvConfig(dsn=None, key_path=None, project=None)
+    result = _check_attestation_freshness(cfg, None, regista_ok=False)
+    assert result["status"] == "skip"
+
+
+def test_freshness_skips_when_regista_unreachable(monkeypatch, tmp_path):
+    """Regista down already reds out its own check — freshness must not
+    pile a misleading 'silent' failure on top."""
+    from cairn._doctor import _check_attestation_freshness
+
+    result = _check_attestation_freshness(_configured_cfg(), None, regista_ok=False)
+    assert result["status"] == "skip"
+    assert "unreachable" in result["detail"]
+
+
+def test_freshness_skips_without_local_transcripts(monkeypatch, tmp_path):
+    from cairn._doctor import _check_attestation_freshness
+
+    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path / "empty"))
+    result = _check_attestation_freshness(_configured_cfg(), None, regista_ok=True)
+    assert result["status"] == "skip"
+    assert "no local session transcripts" in result["detail"]
+
+
+def test_freshness_ok_when_no_recent_sessions(monkeypatch, tmp_path):
+    """Old transcripts only (predating the window) — nothing demanded an
+    attestation, so silence is fine."""
+    from cairn._doctor import _check_attestation_freshness
+
+    _make_transcript(tmp_path, "old-session", age_secs=3 * 24 * 3600)
+    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path))
+    result = _check_attestation_freshness(_configured_cfg(), None, regista_ok=True)
+    assert result["status"] == "ok"
+    assert "no sessions ran" in result["detail"]
+
+
+def test_freshness_ok_with_recent_attestation(monkeypatch, tmp_path):
+    import datetime
+
+    from cairn._doctor import _check_attestation_freshness
+
+    _make_transcript(tmp_path, "recent-session", age_secs=60)
+    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path))
+    recent = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
+    result = _check_attestation_freshness(_configured_cfg(), recent, regista_ok=True)
+    assert result["status"] == "ok"
+
+
+def test_freshness_fails_when_configured_but_silent(monkeypatch, tmp_path):
+    """The WI-4.1 acceptance criterion: sessions ran within the window but
+    the newest attestation predates it (or none exists) — doctor reds out."""
+    import datetime
+
+    from cairn._doctor import _check_attestation_freshness
+
+    _make_transcript(tmp_path, "recent-session", age_secs=60)
+    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path))
+
+    # No attestation at all.
+    result = _check_attestation_freshness(_configured_cfg(), None, regista_ok=True)
+    assert result["status"] == "fail"
+    assert "configured but silent" in result["detail"]
+    assert "never" in result["detail"]
+
+    # Stale attestation (outside the window).
+    stale = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=3)
+    result = _check_attestation_freshness(_configured_cfg(), stale, regista_ok=True)
+    assert result["status"] == "fail"
+    assert "configured but silent" in result["detail"]
+
+
+def test_freshness_window_configurable(monkeypatch, tmp_path):
+    """CAIRN_MAX_ATTESTATION_AGE_HOURS narrows or widens the window."""
+    import datetime
+
+    from cairn._doctor import _check_attestation_freshness
+
+    _make_transcript(tmp_path, "recent-session", age_secs=2 * 3600)
+    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path))
+    stale = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=2, minutes=30)
+
+    # Default 24h window: the 2.5h-old attestation is fresh enough.
+    result = _check_attestation_freshness(_configured_cfg(), stale, regista_ok=True)
+    assert result["status"] == "ok"
+
+    # 1h window: session ran 2h ago (outside window) — nothing to demand.
+    monkeypatch.setenv("CAIRN_MAX_ATTESTATION_AGE_HOURS", "1")
+    result = _check_attestation_freshness(_configured_cfg(), stale, regista_ok=True)
+    assert result["status"] == "ok"
+
+    # 3h window: session ran inside, attestation 2.5h old is also inside.
+    monkeypatch.setenv("CAIRN_MAX_ATTESTATION_AGE_HOURS", "3")
+    result = _check_attestation_freshness(_configured_cfg(), stale, regista_ok=True)
+    assert result["status"] == "ok"
+
+    # 2h window (as hours float): session 2h ago is borderline-outside;
+    # use a fresher transcript to force the demand, stale attestation fails.
+    _make_transcript(tmp_path, "fresher-session", age_secs=60)
+    monkeypatch.setenv("CAIRN_MAX_ATTESTATION_AGE_HOURS", "2")
+    result = _check_attestation_freshness(_configured_cfg(), stale, regista_ok=True)
+    assert result["status"] == "fail"
+
+
+def test_doctor_includes_freshness_check(monkeypatch, tmp_path):
+    """run_doctor emits the attestation_freshness check in its report."""
+    import io
+    import json as _json
+    from contextlib import redirect_stdout
+
+    monkeypatch.setattr(
+        "cairn._doctor.resolve_config",
+        lambda: CairnEnvConfig(dsn=None, key_path=None, project=None),
+    )
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        run_doctor(json_output=True)
+    report = _json.loads(buf.getvalue())
+    names = [c["name"] for c in report["checks"]]
+    assert "attestation_freshness" in names
+
+
+def test_install_wires_subagent_and_compact_hooks(tmp_path, monkeypatch):
+    """Plan 009 WI-3.1: install-harness wires SubagentStart/SubagentStop/
+    PostCompact (and NOT PostToolBatch — per-call attestation covers it)."""
+    from cairn._install import HOOK_EVENTS
+
+    assert HOOK_EVENTS["SubagentStart"] == "subagent-start"
+    assert HOOK_EVENTS["SubagentStop"] == "subagent-stop"
+    assert HOOK_EVENTS["PostCompact"] == "post-compact"
+    assert "PostToolBatch" not in HOOK_EVENTS

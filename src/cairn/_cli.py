@@ -282,6 +282,33 @@ def _extract_readme_sections(readme_text: str) -> tuple[str | None, str | None]:
     return control_text, TRUST_MODEL_CAVEAT
 
 
+def _gather_harness_sessions(base: Path) -> dict[str, dict[str, str | None]]:
+    """Collect session evidence from a harness transcript directory.
+
+    Claude Code writes one ``<session-uuid>.jsonl`` per session under
+    ``<base>/<encoded-cwd>/``.  Each file is evidence that the session ran,
+    independent of whether anything attested (Plan 009 WI-4.1).  Also
+    accepts transcripts directly under ``base`` for non-nested layouts.
+    """
+    evidence: dict[str, dict[str, str | None]] = {}
+    for path in sorted(base.glob("*.jsonl")) + sorted(base.glob("*/*.jsonl")):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        last_activity = datetime.datetime.fromtimestamp(
+            mtime, tz=datetime.UTC
+        ).isoformat()
+        session_id = path.stem
+        existing = evidence.get(session_id)
+        if existing is None or (existing["last_activity"] or "") < last_activity:
+            evidence[session_id] = {
+                "last_activity": last_activity,
+                "transcript_path": str(path),
+            }
+    return evidence
+
+
 @click.group()
 @click.version_option(version=_cairn_version, prog_name="cairn")
 def main() -> None:
@@ -323,6 +350,14 @@ def main() -> None:
     default=None,
     help="ISO timestamp — only verify events before this time (Plan 008 WI-3.1).",
 )
+@click.option(
+    "--harness-sessions",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Harness session-transcript directory (e.g. ~/.claude/projects). "
+    "Sessions found there with no events in the bundle are reported as "
+    "silence gaps (Plan 009 WI-4.1). Not available with --since/--until.",
+)
 def verify(
     bundle_path: Path,
     keys: Path,
@@ -332,6 +367,7 @@ def verify(
     witness_keys: Path | None,
     since: str | None,
     until: str | None,
+    harness_sessions: Path | None,
 ) -> None:
     """Verify a signed Cairn bundle and emit an auditor-ready report."""
     for w in check_key_file_permissions(str(keys)):
@@ -352,6 +388,12 @@ def verify(
     )
 
     if since or until:
+        if harness_sessions:
+            raise click.ClickException(
+                "--harness-sessions cannot be combined with --since/--until: "
+                "a filtered window would report every out-of-window session "
+                "as a false silence gap"
+            )
         if since and until:
             since_dt = datetime.datetime.fromisoformat(since)
             until_dt = datetime.datetime.fromisoformat(until)
@@ -363,7 +405,8 @@ def verify(
             until=until,
         )
     else:
-        report = verifier.verify_bundle(bundle_path)
+        evidence = _gather_harness_sessions(harness_sessions) if harness_sessions else None
+        report = verifier.verify_bundle(bundle_path, harness_sessions=evidence)
 
     if fmt == "json":
         result = json.dumps(Verifier.format_report_json(report), indent=2)

@@ -372,6 +372,18 @@ def format_report(report: VerificationReport) -> str:
             lines.append(f"    -> {ag.detail}")
         lines.append("")
 
+    if report.silence_gaps:
+        lines.append("SILENCE GAPS (SESSIONS THAT NEVER ATTESTED)")
+        lines.append("-" * 40)
+        for sg in report.silence_gaps:
+            lines.append(f"  session {sg.session_id}")
+            if sg.last_activity:
+                lines.append(f"    last activity : {sg.last_activity}")
+            if sg.transcript_path:
+                lines.append(f"    transcript    : {sg.transcript_path}")
+            lines.append(f"    -> {sg.detail}")
+        lines.append("")
+
     if report.content_coverage_gaps:
         lines.append("CONTENT COVERAGE GAPS")
         lines.append("-" * 40)
@@ -664,6 +676,15 @@ def format_report_json(report: VerificationReport) -> dict[str, Any]:
                 "detail": ag.detail,
             }
             for ag in report.attestation_gaps
+        ],
+        "silence_gaps": [
+            {
+                "session_id": sg.session_id,
+                "last_activity": sg.last_activity,
+                "transcript_path": sg.transcript_path,
+                "detail": sg.detail,
+            }
+            for sg in report.silence_gaps
         ],
         "content_coverage_gaps": [
             {
@@ -1323,6 +1344,37 @@ def format_report_html(report: VerificationReport) -> str:
             "uncovered by any signed scope declaration.</p>"
             '<table style="border-collapse:collapse;width:100%">'
             f"{gap_hdr}<tbody>{gap_rows}</tbody></table></div>"
+        )
+
+    # Silence gaps (sessions that never attested)
+    if report.silence_gaps:
+        sg_rows = ""
+        cell = "padding:4px 8px"
+        mono = f"{cell};font-family:monospace;font-size:12px"
+        for sg in report.silence_gaps:
+            sg_rows += (
+                f"<tr>"
+                f'<td style="{mono}">{_esc(sg.session_id[:16])}...</td>'
+                f'<td style="{cell}">{_esc(sg.last_activity or "—")}</td>'
+                f'<td style="{cell};font-size:12px">{_esc(sg.detail)}</td>'
+                f"</tr>"
+            )
+        sg_hdr = (
+            '<thead><tr style="background:#fef2f2">'
+            f'<th style="{cell};text-align:left">Session ID</th>'
+            f'<th style="{cell};text-align:left">Last Activity</th>'
+            f'<th style="{cell};text-align:left">Detail</th>'
+            "</tr></thead>"
+        )
+        sections.append(
+            '<div class="section">'
+            '<h2 style="color:#dc2626">Silence Gaps (Sessions That Never Attested)</h2>'
+            '<p style="font-size:13px;color:#64748b">Plan 009 WI-4.1: harness '
+            "sessions that ran locally but produced no events in the log. The "
+            "recorder was configured but silent — each gap is evidence the "
+            "capture path was broken or unhooked while sessions ran.</p>"
+            '<table style="border-collapse:collapse;width:100%">'
+            f"{sg_hdr}<tbody>{sg_rows}</tbody></table></div>"
         )
 
     # Assurance levels

@@ -54,6 +54,7 @@ from cairn.verifier_types import (
     ScopeViolation,
     SequenceGap,
     SessionAttestationEntry,
+    SilenceGap,
     TemporalOrderingViolation,
     TimestampBatchEntry,
     VerificationEntry,
@@ -87,6 +88,7 @@ __all__ = [
     "ScopeViolation",
     "SequenceGap",
     "SessionAttestationEntry",
+    "SilenceGap",
     "TemporalOrderingViolation",
     "TimestampBatchEntry",
     "VerificationEntry",
@@ -258,7 +260,12 @@ class Verifier:
 
         return report
 
-    def verify_bundle(self, bundle_path: str | Path) -> VerificationReport:
+    def verify_bundle(
+        self,
+        bundle_path: str | Path,
+        *,
+        harness_sessions: dict[str, dict[str, str | None]] | None = None,
+    ) -> VerificationReport:
         """Load a JSON bundle and verify every event inside.
 
         Expected bundle shape (as emitted by export tooling)::
@@ -274,12 +281,19 @@ class Verifier:
                 ...
               ]
             }
+
+        When ``harness_sessions`` is provided (session_id → evidence from
+        the harness's local transcripts), sessions that ran but produced no
+        events are reported as silence gaps (Plan 009 WI-4.1).
         """
         path = Path(bundle_path)
         raw, events, manifest, error_report = self._load_bundle(path)
         if error_report is not None:
             return error_report
-        return self._verify_loaded_bundle(raw, events, manifest)
+        report = self._verify_loaded_bundle(raw, events, manifest)
+        if harness_sessions:
+            self.check_silence_gaps(events, report, harness_sessions)
+        return report
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1818,6 +1832,59 @@ class Verifier:
                         f"tool-call event(s) but has no session attestation. "
                         f"The session ran unscoped — its provenance is "
                         f"uncovered by any signed scope declaration."
+                    ),
+                )
+            )
+
+    def check_silence_gaps(
+        self,
+        events: list[Event],
+        report: VerificationReport,
+        harness_sessions: dict[str, dict[str, str | None]],
+    ) -> None:
+        """Detect harness sessions that produced no events at all
+        (Plan 009 WI-4.1 — silence is a finding).
+
+        ``harness_sessions`` maps session_id → evidence dict with optional
+        ``last_activity`` (ISO timestamp) and ``transcript_path``.  The
+        caller gathers it from the harness's local session transcripts
+        (``cairn verify --harness-sessions``); an offline bundle alone
+        cannot see what never entered it.
+
+        A session counts as "present in the log" if *any* event binds to
+        it — session attestation, ``on_behalf_of.session_id``, or a
+        session-entity event keyed by the session UUID.  A harness session
+        with zero such events means the recorder was wired but recorded
+        nothing for it — the gap an auditor must see named explicitly.
+        """
+        seen: set[str] = set(self._collect_attested_session_ids(events))
+        for ev in events:
+            if ev.on_behalf_of is not None:
+                sid = ev.on_behalf_of.get("session_id")
+                if sid:
+                    seen.add(sid)
+            payload = ev.payload or {}
+            psid = payload.get("session_id")
+            if isinstance(psid, str) and psid:
+                seen.add(psid)
+            wid = getattr(ev, "work_item_id", None)
+            if wid is not None:
+                seen.add(str(wid))
+
+        for session_id, evidence in sorted(harness_sessions.items()):
+            if session_id in seen:
+                continue
+            last_activity = evidence.get("last_activity")
+            report.silence_gaps.append(
+                SilenceGap(
+                    session_id=session_id,
+                    last_activity=last_activity,
+                    transcript_path=evidence.get("transcript_path"),
+                    detail=(
+                        f"Harness session {session_id} ran locally "
+                        f"(last activity {last_activity or 'unknown'}) but produced "
+                        "no events in the log — the recorder was configured "
+                        "but silent for this session."
                     ),
                 )
             )

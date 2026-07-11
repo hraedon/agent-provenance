@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Cairn hook for Claude Code.
 
-Handles PreToolUse, PostToolUse, PostToolUseFailure, and SessionStart events.
-Dispatches to the `cairn-bridge` script for regista communication.
+Handles PreToolUse, PostToolUse, PostToolUseFailure, SessionStart,
+SessionEnd, MessageDisplay, Stop, SubagentStart, SubagentStop, and
+PostCompact events.  Dispatches to the `cairn-bridge` script for regista
+communication.
 
 Manages work_item_id state between Pre and Post calls via session-scoped
 temp files under ${CAIRN_STATE_DIR:-/tmp/cairn-sessions}/{session_id}/.
@@ -11,7 +13,8 @@ Usage (from .claude/settings.json)::
 
     python3 -m cairn._claude_hook <action>
 
-    Actions: pre, post, post-failure, session-start, session-end
+    Actions: pre, post, post-failure, session-start, session-end,
+    message-display, stop, subagent-start, subagent-stop, post-compact
 
 Environment (resolved via cairn._config — REGISTA_* preferred, CAIRN_* fallback)::
 
@@ -44,11 +47,26 @@ Capture correctness (Plan 009):
     * Write: ``{"type":"create", "content":"..."}``
     * Edit:  ``{"filePath":"...", "structuredPatch":[...]}``  (free-form JSON)
 
-TODO(Plan 009 WI-3.1): Claude Code now emits additional lifecycle events
-(``PostToolBatch``, ``SubagentStart``/``SubagentStop``, ``MessageDisplay``,
-``Stop``/``StopFailure``, ``PostCompact``).  These are not yet handled —
-subagent attribution, batch coverage, and compaction attestation are
-deferred to Plan 009 Phase 3.
+Subagent attribution (Plan 009 WI-3.1, verified from real Claude Code
+2.1.207 capture):
+  - Every hook payload fired *inside* a subagent carries ``agent_id`` and
+    ``agent_type``; payloads from the main loop carry neither.  Pre/Post
+    attribute per-call from the payload itself — correct even when
+    multiple subagents run in parallel — and the identity is threaded to
+    the bridge as ``subagent`` and into the pre/post pairing key (so an
+    identical command run concurrently by parent and subagent cannot
+    mis-pair).
+  - ``SubagentStart``/``SubagentStop`` are attested to the session entity
+    (delegation window open/close); stop digests the subagent's final
+    reply and transcript file.
+  - ``PostCompact`` is attested to the session entity: context loss is
+    provenance-relevant, and the digest covers the summary that replaced
+    the dropped context.
+  - ``PostToolBatch`` is deliberately NOT attested: its ``tool_calls``
+    entries carry the same ``tool_use_id``s as the individual
+    ``PostToolUse`` events (verified from capture), so per-call
+    attestation already covers every batch member and attesting the
+    batch would double-count them.
 """
 
 from __future__ import annotations
@@ -221,8 +239,30 @@ def _state_dir(session_id: str) -> Path:
     return d
 
 
-def _call_key(tool_name: str, tool_input: dict[str, Any]) -> str:
+def _extract_subagent(hook_input: dict[str, Any]) -> dict[str, Any] | None:
+    """Read the subagent identity from a hook payload (Plan 009 WI-3.1).
+
+    Claude Code stamps every hook payload fired inside a subagent with
+    ``agent_id``/``agent_type``; main-loop payloads carry neither.
+    """
+    agent_id = hook_input.get("agent_id")
+    if not isinstance(agent_id, str) or not agent_id:
+        return None
+    sub: dict[str, Any] = {"agent_id": agent_id}
+    agent_type = hook_input.get("agent_type")
+    if isinstance(agent_type, str) and agent_type:
+        sub["agent_type"] = agent_type
+    return sub
+
+
+def _call_key(tool_name: str, tool_input: dict[str, Any], agent_id: str | None = None) -> str:
     canonical = json.dumps(tool_input, separators=(",", ":"), sort_keys=True)
+    # The pre/post pairing key includes the subagent identity: parent and
+    # subagent can run the same tool with identical args concurrently, and
+    # without agent_id in the key the FIFO pairing could attribute one's
+    # result to the other (Plan 009 WI-3.1).
+    if agent_id:
+        canonical = f"{agent_id}\x00{canonical}"
     h = hashlib.sha256(canonical.encode()).hexdigest()[:16]
     safe_tool = re.sub(r"[^a-zA-Z0-9._-]", "_", tool_name)
     return f"{safe_tool}:{h}"
@@ -340,25 +380,27 @@ def handle_pre() -> None:
     tool_name = hook_input.get("tool_name", _FALLBACK_TOOL_NAME)
     tool_input = hook_input.get("tool_input", {})
     session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
+    subagent = _extract_subagent(hook_input)
 
     files = _extract_files(tool_name, tool_input)
 
-    reply = _run_bridge(
-        {
-            "action": "begin",
-            "tool": tool_name,
-            "args": tool_input,
-            "files": files,
-            "session_id": session_id,
-        }
-    )
+    bridge_payload: dict[str, Any] = {
+        "action": "begin",
+        "tool": tool_name,
+        "args": tool_input,
+        "files": files,
+        "session_id": session_id,
+    }
+    if subagent:
+        bridge_payload["subagent"] = subagent
+    reply = _run_bridge(bridge_payload)
 
     if reply and reply.get("status") == "ok":
         wi_id = reply.get("work_item_id")
         if not wi_id:
             _mark_degraded(session_id, "pre", "bridge returned ok but no work_item_id")
             return
-        key = _call_key(tool_name, tool_input)
+        key = _call_key(tool_name, tool_input, subagent["agent_id"] if subagent else None)
         state_file = _next_state_file(_state_dir(session_id), key)
         with open(state_file, "w") as f:
             f.write(json.dumps(
@@ -379,6 +421,7 @@ def handle_post(*, failure: bool = False) -> None:
     tool_name = hook_input.get("tool_name", _FALLBACK_TOOL_NAME)
     tool_input = hook_input.get("tool_input", {})
     session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
+    subagent = _extract_subagent(hook_input)
 
     # WI-1.1: read tool_response (canonical for Claude Code 2.1.200+) with
     # tool_output as a legacy fallback.
@@ -401,7 +444,7 @@ def handle_post(*, failure: bool = False) -> None:
     truncated = len(full_output) > _TRANSPORT_CAP
     stdout_text = full_output[:_TRANSPORT_CAP]
 
-    key = _call_key(tool_name, tool_input)
+    key = _call_key(tool_name, tool_input, subagent["agent_id"] if subagent else None)
     state_file = _oldest_state_file(_state_dir(session_id), key)
 
     if state_file is None:
@@ -432,23 +475,24 @@ def handle_post(*, failure: bool = False) -> None:
     if failure:
         error = full_output[:500] if full_output else "tool call failed"
 
-    reply = _run_bridge(
-        {
-            "action": "end",
-            "work_item_id": work_item_id,
-            "session_id": session_id,
-            "result_summary": {
-                "exit_code": 1 if failure else 0,
-                "stdout": stdout_text,
-                "stdout_digest": stdout_digest,
-                "stdout_digest_alg": "sha256",
-                "stdout_bytes_total": bytes_total,
-                "stdout_truncated": truncated,
-            },
-            "files": files,
-            "error": error,
-        }
-    )
+    end_payload: dict[str, Any] = {
+        "action": "end",
+        "work_item_id": work_item_id,
+        "session_id": session_id,
+        "result_summary": {
+            "exit_code": 1 if failure else 0,
+            "stdout": stdout_text,
+            "stdout_digest": stdout_digest,
+            "stdout_digest_alg": "sha256",
+            "stdout_bytes_total": bytes_total,
+            "stdout_truncated": truncated,
+        },
+        "files": files,
+        "error": error,
+    }
+    if subagent:
+        end_payload["subagent"] = subagent
+    reply = _run_bridge(end_payload)
     if not reply or reply.get("status") != "ok":
         _mark_degraded(session_id, "post", f"bridge call failed for {tool_name} end")
 
@@ -593,6 +637,93 @@ def handle_stop() -> None:
         _mark_degraded(session_id, "stop", "transcript attestation bridge call failed")
 
 
+def handle_subagent_start() -> None:
+    """Attest that a subagent began executing (Plan 009 WI-3.1).
+
+    The delegation window opens here; tool calls inside it carry the same
+    ``agent_id`` on their own events (per-call attribution).
+    """
+    raw = sys.stdin.read()
+    _capture_raw("subagent-start", raw)
+    hook_input = json.loads(raw)
+    session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
+    subagent = _extract_subagent(hook_input)
+    if not subagent:
+        _mark_degraded(session_id, "subagent_start", "payload carried no agent_id")
+        return
+
+    reply = _run_bridge(
+        {
+            "action": "subagent_start",
+            "session_id": session_id,
+            "agent_id": subagent["agent_id"],
+            "agent_type": subagent.get("agent_type"),
+        }
+    )
+    if not reply or reply.get("status") != "ok":
+        _mark_degraded(session_id, "subagent_start", "subagent start bridge call failed")
+
+
+def handle_subagent_stop() -> None:
+    """Attest that a subagent finished (Plan 009 WI-3.1).
+
+    Digests the subagent's final reply and its transcript file at stop
+    time (the subagent analogue of the WI-3.2 transcript attestation).
+    """
+    raw = sys.stdin.read()
+    _capture_raw("subagent-stop", raw)
+    hook_input = json.loads(raw)
+    session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
+    subagent = _extract_subagent(hook_input)
+    if not subagent:
+        _mark_degraded(session_id, "subagent_stop", "payload carried no agent_id")
+        return
+
+    last_message = hook_input.get("last_assistant_message")
+    transcript_path = hook_input.get("agent_transcript_path")
+
+    reply = _run_bridge(
+        {
+            "action": "subagent_stop",
+            "session_id": session_id,
+            "agent_id": subagent["agent_id"],
+            "agent_type": subagent.get("agent_type"),
+            "last_assistant_message": last_message if isinstance(last_message, str) else None,
+            "agent_transcript_path": transcript_path
+            if isinstance(transcript_path, str)
+            else None,
+        }
+    )
+    if not reply or reply.get("status") != "ok":
+        _mark_degraded(session_id, "subagent_stop", "subagent stop bridge call failed")
+
+
+def handle_post_compact() -> None:
+    """Attest that the harness compacted the session context (Plan 009 WI-3.1).
+
+    Events after this point were produced by a model that no longer saw
+    the full history — an auditor must see the discontinuity in the chain.
+    """
+    raw = sys.stdin.read()
+    _capture_raw("post-compact", raw)
+    hook_input = json.loads(raw)
+    session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
+
+    trigger = hook_input.get("trigger")
+    compact_summary = hook_input.get("compact_summary")
+
+    reply = _run_bridge(
+        {
+            "action": "compaction",
+            "session_id": session_id,
+            "trigger": trigger if isinstance(trigger, str) and trigger else "unknown",
+            "compact_summary": compact_summary if isinstance(compact_summary, str) else None,
+        }
+    )
+    if not reply or reply.get("status") != "ok":
+        _mark_degraded(session_id, "post_compact", "compaction bridge call failed")
+
+
 def _env_truthy(name: str) -> bool:
     val = os.environ.get(name)
     if val is None:
@@ -607,7 +738,7 @@ def main() -> None:
     if len(sys.argv) < 2:
         print(
             "Usage: cairn_hook.py <pre|post|post-failure|session-start|session-end"
-            "|message-display|stop>",
+            "|message-display|stop|subagent-start|subagent-stop|post-compact>",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -629,6 +760,12 @@ def main() -> None:
             handle_message_display()
         elif action == "stop":
             handle_stop()
+        elif action == "subagent-start":
+            handle_subagent_start()
+        elif action == "subagent-stop":
+            handle_subagent_stop()
+        elif action == "post-compact":
+            handle_post_compact()
         else:
             print(f"Unknown action: {action}", file=sys.stderr)
             sys.exit(1)

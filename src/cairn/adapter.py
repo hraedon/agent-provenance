@@ -43,10 +43,14 @@ from ._content_crypto import encrypt_content_fields, resolve_content_encryption_
 from .schema import (
     AssistantMessagePayload,
     CairnConfig,
+    CompactionPayload,
     FileDigest,
     ResultSummary,
     ScopeAttestationPayload,
     SessionAttestationPayload,
+    SubagentIdentity,
+    SubagentStartPayload,
+    SubagentStopPayload,
     ToolCallBegin,
     ToolCallEnd,
     TranscriptAttestationPayload,
@@ -292,6 +296,7 @@ class CairnAdapter:
         work_item_id: uuid.UUID | None = None,
         actor_id: str | None = None,
         event_id: uuid.UUID | None = None,
+        subagent: dict[str, Any] | None = None,
     ) -> Any:
         """Record the start of a tool call.
 
@@ -305,6 +310,9 @@ class CairnAdapter:
                 a fresh work item for this action.
             actor_id: Actor for this event (defaults to adapter default).
             event_id: Explicit UUID for idempotency.
+            subagent: ``{"agent_id", "agent_type"}`` when this call executed
+                inside a subagent (Plan 009 WI-3.1) — attributes the call to
+                the subagent, not the parent loop.
 
         Returns:
             The :class:`~regista.WorkItem` that carries this tool call.
@@ -327,6 +335,7 @@ class CairnAdapter:
             on_behalf_of=delegation,
             parent_action_event_id=parent_action_event_id,
             harness=self._config,
+            subagent=SubagentIdentity.from_dict(subagent) if subagent else None,
         ).to_dict()
 
         if work_item_id is None:
@@ -378,6 +387,7 @@ class CairnAdapter:
         actor_id: str | None = None,
         event_id: uuid.UUID | None = None,
         error: str | None = None,
+        subagent: dict[str, Any] | None = None,
     ) -> Any:
         """Record the completion (or failure) of a tool call.
 
@@ -390,6 +400,8 @@ class CairnAdapter:
             actor_id: Actor for this event (defaults to adapter default).
             event_id: Explicit UUID for idempotency.
             error: If set, the tool call is treated as failed.
+            subagent: ``{"agent_id", "agent_type"}`` when this call executed
+                inside a subagent (Plan 009 WI-3.1).
 
         Returns:
             The appended :class:`~regista.Event`.
@@ -411,6 +423,7 @@ class CairnAdapter:
             on_behalf_of=delegation,
             parent_action_event_id=parent_action_event_id,
             harness=self._config,
+            subagent=SubagentIdentity.from_dict(subagent) if subagent else None,
         ).to_dict()
 
         transition_name = "tool_call_fail" if error else "tool_call_end"
@@ -580,6 +593,148 @@ class CairnAdapter:
             event_id=event_id,
         )
         log.info("cairn.transcript_attestation", session_id=session_id, actor=actor)
+        return event
+
+    # ----------------------------------------------------------------------
+    # Subagent lifecycle + compaction (Plan 009 WI-3.1)
+    # ----------------------------------------------------------------------
+
+    def record_subagent_start(
+        self,
+        session_id: str,
+        agent_id: str,
+        *,
+        agent_type: str | None = None,
+        on_behalf_of: dict[str, Any] | None = None,
+        actor_id: str | None = None,
+        event_id: uuid.UUID | None = None,
+    ) -> Any:
+        """Record that a subagent began executing within a session.
+
+        Appended to the session entity so the chain shows when the
+        delegation window opened.  Tool calls inside the window carry the
+        same ``agent_id`` on their own events (per-call attribution).
+        """
+        actor = actor_id or self._actor_id
+        delegation = on_behalf_of or self._on_behalf_of
+
+        payload = SubagentStartPayload(
+            agent_id=agent_id,
+            agent_type=agent_type,
+            on_behalf_of=delegation,
+            harness=self._config,
+        ).to_dict()
+
+        entity_id = uuid.UUID(session_id) if isinstance(session_id, str) else session_id
+        event = self._sub.append_event(
+            work_item_id=entity_id,
+            actor_id=actor,
+            actor_kind=self._actor_kind,
+            actor_metadata={"role": "agent", "phase": "subagent_start"},
+            transition="subagent_start",
+            payload=payload,
+            on_behalf_of=delegation,
+            entity_kind="session",
+            event_id=event_id,
+        )
+        log.info("cairn.subagent_start", session_id=session_id, agent_id=agent_id, actor=actor)
+        return event
+
+    def record_subagent_stop(
+        self,
+        session_id: str,
+        agent_id: str,
+        *,
+        agent_type: str | None = None,
+        last_assistant_message: str | None = None,
+        agent_transcript_path: str | None = None,
+        on_behalf_of: dict[str, Any] | None = None,
+        actor_id: str | None = None,
+        event_id: uuid.UUID | None = None,
+    ) -> Any:
+        """Record that a subagent finished executing.
+
+        Digests the subagent's final reply and (when the harness exposed a
+        readable path) its transcript file at stop time.  Digest-only —
+        subagent content capture flows through the same message events as
+        the parent.
+        """
+        actor = actor_id or self._actor_id
+        delegation = on_behalf_of or self._on_behalf_of
+
+        transcript_digest = digest_file(agent_transcript_path) if agent_transcript_path else None
+        payload = SubagentStopPayload(
+            agent_id=agent_id,
+            agent_type=agent_type,
+            last_assistant_message_digest=digest_string(last_assistant_message),
+            agent_transcript_path=agent_transcript_path,
+            agent_transcript_digest=transcript_digest,
+            on_behalf_of=delegation,
+            harness=self._config,
+        ).to_dict()
+
+        entity_id = uuid.UUID(session_id) if isinstance(session_id, str) else session_id
+        event = self._sub.append_event(
+            work_item_id=entity_id,
+            actor_id=actor,
+            actor_kind=self._actor_kind,
+            actor_metadata={"role": "agent", "phase": "subagent_stop"},
+            transition="subagent_stop",
+            payload=payload,
+            on_behalf_of=delegation,
+            entity_kind="session",
+            event_id=event_id,
+        )
+        log.info("cairn.subagent_stop", session_id=session_id, agent_id=agent_id, actor=actor)
+        return event
+
+    def record_compaction(
+        self,
+        session_id: str,
+        trigger: str,
+        *,
+        compact_summary: str | None = None,
+        on_behalf_of: dict[str, Any] | None = None,
+        actor_id: str | None = None,
+        event_id: uuid.UUID | None = None,
+        content_capture: bool = False,
+    ) -> Any:
+        """Record that the harness compacted the session context.
+
+        Context loss is provenance-relevant: events after this point were
+        produced by a model that no longer saw the full history.  The
+        summary that replaced the dropped context is digested; under
+        content capture it is also stored (encrypted at rest when content
+        encryption is on).
+        """
+        actor = actor_id or self._actor_id
+        delegation = on_behalf_of or self._on_behalf_of
+
+        content: str | None = compact_summary if content_capture else None
+        payload = CompactionPayload(
+            trigger=trigger,
+            compact_summary_digest=digest_string(compact_summary),
+            compact_summary_content=content,
+            on_behalf_of=delegation,
+            harness=self._config,
+        ).to_dict()
+
+        if content_capture:
+            payload = encrypt_content_fields(payload)
+
+        entity_id = uuid.UUID(session_id) if isinstance(session_id, str) else session_id
+        event = self._sub.append_event(
+            work_item_id=entity_id,
+            actor_id=actor,
+            actor_kind=self._actor_kind,
+            actor_metadata={"role": "agent", "phase": "compaction"},
+            transition="compaction",
+            payload=payload,
+            on_behalf_of=delegation,
+            entity_kind="session",
+            event_id=event_id,
+        )
+        log.info("cairn.compaction", session_id=session_id, trigger=trigger, actor=actor)
         return event
 
     # ----------------------------------------------------------------------

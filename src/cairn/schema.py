@@ -101,6 +101,32 @@ class CairnConfig:
 
 
 @dataclass(frozen=True)
+class SubagentIdentity:
+    """The subagent a tool call executed inside (Plan 009 WI-3.1).
+
+    Claude Code stamps every hook payload fired inside a subagent with
+    ``agent_id``/``agent_type`` (verified from real 2.1.207 capture);
+    payloads from the main loop carry neither.  Attribution is therefore
+    per-call from the payload itself — correct even when multiple
+    subagents run in parallel — and a subagent's tool calls can never
+    masquerade as the parent's.
+    """
+
+    agent_id: str
+    agent_type: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"agent_id": self.agent_id}
+        if self.agent_type is not None:
+            d["agent_type"] = self.agent_type
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SubagentIdentity:
+        return cls(agent_id=data["agent_id"], agent_type=data.get("agent_type"))
+
+
+@dataclass(frozen=True)
 class ToolCallBegin:
     tool: str
     tool_args_hash: str
@@ -109,6 +135,7 @@ class ToolCallBegin:
     on_behalf_of: dict[str, Any] | None = None
     parent_action_event_id: str | None = None
     harness: CairnConfig | None = None
+    subagent: SubagentIdentity | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -125,6 +152,8 @@ class ToolCallBegin:
             d["parent_action_event_id"] = self.parent_action_event_id
         if self.harness is not None:
             d["harness"] = self.harness.to_dict()
+        if self.subagent is not None:
+            d["subagent"] = self.subagent.to_dict()
         return d
 
     @classmethod
@@ -137,6 +166,7 @@ class ToolCallBegin:
             on_behalf_of=data.get("on_behalf_of"),
             parent_action_event_id=data.get("parent_action_event_id"),
             harness=CairnConfig.from_dict(data["harness"]) if "harness" in data else None,
+            subagent=SubagentIdentity.from_dict(data["subagent"]) if "subagent" in data else None,
         )
 
 
@@ -149,6 +179,7 @@ class ToolCallEnd:
     on_behalf_of: dict[str, Any] | None = None
     parent_action_event_id: str | None = None
     harness: CairnConfig | None = None
+    subagent: SubagentIdentity | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -165,6 +196,8 @@ class ToolCallEnd:
             d["parent_action_event_id"] = self.parent_action_event_id
         if self.harness is not None:
             d["harness"] = self.harness.to_dict()
+        if self.subagent is not None:
+            d["subagent"] = self.subagent.to_dict()
         return d
 
     @classmethod
@@ -179,6 +212,7 @@ class ToolCallEnd:
             on_behalf_of=data.get("on_behalf_of"),
             parent_action_event_id=data.get("parent_action_event_id"),
             harness=CairnConfig.from_dict(data["harness"]) if "harness" in data else None,
+            subagent=SubagentIdentity.from_dict(data["subagent"]) if "subagent" in data else None,
         )
 
 
@@ -457,6 +491,128 @@ class TranscriptAttestationPayload:
             transcript_content=data.get("transcript_content"),
             event_count=data.get("event_count"),
             session_id=data.get("session_id"),
+            on_behalf_of=data.get("on_behalf_of"),
+            harness=CairnConfig.from_dict(data["harness"]) if "harness" in data else None,
+        )
+
+
+@dataclass(frozen=True)
+class SubagentStartPayload:
+    """A subagent began executing within a session (Plan 009 WI-3.1).
+
+    Recorded from Claude Code's ``SubagentStart`` hook, whose payload
+    carries ``agent_id`` and ``agent_type`` on top of the session base
+    fields (verified from real 2.1.207 capture).
+    """
+
+    agent_id: str
+    agent_type: str | None = None
+    on_behalf_of: dict[str, Any] | None = None
+    harness: CairnConfig | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"agent_id": self.agent_id}
+        if self.agent_type is not None:
+            d["agent_type"] = self.agent_type
+        if self.on_behalf_of is not None:
+            d["on_behalf_of"] = self.on_behalf_of
+        if self.harness is not None:
+            d["harness"] = self.harness.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SubagentStartPayload:
+        return cls(
+            agent_id=data["agent_id"],
+            agent_type=data.get("agent_type"),
+            on_behalf_of=data.get("on_behalf_of"),
+            harness=CairnConfig.from_dict(data["harness"]) if "harness" in data else None,
+        )
+
+
+@dataclass(frozen=True)
+class SubagentStopPayload:
+    """A subagent finished executing (Plan 009 WI-3.1).
+
+    ``last_assistant_message_digest`` covers the subagent's final reply
+    (the text the parent received).  ``agent_transcript_digest`` covers
+    the subagent's transcript file at stop time when the harness exposed
+    a readable path — the subagent analogue of the WI-3.2 transcript
+    attestation.
+    """
+
+    agent_id: str
+    agent_type: str | None = None
+    last_assistant_message_digest: str | None = None
+    agent_transcript_path: str | None = None
+    agent_transcript_digest: str | None = None
+    on_behalf_of: dict[str, Any] | None = None
+    harness: CairnConfig | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"agent_id": self.agent_id}
+        if self.agent_type is not None:
+            d["agent_type"] = self.agent_type
+        if self.last_assistant_message_digest is not None:
+            d["last_assistant_message_digest"] = self.last_assistant_message_digest
+        if self.agent_transcript_path is not None:
+            d["agent_transcript_path"] = self.agent_transcript_path
+        if self.agent_transcript_digest is not None:
+            d["agent_transcript_digest"] = self.agent_transcript_digest
+        if self.on_behalf_of is not None:
+            d["on_behalf_of"] = self.on_behalf_of
+        if self.harness is not None:
+            d["harness"] = self.harness.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SubagentStopPayload:
+        return cls(
+            agent_id=data["agent_id"],
+            agent_type=data.get("agent_type"),
+            last_assistant_message_digest=data.get("last_assistant_message_digest"),
+            agent_transcript_path=data.get("agent_transcript_path"),
+            agent_transcript_digest=data.get("agent_transcript_digest"),
+            on_behalf_of=data.get("on_behalf_of"),
+            harness=CairnConfig.from_dict(data["harness"]) if "harness" in data else None,
+        )
+
+
+@dataclass(frozen=True)
+class CompactionPayload:
+    """The harness compacted the session context (Plan 009 WI-3.1).
+
+    Context loss is provenance-relevant: events after a compaction were
+    produced by a model that no longer saw the full history.  The digest
+    covers the compaction summary that replaced the dropped context;
+    ``compact_summary_content`` is present only under content capture
+    (encrypted at rest when content encryption is on).
+    """
+
+    trigger: str
+    compact_summary_digest: str | None = None
+    compact_summary_content: str | dict[str, Any] | None = None
+    on_behalf_of: dict[str, Any] | None = None
+    harness: CairnConfig | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"trigger": self.trigger}
+        if self.compact_summary_digest is not None:
+            d["compact_summary_digest"] = self.compact_summary_digest
+        if self.compact_summary_content is not None:
+            d["compact_summary_content"] = self.compact_summary_content
+        if self.on_behalf_of is not None:
+            d["on_behalf_of"] = self.on_behalf_of
+        if self.harness is not None:
+            d["harness"] = self.harness.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CompactionPayload:
+        return cls(
+            trigger=data["trigger"],
+            compact_summary_digest=data.get("compact_summary_digest"),
+            compact_summary_content=data.get("compact_summary_content"),
             on_behalf_of=data.get("on_behalf_of"),
             harness=CairnConfig.from_dict(data["harness"]) if "harness" in data else None,
         )
