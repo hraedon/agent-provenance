@@ -28,6 +28,7 @@ CONTENT_ENCRYPTION_ENV = "CAIRN_CONTENT_ENCRYPTION"
 _CONTENT_FIELD_NAMES = frozenset({
     "message_content",
     "transcript_content",
+    "compact_summary_content",
 })
 
 _DEFAULT_KEY_ID = "cairn-content-001"

@@ -48,6 +48,13 @@ HOOK_EVENTS: dict[str, str] = {
     "SessionEnd": "session-end",
     "MessageDisplay": "message-display",
     "Stop": "stop",
+    # Plan 009 WI-3.1 — subagent attribution + compaction attestation.
+    # PostToolBatch is deliberately absent: per-call PostToolUse already
+    # covers every batch member (same tool_use_ids; verified from real
+    # 2.1.207 capture), so attesting the batch would double-count.
+    "SubagentStart": "subagent-start",
+    "SubagentStop": "subagent-stop",
+    "PostCompact": "post-compact",
 }
 
 _ENV_VARS = [

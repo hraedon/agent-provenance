@@ -352,6 +352,28 @@ class AttestationGap:
 
 
 @dataclass(frozen=True)
+class SilenceGap:
+    """A session that ran on the harness but produced no events at all
+    (Plan 009 WI-4.1 — silence is a finding).
+
+    Complementary to :class:`AttestationGap`: an attestation gap is a
+    session *visible in the log* without a session attestation; a silence
+    gap is a session the harness ran (evidenced by its local transcript)
+    that never reached the log — the recorder was wired but recorded
+    nothing, or was unhooked while config stayed in place.
+
+    Populated only when the caller supplies harness session evidence
+    (``cairn verify --harness-sessions``); an offline bundle alone cannot
+    see what never entered it.
+    """
+
+    session_id: str
+    last_activity: str | None = None
+    transcript_path: str | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
 class AssuranceEntry:
     """Review assurance level for a work item (regista Plan 027 WI-1.2).
 
@@ -414,6 +436,7 @@ class VerificationReport:
     chain_contiguity_violations: list[ChainContiguityViolation] = field(default_factory=list)
     principal_binding_violations: list[PrincipalBindingViolation] = field(default_factory=list)
     attestation_gaps: list[AttestationGap] = field(default_factory=list)
+    silence_gaps: list[SilenceGap] = field(default_factory=list)
     assurance_entries: list[AssuranceEntry] = field(default_factory=list)
     content_coverage_gaps: list[ContentCoverageGap] = field(default_factory=list)
     scheme_counts: dict[str, int] = field(default_factory=dict)
@@ -463,6 +486,7 @@ class VerificationReport:
             and len(self.chain_contiguity_violations) == 0
             and len(self.principal_binding_violations) == 0
             and len(self.attestation_gaps) == 0
+            and len(self.silence_gaps) == 0
             and len(self.content_coverage_gaps) == 0
             and bundle_ok
             and chain_ok

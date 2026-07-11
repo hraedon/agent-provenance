@@ -1,0 +1,9 @@
+{
+  "agent_id": "a1d866d3e0dee29b8",
+  "agent_type": "general-purpose",
+  "cwd": "/home/operator/work",
+  "hook_event_name": "SubagentStart",
+  "prompt_id": "c27d5e9c-d329-4141-b956-41294f8a77d1",
+  "session_id": "ab1791e7-afd6-449b-8f49-1f2c79919206",
+  "transcript_path": "/home/operator/.claude/projects/-home-operator-work/ab1791e7-afd6-449b-8f49-1f2c79919206.jsonl"
+}

@@ -1,0 +1,39 @@
+{
+  "cwd": "/home/operator/work",
+  "hook_event_name": "PostToolBatch",
+  "permission_mode": "bypassPermissions",
+  "prompt_id": "c27d5e9c-d329-4141-b956-41294f8a77d1",
+  "session_id": "ab1791e7-afd6-449b-8f49-1f2c79919206",
+  "tool_calls": [
+    {
+      "tool_input": {
+        "command": "echo cairn-parent-marker-7301",
+        "description": "Run marker command"
+      },
+      "tool_name": "Bash",
+      "tool_response": "cairn-parent-marker-7301",
+      "tool_use_id": "toolu_01YJMsDkUwgt46XdvFQdFgSP"
+    },
+    {
+      "tool_input": {
+        "description": "Run subagent marker command",
+        "prompt": "Run this exact command with the Bash tool: echo cairn-subagent-marker-7302 \u2014 then reply with just the output.",
+        "run_in_background": false,
+        "subagent_type": "general-purpose"
+      },
+      "tool_name": "Agent",
+      "tool_response": [
+        {
+          "text": "cairn-subagent-marker-7302",
+          "type": "text"
+        },
+        {
+          "text": "agentId: a1d866d3e0dee29b8 (use SendMessage with to: 'a1d866d3e0dee29b8', summary: '<5-10 word recap>' to continue this agent)\n<usage>subagent_tokens: 12842\ntool_uses: 1\nduration_ms: 6950</usage>",
+          "type": "text"
+        }
+      ],
+      "tool_use_id": "toolu_01FyPcwMidg3LuANPmBznEuN"
+    }
+  ],
+  "transcript_path": "/home/operator/.claude/projects/-home-operator-work/ab1791e7-afd6-449b-8f49-1f2c79919206.jsonl"
+}

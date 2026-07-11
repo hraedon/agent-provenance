@@ -6720,3 +6720,262 @@ def test_attestation_gap_chain_dedup_across_bundles(hmac_keys: Path, tmp_path: P
     assert len(report.attestation_gaps) == 0, [
         g.detail for g in report.attestation_gaps
     ]
+
+
+# ----------------------------------------------------------------------
+# Plan 009 WI-3.1: subagent lifecycle + compaction
+# ----------------------------------------------------------------------
+
+
+def test_subagent_identity_roundtrip() -> None:
+    from cairn.schema import SubagentIdentity
+
+    si = SubagentIdentity(agent_id="a1d866d3e0dee29b8", agent_type="general-purpose")
+    assert SubagentIdentity.from_dict(si.to_dict()) == si
+    minimal = SubagentIdentity(agent_id="a1d866d3e0dee29b8")
+    assert "agent_type" not in minimal.to_dict()
+    assert SubagentIdentity.from_dict(minimal.to_dict()) == minimal
+
+
+def test_tool_call_begin_with_subagent_roundtrip() -> None:
+    from cairn.schema import SubagentIdentity
+
+    tc = ToolCallBegin(
+        tool="Bash",
+        tool_args_hash="abc",
+        subagent=SubagentIdentity(agent_id="a1d866d3e0dee29b8", agent_type="general-purpose"),
+    )
+    d = tc.to_dict()
+    assert d["subagent"] == {
+        "agent_id": "a1d866d3e0dee29b8",
+        "agent_type": "general-purpose",
+    }
+    assert ToolCallBegin.from_dict(d) == tc
+
+
+def test_tool_call_end_with_subagent_roundtrip() -> None:
+    from cairn.schema import SubagentIdentity, ToolCallEnd
+
+    tc = ToolCallEnd(
+        tool="Bash",
+        tool_args_hash="abc",
+        subagent=SubagentIdentity(agent_id="a1d866d3e0dee29b8"),
+    )
+    assert ToolCallEnd.from_dict(tc.to_dict()) == tc
+
+
+def test_subagent_start_payload_roundtrip() -> None:
+    from cairn.schema import SubagentStartPayload
+
+    p = SubagentStartPayload(
+        agent_id="a1d866d3e0dee29b8",
+        agent_type="general-purpose",
+        on_behalf_of={"principal_id": "human:test"},
+    )
+    assert SubagentStartPayload.from_dict(p.to_dict()) == p
+
+
+def test_subagent_stop_payload_roundtrip() -> None:
+    from cairn.schema import SubagentStopPayload
+
+    p = SubagentStopPayload(
+        agent_id="a1d866d3e0dee29b8",
+        agent_type="general-purpose",
+        last_assistant_message_digest="d" * 64,
+        agent_transcript_path="/home/operator/work/agent.jsonl",
+        agent_transcript_digest="e" * 64,
+    )
+    assert SubagentStopPayload.from_dict(p.to_dict()) == p
+
+
+def test_compaction_payload_roundtrip() -> None:
+    from cairn.schema import CompactionPayload
+
+    p = CompactionPayload(
+        trigger="manual",
+        compact_summary_digest="f" * 64,
+    )
+    assert CompactionPayload.from_dict(p.to_dict()) == p
+
+
+def test_adapter_records_subagent_lifecycle(adapter: CairnAdapter) -> None:
+    """DB round-trip: subagent start/stop + compaction land on the session
+    entity with the right transitions and digests."""
+    from cairn.schema import digest_string
+
+    session_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    start_ev = adapter.record_subagent_start(
+        session_id,
+        "a1d866d3e0dee29b8",
+        agent_type="general-purpose",
+    )
+    assert start_ev.transition == "subagent_start"
+    assert start_ev.payload["agent_id"] == "a1d866d3e0dee29b8"
+
+    last_message = "cairn-subagent-marker-7302"
+    stop_ev = adapter.record_subagent_stop(
+        session_id,
+        "a1d866d3e0dee29b8",
+        agent_type="general-purpose",
+        last_assistant_message=last_message,
+    )
+    assert stop_ev.transition == "subagent_stop"
+    assert stop_ev.payload["last_assistant_message_digest"] == digest_string(last_message)
+
+    compact_ev = adapter.record_compaction(
+        session_id,
+        "auto",
+        compact_summary="summary of dropped context",
+    )
+    assert compact_ev.transition == "compaction"
+    assert compact_ev.payload["trigger"] == "auto"
+    assert compact_ev.payload["compact_summary_digest"] == digest_string(
+        "summary of dropped context"
+    )
+    # Digest-only by default: no content stored without content_capture.
+    assert "compact_summary_content" not in compact_ev.payload
+
+
+def test_adapter_begin_tool_call_carries_subagent(adapter: CairnAdapter) -> None:
+    """DB round-trip: a tool call inside a subagent carries the identity
+    on both begin and end payloads."""
+    sub = {"agent_id": "a1d866d3e0dee29b8", "agent_type": "general-purpose"}
+    wi = adapter.begin_tool_call(
+        tool="Bash",
+        tool_args={"command": "echo hi"},
+        subagent=sub,
+    )
+    end_ev = adapter.end_tool_call(wi.work_item_id, subagent=sub)
+
+    begin_events = adapter._sub.read_events(
+        work_item_id=wi.work_item_id, transition="tool_call_begin"
+    )
+    assert begin_events[-1].payload["subagent"] == sub
+    assert end_ev.payload["subagent"] == sub
+
+
+# ----------------------------------------------------------------------
+# Plan 009 WI-4.1: silence gaps — sessions that ran but never attested
+# ----------------------------------------------------------------------
+
+
+def _signed_tool_call_event(key_bytes: bytes, session_id: str, seq: int = 0):
+    from regista._signing import sign_event
+    from regista._types import Event
+
+    ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    payload = {"tool": "Bash", "tool_args_hash": "abc"}
+    on_behalf_of = {"principal_id": "human:test", "session_id": session_id}
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=seq,
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload=payload,
+        on_behalf_of=on_behalf_of,
+        key=key_bytes,
+    )
+    return Event(
+        event_id=ev_id,
+        work_item_id=wi_id,
+        event_seq=seq,
+        actor_id="agent-1",
+        actor_kind="agent",
+        actor_metadata=None,
+        key_id="cairn-test-001",
+        workflow_name="cairn_agent_actions",
+        workflow_version=1,
+        timestamp=now,
+        transition="tool_call_begin",
+        payload=payload,
+        on_behalf_of=on_behalf_of,
+        payload_canonical_hash=c_hash,
+        signature=sig,
+        canonical_envelope=env,
+    )
+
+
+def test_silence_gap_flags_session_with_no_events(hmac_keys: Path) -> None:
+    """A harness session with local transcript evidence but zero events in
+    the log is a named silence-gap finding (WI-4.1)."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    attested_session = str(uuid.uuid4())
+    silent_session = str(uuid.uuid4())
+    events = [_signed_tool_call_event(key_bytes, attested_session)]
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events(events)
+
+    evidence = {
+        attested_session: {
+            "last_activity": "2026-07-11T03:00:00+00:00",
+            "transcript_path": f"/home/operator/.claude/projects/x/{attested_session}.jsonl",
+        },
+        silent_session: {
+            "last_activity": "2026-07-11T03:05:00+00:00",
+            "transcript_path": f"/home/operator/.claude/projects/x/{silent_session}.jsonl",
+        },
+    }
+    verifier.check_silence_gaps(events, report, evidence)
+
+    assert len(report.silence_gaps) == 1
+    gap = report.silence_gaps[0]
+    assert gap.session_id == silent_session
+    assert "produced" in gap.detail and "no events" in gap.detail
+    assert report.all_ok is False
+
+
+def test_silence_gap_absent_when_all_sessions_attested(hmac_keys: Path) -> None:
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    session = str(uuid.uuid4())
+    events = [_signed_tool_call_event(key_bytes, session)]
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_events(events)
+    verifier.check_silence_gaps(
+        events,
+        report,
+        {session: {"last_activity": None, "transcript_path": None}},
+    )
+    assert report.silence_gaps == []
+
+
+def test_silence_gap_rendered_in_reports(hmac_keys: Path) -> None:
+    """The finding is named in text, JSON, and HTML report formats."""
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    silent_session = str(uuid.uuid4())
+    events = [_signed_tool_call_event(key_bytes, str(uuid.uuid4()))]
+    verifier = Verifier(key_set)
+    report = verifier.verify_events(events)
+    verifier.check_silence_gaps(
+        events,
+        report,
+        {silent_session: {"last_activity": "2026-07-11T03:05:00+00:00",
+                          "transcript_path": None}},
+    )
+
+    text = Verifier.format_report(report)
+    assert "SILENCE GAPS" in text
+    assert silent_session in text
+
+    as_json = Verifier.format_report_json(report)
+    assert as_json["silence_gaps"][0]["session_id"] == silent_session
+
+    html = Verifier.format_report_html(report)
+    assert "Silence Gaps" in html

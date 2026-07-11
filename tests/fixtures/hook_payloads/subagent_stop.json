@@ -1,0 +1,15 @@
+{
+  "agent_id": "a1d866d3e0dee29b8",
+  "agent_transcript_path": "/home/operator/.claude/projects/-home-operator-work/ab1791e7-afd6-449b-8f49-1f2c79919206/subagents/agent-a1d866d3e0dee29b8.jsonl",
+  "agent_type": "general-purpose",
+  "background_tasks": [],
+  "cwd": "/home/operator/work",
+  "hook_event_name": "SubagentStop",
+  "last_assistant_message": "cairn-subagent-marker-7302",
+  "permission_mode": "bypassPermissions",
+  "prompt_id": "c27d5e9c-d329-4141-b956-41294f8a77d1",
+  "session_crons": [],
+  "session_id": "ab1791e7-afd6-449b-8f49-1f2c79919206",
+  "stop_hook_active": false,
+  "transcript_path": "/home/operator/.claude/projects/-home-operator-work/ab1791e7-afd6-449b-8f49-1f2c79919206.jsonl"
+}

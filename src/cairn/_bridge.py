@@ -173,6 +173,9 @@ def main() -> None:
         "user_message",
         "assistant_message",
         "transcript_attestation",
+        "subagent_start",
+        "subagent_stop",
+        "compaction",
     ):
         sys.stderr.write(f"cairn_bridge: unknown action {action!r}\n")
         sys.exit(1)
@@ -252,6 +255,10 @@ def _dispatch(
         )
         return {"status": "ok", "event_id": str(event.event_id)}
 
+    subagent = msg.get("subagent")
+    if not (isinstance(subagent, dict) and subagent.get("agent_id")):
+        subagent = None
+
     if action == "begin":
         args = msg.get("args", {})
         args_hash = "sha256:" + hash_payload(args)
@@ -259,6 +266,7 @@ def _dispatch(
             tool=msg.get("tool", "unknown"),
             tool_args=args,
             files=files,
+            subagent=subagent,
         )
         return {
             "status": "ok",
@@ -277,6 +285,7 @@ def _dispatch(
             result_summary=msg.get("result_summary"),
             files=files,
             error=msg.get("error"),
+            subagent=subagent,
         )
         return {"status": "ok", "event_id": str(event.event_id)}
 
@@ -310,6 +319,41 @@ def _dispatch(
             transcript=transcript,
             event_count=msg.get("event_count"),
             content_capture=content_capture,
+        )
+        return {"status": "ok", "event_id": str(event.event_id)}
+
+    if action == "subagent_start":
+        agent_id = msg.get("agent_id")
+        if not agent_id:
+            sys.stderr.write("cairn_bridge: agent_id required for subagent_start\n")
+            sys.exit(1)
+        event = adapter.record_subagent_start(
+            session_id=session_id,
+            agent_id=agent_id,
+            agent_type=msg.get("agent_type"),
+        )
+        return {"status": "ok", "event_id": str(event.event_id)}
+
+    if action == "subagent_stop":
+        agent_id = msg.get("agent_id")
+        if not agent_id:
+            sys.stderr.write("cairn_bridge: agent_id required for subagent_stop\n")
+            sys.exit(1)
+        event = adapter.record_subagent_stop(
+            session_id=session_id,
+            agent_id=agent_id,
+            agent_type=msg.get("agent_type"),
+            last_assistant_message=msg.get("last_assistant_message"),
+            agent_transcript_path=msg.get("agent_transcript_path"),
+        )
+        return {"status": "ok", "event_id": str(event.event_id)}
+
+    if action == "compaction":
+        event = adapter.record_compaction(
+            session_id=session_id,
+            trigger=msg.get("trigger", "unknown"),
+            compact_summary=msg.get("compact_summary"),
+            content_capture=msg.get("content_capture", False),
         )
         return {"status": "ok", "event_id": str(event.event_id)}
 

@@ -1,6 +1,17 @@
 # Plan 009 — Capture correctness: attest what the harness actually emits
 
-**Status:** Proposed 2026-07-07.
+**Status:** Complete 2026-07-11. Phases 1–2 landed 2026-07-07/08 (WI-1.1/1.2/1.3
+capture correctness; WI-2.1 operator install; WI-2.2 live proof). Phases 3–4
+landed 2026-07-11: WI-3.1 subagent attribution (per-call `agent_id` from the
+payload, verified from real 2.1.207 capture; `subagent_start`/`subagent_stop`/
+`compaction` session events; PostToolBatch documented as covered by per-call
+attestation — same `tool_use_id`s, attesting it would double-count) and WI-4.1
+(doctor `attestation_freshness` check + verifier `SilenceGap` finding via
+`cairn verify --harness-sessions`; live run surfaced 105 real pre-wiring
+silent sessions and zero post-wiring ones). WI-3.2 (assistant-output/transcript
+attestation) was delivered by Plan 010's `MessageDisplay`/`Stop` handlers.
+Note for operators: existing installs red-out on the three new hooks until
+`cairn install-harness claude` is re-run (idempotent merge).
 **Author:** Claude (Fable 5), from the 2026-07-07 suite v2 gaps review
 **Strategic role:** Plan 008 made attestation *installable*; this plan makes it
 *true*. A verification pass on 2026-07-07 found that cairn is not capturing

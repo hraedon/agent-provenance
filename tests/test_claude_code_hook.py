@@ -20,6 +20,7 @@ from cairn._claude_hook import (
     _call_key,
     _compute_output_digest,
     _extract_files,
+    _extract_subagent,
     _extract_tool_response,
     _mark_degraded,
     _next_state_file,
@@ -29,9 +30,12 @@ from cairn._claude_hook import (
     _safe_session_id,
     _state_dir,
     handle_post,
+    handle_post_compact,
     handle_pre,
     handle_session_end,
     handle_session_start,
+    handle_subagent_start,
+    handle_subagent_stop,
 )
 
 
@@ -876,7 +880,8 @@ def _setup_state_and_post(
     tool_input = fixture["tool_input"]
     tool_name = fixture["tool_name"]
     session_id = fixture["session_id"]
-    key = _call_key(tool_name, tool_input)
+    # Subagent payloads pair under an agent-scoped key (Plan 009 WI-3.1).
+    key = _call_key(tool_name, tool_input, fixture.get("agent_id"))
     # Write state file to the dir matching the fixture's session_id.
     fixture_state_dir = state_dir.parent / _safe_session_id(session_id)
     fixture_state_dir.mkdir(parents=True, exist_ok=True)
@@ -968,3 +973,235 @@ def test_fixture_session_start_attests_real_session_id(
 
     call_args = mock_bridge.call_args[0][0]
     assert call_args["session_id"] == fixture["session_id"]
+
+
+# ----------------------------------------------------------------------
+# Plan 009 WI-3.1: subagent attribution + compaction attestation
+# Fixtures recorded from a REAL Claude Code 2.1.207 session that spawned
+# a general-purpose subagent and ran /compact (CAIRN_CAPTURE_DIR).
+# ----------------------------------------------------------------------
+
+
+def test_extract_subagent_from_recorded_payload() -> None:
+    """Recorded subagent PreToolUse carries agent_id/agent_type; the
+    extractor reads them verbatim."""
+    fixture = _load_fixture("pre_bash_subagent.json")
+    sub = _extract_subagent(fixture)
+    assert sub is not None
+    assert sub["agent_id"] == fixture["agent_id"]
+    assert sub["agent_type"] == fixture["agent_type"]
+
+
+def test_extract_subagent_absent_for_main_loop_payload() -> None:
+    """Recorded main-loop PreToolUse carries no agent_id — no subagent."""
+    fixture = _load_fixture("pre_bash.json")
+    assert _extract_subagent(fixture) is None
+
+
+def test_call_key_differs_with_agent_id() -> None:
+    """Parent and subagent running the SAME tool with the SAME args must
+    pair under different keys, or the FIFO pairing could attribute one's
+    result to the other."""
+    tool_input = {"command": "echo marker"}
+    parent_key = _call_key("Bash", tool_input)
+    subagent_key = _call_key("Bash", tool_input, "a1d866d3e0dee29b8")
+    other_agent_key = _call_key("Bash", tool_input, "b2e977e4f1eff3ac9")
+    assert parent_key != subagent_key
+    assert subagent_key != other_agent_key
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_handle_pre_subagent_threads_identity_to_bridge(
+    mock_bridge: MagicMock, state_dir: Path
+) -> None:
+    """Recorded subagent PreToolUse: the bridge payload carries the
+    subagent identity and state lands under the agent-scoped key."""
+    mock_bridge.return_value = {"status": "ok", "work_item_id": str(uuid.uuid4())}
+    fixture = _load_fixture("pre_bash_subagent.json")
+
+    with patch("sys.stdin", StringIO(json.dumps(fixture))):
+        handle_pre()
+
+    call_args = mock_bridge.call_args[0][0]
+    assert call_args["subagent"] == {
+        "agent_id": fixture["agent_id"],
+        "agent_type": fixture["agent_type"],
+    }
+
+    key = _call_key(fixture["tool_name"], fixture["tool_input"], fixture["agent_id"])
+    fixture_state_dir = state_dir.parent / _safe_session_id(fixture["session_id"])
+    assert _oldest_state_file(fixture_state_dir, key) is not None
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_handle_post_subagent_digest_matches_real_output(
+    mock_bridge: MagicMock, state_dir: Path
+) -> None:
+    """Recorded subagent PostToolUse: attribution flows to the end event
+    and the digest covers the real subagent stdout."""
+    fixture = _load_fixture("post_bash_subagent.json")
+    call_args = _setup_state_and_post(mock_bridge, state_dir, fixture)
+
+    assert call_args["subagent"] == {
+        "agent_id": fixture["agent_id"],
+        "agent_type": fixture["agent_type"],
+    }
+    real_output = fixture["tool_response"]["stdout"]
+    rs = call_args["result_summary"]
+    assert rs["stdout_digest"] == hashlib.sha256(real_output.encode("utf-8")).hexdigest()
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_parent_and_subagent_identical_calls_do_not_cross_pair(
+    mock_bridge: MagicMock, state_dir: Path
+) -> None:
+    """Regression for the pairing hazard the real capture exposed: parent
+    and subagent run the SAME command concurrently; each post must consume
+    its own begin's work_item_id."""
+    session_id = "test-session"
+    tool_input = {"command": "echo same-command"}
+    parent_wi = str(uuid.uuid4())
+    subagent_wi = str(uuid.uuid4())
+    agent_id = "a1d866d3e0dee29b8"
+
+    base = {
+        "tool_name": "Bash",
+        "tool_input": tool_input,
+        "session_id": session_id,
+    }
+    # Parent begin, then subagent begin (interleaved).
+    mock_bridge.return_value = {"status": "ok", "work_item_id": parent_wi}
+    with patch("sys.stdin", StringIO(json.dumps(base))):
+        handle_pre()
+    mock_bridge.return_value = {"status": "ok", "work_item_id": subagent_wi}
+    with patch(
+        "sys.stdin",
+        StringIO(json.dumps({**base, "agent_id": agent_id, "agent_type": "general-purpose"})),
+    ):
+        handle_pre()
+
+    # Subagent post arrives FIRST — it must consume the subagent's state,
+    # not the parent's (FIFO on a shared key would return parent_wi).
+    mock_bridge.return_value = {"status": "ok", "event_id": str(uuid.uuid4())}
+    with patch(
+        "sys.stdin",
+        StringIO(
+            json.dumps(
+                {
+                    **base,
+                    "agent_id": agent_id,
+                    "agent_type": "general-purpose",
+                    "tool_response": {"stdout": "same-command\n", "stderr": ""},
+                }
+            )
+        ),
+    ):
+        handle_post()
+    assert mock_bridge.call_args[0][0]["work_item_id"] == subagent_wi
+
+    with patch(
+        "sys.stdin",
+        StringIO(json.dumps({**base, "tool_response": {"stdout": "same-command\n", "stderr": ""}})),
+    ):
+        handle_post()
+    assert mock_bridge.call_args[0][0]["work_item_id"] == parent_wi
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_handle_subagent_start_fixture(mock_bridge: MagicMock) -> None:
+    """Recorded SubagentStart: the bridge receives the subagent identity
+    bound to the parent session."""
+    mock_bridge.return_value = {"status": "ok", "event_id": str(uuid.uuid4())}
+    fixture = _load_fixture("subagent_start.json")
+
+    with patch("sys.stdin", StringIO(json.dumps(fixture))):
+        handle_subagent_start()
+
+    call_args = mock_bridge.call_args[0][0]
+    assert call_args["action"] == "subagent_start"
+    assert call_args["session_id"] == fixture["session_id"]
+    assert call_args["agent_id"] == fixture["agent_id"]
+    assert call_args["agent_type"] == fixture["agent_type"]
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_handle_subagent_stop_fixture(mock_bridge: MagicMock) -> None:
+    """Recorded SubagentStop: the bridge receives the final reply and the
+    transcript path for digesting."""
+    mock_bridge.return_value = {"status": "ok", "event_id": str(uuid.uuid4())}
+    fixture = _load_fixture("subagent_stop.json")
+
+    with patch("sys.stdin", StringIO(json.dumps(fixture))):
+        handle_subagent_stop()
+
+    call_args = mock_bridge.call_args[0][0]
+    assert call_args["action"] == "subagent_stop"
+    assert call_args["agent_id"] == fixture["agent_id"]
+    assert call_args["last_assistant_message"] == fixture["last_assistant_message"]
+    assert call_args["agent_transcript_path"] == fixture["agent_transcript_path"]
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_handle_subagent_start_without_agent_id_degrades(
+    mock_bridge: MagicMock, state_dir: Path
+) -> None:
+    """A SubagentStart payload without agent_id (drifted harness) marks
+    degradation instead of attesting a nameless subagent."""
+    payload = {"session_id": "test-session", "hook_event_name": "SubagentStart"}
+    with patch("sys.stdin", StringIO(json.dumps(payload))):
+        handle_subagent_start()
+
+    mock_bridge.assert_not_called()
+    assert (state_dir / "degradation.log").exists()
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_handle_post_compact_fixture(mock_bridge: MagicMock) -> None:
+    """Recorded PostCompact: the bridge receives the trigger and the
+    summary that replaced the dropped context."""
+    mock_bridge.return_value = {"status": "ok", "event_id": str(uuid.uuid4())}
+    fixture = _load_fixture("post_compact.json")
+
+    with patch("sys.stdin", StringIO(json.dumps(fixture))):
+        handle_post_compact()
+
+    call_args = mock_bridge.call_args[0][0]
+    assert call_args["action"] == "compaction"
+    assert call_args["session_id"] == fixture["session_id"]
+    assert call_args["trigger"] == fixture["trigger"]
+    assert call_args["compact_summary"] == fixture["compact_summary"]
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_handle_subagent_stop_bridge_failure_degrades(
+    mock_bridge: MagicMock, state_dir: Path
+) -> None:
+    """Bridge failure on subagent stop is recorded as degradation."""
+    mock_bridge.return_value = None
+    fixture = {
+        "session_id": "test-session",
+        "agent_id": "a1d866d3e0dee29b8",
+        "agent_type": "general-purpose",
+    }
+    with patch("sys.stdin", StringIO(json.dumps(fixture))):
+        handle_subagent_stop()
+
+    assert (state_dir / "degradation.log").exists()
+
+
+def test_post_tool_batch_is_covered_by_per_call_attestation() -> None:
+    """PostToolBatch is deliberately NOT attested (Plan 009 WI-3.1).
+
+    This executable document pins the reason: every recorded batch entry
+    carries a tool_use_id and tool_response — the same calls the per-call
+    PostToolUse hook already attested.  Attesting the batch would
+    double-count them.  If the harness ever ships batch entries WITHOUT
+    per-call coverage, this shape assertion is where to start."""
+    fixture = _load_fixture("post_tool_batch.json")
+    assert fixture["hook_event_name"] == "PostToolBatch"
+    calls = fixture["tool_calls"]
+    assert isinstance(calls, list) and calls
+    for call in calls:
+        assert call["tool_use_id"].startswith("toolu_")
+        assert "tool_name" in call
+        assert "tool_response" in call
