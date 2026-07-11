@@ -34,6 +34,11 @@ def _clear_env(monkeypatch):
             "CAIRN_HARNESS_VERSION",
         ]
     }
+    # Clear ambient values so tests are hermetic: on an operator box with a
+    # live cairn wiring (REGISTA_DSN etc. in the environment), "missing env"
+    # tests would otherwise resolve real config and fail on a later check.
+    for k in orig:
+        os.environ.pop(k, None)
     yield
     for k, v in orig.items():
         if v is None:

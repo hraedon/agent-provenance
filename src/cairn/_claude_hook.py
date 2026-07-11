@@ -515,6 +515,26 @@ def _resolve_settings_digest() -> str | None:
     return None
 
 
+def _detect_harness_version() -> str | None:
+    """Detect the live Claude Code version at attestation time.
+
+    The install-time ``CAIRN_HARNESS_VERSION`` pin goes stale on every harness
+    auto-update (the 2026-07-11 live proof caught an attestation claiming the
+    pinned 2.1.206 while 2.1.207 was actually running), so the session
+    attestation prefers live detection and only falls back to the pin.
+    """
+    try:
+        result = subprocess.run(
+            ["claude", "--version"], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    m = re.search(r"(\d+\.\d+(?:\.\d+)?)", result.stdout)
+    return m.group(1) if m else None
+
+
 def handle_session_start() -> None:
     raw = sys.stdin.read()
     _capture_raw("session-start", raw)
@@ -523,6 +543,10 @@ def handle_session_start() -> None:
 
     harness_name = os.environ.get("CAIRN_HARNESS_NAME", "claude-code")
     config_digest = _resolve_settings_digest()
+    harness_version = (
+        _detect_harness_version()
+        or os.environ.get("CAIRN_HARNESS_VERSION", _FALLBACK_TOOL_NAME)
+    )
 
     reply = _run_bridge(
         {
@@ -531,7 +555,7 @@ def handle_session_start() -> None:
             "harnesses": [
                 {
                     "name": harness_name,
-                    "version": os.environ.get("CAIRN_HARNESS_VERSION", _FALLBACK_TOOL_NAME),
+                    "version": harness_version,
                 }
             ],
             "scope_statement": "In scope: claude-code.",

@@ -515,6 +515,14 @@ def export(
     try:
         start = datetime.datetime.fromisoformat(since) if since else None
         end = datetime.datetime.fromisoformat(until) if until else None
+        # regista's read_events contract requires start and end together
+        # (INVALID_FILTER otherwise). Complete an open half-window instead of
+        # crashing: --since alone means "since X until now", --until alone
+        # means "everything up to X".
+        if start is not None and end is None:
+            end = datetime.datetime.now(datetime.UTC)
+        elif end is not None and start is None:
+            start = datetime.datetime.fromtimestamp(0, tz=datetime.UTC)
 
         events = sub.read_events(
             start=start,
