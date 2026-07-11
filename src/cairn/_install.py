@@ -521,6 +521,8 @@ def _install_claude(
                     keys=["env.CAIRN_HARNESS_VERSION"],
                 )
             )
+        elif hv == "unknown":
+            desired_env.pop("CAIRN_HARNESS_VERSION", None)
 
     for key, val in desired_env.items():
         current = env.get(key)
