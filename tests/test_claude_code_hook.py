@@ -8,6 +8,7 @@ import os
 import uuid
 from io import StringIO
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,6 +26,7 @@ from cairn._claude_hook import (
     _normalize_response,
     _oldest_state_file,
     _resolve_settings_digest,
+    _safe_session_id,
     _state_dir,
     handle_post,
     handle_pre,
@@ -843,3 +845,126 @@ def test_capture_mode_off_by_default(mock_bridge: MagicMock, tmp_path: Path) -> 
         handle_pre()
 
     assert not capture_dir.exists()
+
+
+# ----------------------------------------------------------------------
+# Plan 009 WI-1.1: recorded-reality fixture tests
+# These tests load REAL Claude Code 2.1.206 hook payloads captured via
+# CAIRN_CAPTURE_DIR, sanitized and committed as fixtures.  They verify
+# that the attested digest equals an independently computed sha256 of
+# the REAL tool output (the field the harness actually sends), not a
+# hand-written assumption.
+# ----------------------------------------------------------------------
+
+_FIXTURES_DIR = Path(__file__).parent / "fixtures" / "hook_payloads"
+
+
+def _load_fixture(name: str) -> dict[str, Any]:
+    return json.loads((_FIXTURES_DIR / name).read_text())
+
+
+def _setup_state_and_post(
+    mock_bridge: MagicMock,
+    state_dir: Path,
+    fixture: dict[str, Any],
+    *,
+    failure: bool = False,
+) -> dict[str, Any]:
+    """Set up a state file from the fixture's PreToolUse fields, feed
+    the PostToolUse payload, and return the bridge call args."""
+    wi_id = str(uuid.uuid4())
+    tool_input = fixture["tool_input"]
+    tool_name = fixture["tool_name"]
+    session_id = fixture["session_id"]
+    key = _call_key(tool_name, tool_input)
+    # Write state file to the dir matching the fixture's session_id.
+    fixture_state_dir = state_dir.parent / _safe_session_id(session_id)
+    fixture_state_dir.mkdir(parents=True, exist_ok=True)
+    state_file = _next_state_file(fixture_state_dir, key)
+    state_file.write_text(
+        json.dumps({"work_item_id": wi_id, "session_id": session_id, "tool": tool_name})
+    )
+    mock_bridge.return_value = {"status": "ok", "event_id": str(uuid.uuid4())}
+
+    with patch("sys.stdin", StringIO(json.dumps(fixture))):
+        handle_post(failure=failure)
+
+    return mock_bridge.call_args[0][0]
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_fixture_post_read_digest_matches_real_file_content(
+    mock_bridge: MagicMock, state_dir: Path
+) -> None:
+    """Recorded PostToolUse (Read): the attested digest equals sha256 of
+    the real file content extracted from tool_response.file.content."""
+    fixture = _load_fixture("post_read.json")
+    call_args = _setup_state_and_post(mock_bridge, state_dir, fixture)
+
+    real_output = fixture["tool_response"]["file"]["content"]
+    rs = call_args["result_summary"]
+    assert rs["stdout_digest"] == hashlib.sha256(real_output.encode("utf-8")).hexdigest()
+    assert rs["stdout_bytes_total"] == len(real_output.encode("utf-8"))
+    assert rs["stdout_truncated"] is False
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_fixture_post_bash_digest_matches_real_stdout(
+    mock_bridge: MagicMock, state_dir: Path
+) -> None:
+    """Recorded PostToolUse (Bash): the attested digest equals sha256 of
+    the real stdout extracted from tool_response.stdout."""
+    fixture = _load_fixture("post_bash.json")
+    call_args = _setup_state_and_post(mock_bridge, state_dir, fixture)
+
+    real_output = fixture["tool_response"]["stdout"]
+    rs = call_args["result_summary"]
+    assert rs["stdout_digest"] == hashlib.sha256(real_output.encode("utf-8")).hexdigest()
+    assert rs["stdout_bytes_total"] == len(real_output.encode("utf-8"))
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_fixture_post_write_digest_matches_real_content(
+    mock_bridge: MagicMock, state_dir: Path
+) -> None:
+    """Recorded PostToolUse (Write): the attested digest equals sha256 of
+    the real written content from tool_response.content."""
+    fixture = _load_fixture("post_write.json")
+    call_args = _setup_state_and_post(mock_bridge, state_dir, fixture)
+
+    real_output = fixture["tool_response"]["content"]
+    rs = call_args["result_summary"]
+    assert rs["stdout_digest"] == hashlib.sha256(real_output.encode("utf-8")).hexdigest()
+    assert rs["stdout_bytes_total"] == len(real_output.encode("utf-8"))
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_fixture_post_failure_carries_real_error_detail(
+    mock_bridge: MagicMock, state_dir: Path
+) -> None:
+    """Recorded PostToolUseFailure (Read): the error field carries the
+    REAL failure detail from the harness, not generic 'tool call failed'.
+    The digest covers the real error text."""
+    fixture = _load_fixture("post_failure_read.json")
+    call_args = _setup_state_and_post(mock_bridge, state_dir, fixture, failure=True)
+
+    real_error = fixture["error"]
+    assert call_args["error"] == real_error
+    rs = call_args["result_summary"]
+    assert rs["stdout_digest"] == hashlib.sha256(real_error.encode("utf-8")).hexdigest()
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_fixture_session_start_attests_real_session_id(
+    mock_bridge: MagicMock,
+) -> None:
+    """Recorded SessionStart: the hook attests with the real session_id
+    from the harness payload."""
+    mock_bridge.return_value = {"status": "ok", "event_id": str(uuid.uuid4())}
+    fixture = _load_fixture("session_start.json")
+
+    with patch("sys.stdin", StringIO(json.dumps(fixture))):
+        handle_session_start()
+
+    call_args = mock_bridge.call_args[0][0]
+    assert call_args["session_id"] == fixture["session_id"]

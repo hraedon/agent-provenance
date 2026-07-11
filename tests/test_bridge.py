@@ -16,14 +16,18 @@ from cairn._bridge import main as bridge_main
 
 
 @pytest.fixture(autouse=True)
-def _clear_env():
-    """Restore environment after each test."""
+def _clear_env(monkeypatch):
+    """Restore environment after each test and isolate from suite.env."""
+    monkeypatch.setattr("cairn._config._load_suite_env", lambda: {})
     orig = {
         k: os.environ.get(k)
         for k in [
             "CAIRN_DSN",
+            "REGISTA_DSN",
             "CAIRN_PROJECT",
             "CAIRN_KEY_PATH",
+            "REGISTA_KEY_PATH",
+            "REGISTA_KEY_REF",
             "CAIRN_DISABLE",
             "PRINCIPAL_ID",
             "CAIRN_HARNESS_NAME",

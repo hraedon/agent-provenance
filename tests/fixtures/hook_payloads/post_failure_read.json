@@ -1,0 +1,17 @@
+{
+  "session_id": "00000000-0000-0000-0000-000000000001",
+  "transcript_path": "/tmp/project/transcript.jsonl",
+  "cwd": "/tmp/project",
+  "prompt_id": "00000000-0000-0000-0000-000000000002",
+  "permission_mode": "default",
+  "effort": { "level": "high" },
+  "hook_event_name": "PostToolUseFailure",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "/tmp/project/missing.txt"
+  },
+  "tool_use_id": "toolu_captured_fail_read",
+  "error": "File does not exist. Note: your current working directory is /tmp/project.",
+  "is_interrupt": false,
+  "duration_ms": 11
+}

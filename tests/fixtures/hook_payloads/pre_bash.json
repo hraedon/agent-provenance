@@ -1,0 +1,15 @@
+{
+  "session_id": "00000000-0000-0000-0000-000000000001",
+  "transcript_path": "/tmp/project/transcript.jsonl",
+  "cwd": "/tmp/project",
+  "prompt_id": "00000000-0000-0000-0000-000000000002",
+  "permission_mode": "default",
+  "effort": { "level": "high" },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo capture-test",
+    "description": "Verify bash works"
+  },
+  "tool_use_id": "toolu_captured_pre_bash"
+}

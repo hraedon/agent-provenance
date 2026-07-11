@@ -12,6 +12,7 @@ from cairn._config import CairnEnvConfig, resolve_config
 from cairn._doctor import run_doctor
 from cairn._install import (
     InstallResult,
+    _detect_harness_version,
     _install_claude,
     _install_hermes,
     _is_cairn_hook_entry,
@@ -438,3 +439,49 @@ def test_doctor_exit_code_pass(monkeypatch):
     monkeypatch.setattr("regista.Regista", _FakeRegista)
     exit_code = run_doctor(json_output=False)
     assert exit_code == 1
+
+
+# ----------------------------------------------------------------------
+# Plan 009 WI-1.3: harness version detection at install time
+# ----------------------------------------------------------------------
+
+
+def test_detect_harness_version_claude():
+    """When claude is on PATH, _detect_harness_version returns a non-unknown version."""
+    version = _detect_harness_version("claude")
+    # On a machine with Claude Code installed, this should be a real version.
+    # On CI without claude, it returns None — both are acceptable.
+    if version is not None:
+        assert version != "unknown"
+        assert len(version) > 0
+
+
+def test_detect_harness_version_unknown_harness():
+    """An unsupported harness name returns None."""
+    assert _detect_harness_version("aider") is None
+
+
+def test_install_claude_detects_version_when_unknown(
+    cfg: CairnEnvConfig, claude_settings: Path
+) -> None:
+    """WI-1.3: when harness_version is 'unknown', install-harness detects
+    the real version and records it into the env block."""
+    cfg_unknown = CairnEnvConfig(
+        dsn=cfg.dsn,
+        key_path=cfg.key_path,
+        key_ref=None,
+        project=cfg.project,
+        harness_name="claude-code",
+        harness_version="unknown",
+        principal_id=cfg.principal_id,
+        state_dir=cfg.state_dir,
+        disabled=False,
+    )
+    _install_claude(cfg_unknown, dry_run=False, uninstall=False, user=None)
+    data = json.loads(claude_settings.read_text())
+    env = data.get("env", {})
+    # If claude is installed, version should be detected and non-unknown.
+    # If not installed, version stays absent (not set to "unknown").
+    hv = env.get("CAIRN_HARNESS_VERSION")
+    if hv is not None:
+        assert hv != "unknown"

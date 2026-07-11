@@ -1,0 +1,25 @@
+{
+  "session_id": "00000000-0000-0000-0000-000000000001",
+  "transcript_path": "/tmp/project/transcript.jsonl",
+  "cwd": "/tmp/project",
+  "prompt_id": "00000000-0000-0000-0000-000000000002",
+  "permission_mode": "default",
+  "effort": { "level": "high" },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "/tmp/project/test.txt"
+  },
+  "tool_response": {
+    "type": "text",
+    "file": {
+      "filePath": "/tmp/project/test.txt",
+      "content": "Hello from test.txt\nThis is line 2\n",
+      "numLines": 3,
+      "startLine": 1,
+      "totalLines": 3
+    }
+  },
+  "tool_use_id": "toolu_captured_pre_read",
+  "duration_ms": 2
+}

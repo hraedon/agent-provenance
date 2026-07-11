@@ -31,9 +31,18 @@ Environment (resolved via cairn._config — REGISTA_* preferred, CAIRN_* fallbac
 Capture correctness (Plan 009):
   - ``tool_response`` is the canonical field Claude Code 2.1.200+ sends
     (``tool_output`` is kept as a legacy fallback).
+  - PostToolUseFailure carries the error detail in the ``error`` field,
+    not in ``tool_response`` (verified from real Claude Code 2.1.206
+    capture).  The hook uses the error text as the digest preimage so
+    the attested digest and error detail reflect the real failure.
   - The output digest is computed over the FULL untruncated output (UTF-8
     bytes) before truncating for transport.  See
     ``docs/digest-preimage-definition.md``.
+  - Recorded-reality ``tool_response`` shapes (from Claude Code 2.1.206):
+    * Read:  ``{"type":"text", "file":{"content":"..."}}``
+    * Bash:  ``{"stdout":"...", "stderr":"..."}``
+    * Write: ``{"type":"create", "content":"..."}``
+    * Edit:  ``{"filePath":"...", "structuredPatch":[...]}``  (free-form JSON)
 
 TODO(Plan 009 WI-3.1): Claude Code now emits additional lifecycle events
 (``PostToolBatch``, ``SubagentStart``/``SubagentStop``, ``MessageDisplay``,
@@ -99,9 +108,17 @@ def _normalize_response(value: Any) -> str:
     """Normalize a ``tool_response`` / ``tool_output`` value to text.
 
     Claude Code's ``tool_response`` field can arrive in several shapes
-    depending on the tool (string, ``{"content": [...]}`` content-block
-    array, or a free-form dict).  This helper extracts a plain text
+    depending on the tool.  This helper extracts a plain text
     representation suitable for digesting.
+
+    Shapes handled (verified from real Claude Code 2.1.206 captures):
+      - ``str`` — used directly
+      - ``{"content": [{"type":"text","text":"..."}]}`` — content-block
+        array (text blocks joined with newline)
+      - ``{"file": {"content": "..."}}`` — Read tool nested file content
+      - ``{"stdout": "..."}`` — Bash-style output
+      - ``{"content": "..."}`` (string) — Write tool top-level content
+      - Other ``dict`` / ``list`` — canonical JSON
 
     The preimage contract (Plan 009 WI-1.2): the digest covers the UTF-8
     encoding of the string returned here.  An auditor reproduces the digest
@@ -125,8 +142,17 @@ def _normalize_response(value: Any) -> str:
                     parts.append(block)
             if parts:
                 return "\n".join(parts)
-        # Bash-style: {"stdout": "...", "stderr": "..."}
-        for key in ("stdout", "output", "result", "text"):
+        # Read tool: {"type": "text", "file": {"content": "...", ...}}
+        # (verified from real Claude Code 2.1.206 capture — Plan 009 WI-1.1)
+        file_obj = value.get("file")
+        if isinstance(file_obj, dict):
+            file_content = file_obj.get("content")
+            if isinstance(file_content, str):
+                return file_content
+        # Standard output fields: Bash stdout, Write content, etc.
+        # "content" is checked here for the Write shape where it's a
+        # top-level string (the list case is handled above).
+        for key in ("stdout", "output", "result", "text", "content"):
             v = value.get(key)
             if isinstance(v, str):
                 return v
@@ -357,6 +383,16 @@ def handle_post(*, failure: bool = False) -> None:
     # WI-1.1: read tool_response (canonical for Claude Code 2.1.200+) with
     # tool_output as a legacy fallback.
     full_output = _extract_tool_response(hook_input)
+
+    # PostToolUseFailure carries the error detail in the "error" field,
+    # not in tool_response (verified from real Claude Code 2.1.206
+    # capture — Plan 009 WI-1.1).  When tool_response is absent, use
+    # the error text as the output for digesting so the attested digest
+    # and error detail reflect the real failure.
+    if failure and not full_output:
+        error_text = hook_input.get("error")
+        if isinstance(error_text, str) and error_text:
+            full_output = error_text
 
     # WI-1.2: digest the FULL untruncated output before truncating for
     # transport.  An auditor reproduces this digest against the complete

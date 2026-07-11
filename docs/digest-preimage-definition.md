@@ -56,14 +56,24 @@ tool. Normalization extracts a plain text string:
 |-------|--------------|
 | `str` | Used directly. |
 | `{"content": [{"type":"text","text":"..."}, ...]}` | Text blocks joined with `"\n"`. |
+| `{"file": {"content": "..."}}` (Read tool) | The nested `file.content` value. |
 | `{"stdout": "..."}` (Bash-style) | The `stdout` value. |
+| `{"content": "..."}` (string, Write tool) | That field's value. |
 | `{"output": "..."}` / `{"result": "..."}` / `{"text": "..."}` | That field's value. |
 | Other `dict` | Canonical JSON (`json.dumps(..., sort_keys=True, ensure_ascii=False)`). |
 | `list` | Canonical JSON. |
 | `None` / absent | Empty string `""`. |
 
+PostToolUseFailure payloads carry the error detail in a top-level `error`
+field (no `tool_response`). The hook uses this as the digest preimage so
+the attested digest and error detail reflect the real failure.
+
 The normalization function is `cairn._claude_hook._normalize_response`. An
 auditor re-implementing reproduction should apply the equivalent logic.
+
+These shapes were verified from real Claude Code 2.1.206 captures
+(Plan 009 WI-1.1). Sanitized payloads are committed in
+`tests/fixtures/hook_payloads/`.
 
 ## Legacy fallback
 
