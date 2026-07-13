@@ -40,26 +40,9 @@ from cairn._claude_hook import (
 
 
 @pytest.fixture(autouse=True)
-def _clear_env(tmp_path: Path):
-    orig = {
-        k: os.environ.get(k)
-        for k in [
-            "CAIRN_DSN",
-            "CAIRN_PROJECT",
-            "CAIRN_KEY_PATH",
-            "CAIRN_DISABLE",
-            "CAIRN_STATE_DIR",
-            "CAIRN_BRIDGE_PATH",
-            "CAIRN_CAPTURE_DIR",
-        ]
-    }
-    os.environ["CAIRN_STATE_DIR"] = str(tmp_path / "cairn-state")
-    yield
-    for k, v in orig.items():
-        if v is None:
-            os.environ.pop(k, None)
-        else:
-            os.environ[k] = v
+def _set_state_dir(tmp_path: Path, monkeypatch):
+    """Point CAIRN_STATE_DIR at a writable temp dir for every test."""
+    monkeypatch.setenv("CAIRN_STATE_DIR", str(tmp_path / "cairn-state"))
 
 
 @pytest.fixture

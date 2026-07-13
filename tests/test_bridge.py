@@ -15,38 +15,6 @@ import pytest
 from cairn._bridge import main as bridge_main
 
 
-@pytest.fixture(autouse=True)
-def _clear_env(monkeypatch):
-    """Restore environment after each test and isolate from suite.env."""
-    monkeypatch.setattr("cairn._config._load_suite_env", lambda: {})
-    orig = {
-        k: os.environ.get(k)
-        for k in [
-            "CAIRN_DSN",
-            "REGISTA_DSN",
-            "CAIRN_PROJECT",
-            "CAIRN_KEY_PATH",
-            "REGISTA_KEY_PATH",
-            "REGISTA_KEY_REF",
-            "CAIRN_DISABLE",
-            "PRINCIPAL_ID",
-            "CAIRN_HARNESS_NAME",
-            "CAIRN_HARNESS_VERSION",
-        ]
-    }
-    # Clear ambient values so tests are hermetic: on an operator box with a
-    # live cairn wiring (REGISTA_DSN etc. in the environment), "missing env"
-    # tests would otherwise resolve real config and fail on a later check.
-    for k in orig:
-        os.environ.pop(k, None)
-    yield
-    for k, v in orig.items():
-        if v is None:
-            os.environ.pop(k, None)
-        else:
-            os.environ[k] = v
-
-
 @pytest.fixture
 def _valid_env(tmp_path: Path) -> Path:
     """Set minimal valid env vars for the bridge."""

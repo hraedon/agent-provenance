@@ -39,13 +39,16 @@ from pathlib import Path
 
 try:
     import psycopg
-    from psycopg.sql import SQL, Identifier
 except ImportError:
     print("ERROR: psycopg3 not installed", file=sys.stderr)
     sys.exit(2)
 
-from cairn.proof import ProofEvent, ProofFailure, run_proof
-from cairn.verifier_types import VerificationReport
+from cairn.proof import ProofFailure, run_proof
+from cairn.proof_runner import (
+    get_baseline_seq,
+    query_events,
+    run_canonical_verifier,
+)
 
 
 def _get_config() -> dict[str, str]:
@@ -89,158 +92,6 @@ def _detect_claude_version() -> str:
     return "unknown"
 
 
-def _get_baseline_seq(conn: psycopg.Connection, project: str) -> int:
-    cur = conn.cursor()
-    cur.execute(
-        SQL("SELECT COALESCE(MAX(global_seq), 0) FROM {}.events").format(
-            Identifier(project)
-        )
-    )
-    row = cur.fetchone()
-    return int(row[0]) if row and row[0] is not None else 0
-
-
-def _query_events(
-    conn: psycopg.Connection,
-    project: str,
-    baseline_seq: int,
-) -> list[ProofEvent]:
-    """Query all events after baseline and build ProofEvent rows."""
-    cur = conn.cursor()
-    cur.execute(
-        SQL(
-            "SELECT transition, global_seq, entity_id::text, entity_kind, "
-            "payload::text, on_behalf_of::text "
-            "FROM {}.events WHERE global_seq > %s ORDER BY global_seq"
-        ).format(Identifier(project)),
-        (baseline_seq,),
-    )
-    rows = cur.fetchall()
-    events: list[ProofEvent] = []
-    for row in rows:
-        transition = row[0]
-        global_seq = row[1]
-        entity_id = row[2]
-        entity_kind = row[3] if row[3] else "work_item"
-        payload = json.loads(row[4]) if row[4] else None
-        on_behalf_of = json.loads(row[5]) if row[5] else None
-        events.append(
-            ProofEvent(
-                transition=transition,
-                global_seq=global_seq,
-                entity_id=entity_id,
-                entity_kind=entity_kind,
-                payload=payload,
-                on_behalf_of=on_behalf_of,
-            )
-        )
-    return events
-
-
-def _run_canonical_verifier(
-    dsn: str,
-    project: str,
-    key_path: str,
-    tmpdir: Path,
-    since: str,
-) -> tuple[VerificationReport | None, str]:
-    """Export events to a bundle and verify with the canonical cairn verifier.
-
-    Returns ``(report, detail)``.  *report* is the parsed
-    :class:`VerificationReport` on success, or ``None`` on failure (export
-    crash, verify crash, missing report file).  *detail* is a human-readable
-    status string.
-
-    The export is scoped to events at or after *since* (the timestamp
-    recorded just before launching the session) so the verifier checks only
-    the proof window, not the entire project history (B2).
-
-    Uses the public CLI (``cairn export`` + ``cairn verify``) rather than
-    SQL chain checks, per the F-2 review's secondary observation that proofs
-    should call public or auditor-facing verification APIs.
-
-    The JSON report is parsed once and the resulting
-    :class:`VerificationReport` is the single source of truth for both the
-    ``all_ok`` check and the chain-integrity check (B3).
-    """
-    bundle_path = tmpdir / "proof-bundle.json"
-    report_path = tmpdir / "verify-report.json"
-
-    export_result = subprocess.run(
-        [
-            sys.executable, "-m", "cairn._cli", "export",
-            "--dsn", dsn,
-            "--project", project,
-            "--keys", key_path,
-            "--output", str(bundle_path),
-            "--since", since,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if export_result.returncode != 0:
-        return None, f"cairn export failed: {export_result.stderr.strip()}"
-
-    verify_result = subprocess.run(
-        [
-            sys.executable, "-m", "cairn._cli", "verify",
-            "--bundle-path", str(bundle_path),
-            "--keys", key_path,
-            "--format", "json",
-            "--output", str(report_path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if verify_result.returncode not in (0, 1):
-        return None, f"cairn verify crashed: {verify_result.stderr.strip()}"
-
-    if not report_path.is_file():
-        return None, "cairn verify produced no report file"
-
-    report = _parse_verifier_report(report_path)
-    if report is None:
-        return None, "cairn verify produced an unparseable report"
-
-    if report.all_ok:
-        return report, "canonical verifier: all checks passed"
-    return report, "canonical verifier: report not all_ok"
-
-
-def _parse_verifier_report(report_path: Path) -> VerificationReport | None:
-    """Parse the JSON verifier report into a VerificationReport for chain checks.
-
-    The canonical verifier's JSON output nests summary fields under a
-    ``summary`` key (see :func:`cairn.verifier_report.format_report_json`).
-    List fields like ``chain_contiguity_violations`` are at the top level.
-    """
-    if not report_path.is_file():
-        return None
-    data = json.loads(report_path.read_text())
-    summary = data.get("summary", {})
-    report = VerificationReport()
-    report.signature_failed = summary.get("signature_failed", 0)
-    report.hash_mismatch = summary.get("hash_mismatch", 0)
-    report.revoked_key = summary.get("revoked_key", 0)
-    report.bundle_hash_ok = summary.get("bundle_hash_ok")
-    report.chain_integrity_ok = summary.get("chain_integrity_ok")
-    chain_violations = data.get("chain_contiguity_violations", [])
-    from cairn.verifier_types import ChainContiguityViolation
-
-    for v in chain_violations:
-        report.chain_contiguity_violations.append(
-            ChainContiguityViolation(
-                kind=v.get("kind", "unknown"),
-                detail=v.get("detail", ""),
-                event_id=v.get("event_id"),
-                work_item_id=v.get("work_item_id"),
-            )
-        )
-    return report
-
-
 def main() -> int:
     config = _get_config()
     dsn = config["REGISTA_DSN"]
@@ -273,7 +124,7 @@ def main() -> int:
         test_file.write_text(test_file_content)
 
         conn = psycopg.connect(dsn)
-        baseline_seq = _get_baseline_seq(conn, project)
+        baseline_seq = get_baseline_seq(conn, project)
         print(f"Baseline global_seq: {baseline_seq}")
         conn.close()
 
@@ -306,7 +157,7 @@ def main() -> int:
         print()
         print("[2/4] Verifying session-bound events in regista store...")
         conn = psycopg.connect(dsn)
-        events = _query_events(conn, project, baseline_seq)
+        events = query_events(conn, project, baseline_seq)
         conn.close()
 
         print(f"  Events after baseline: {len(events)}")
@@ -319,7 +170,7 @@ def main() -> int:
 
         print()
         print("[3/4] Running canonical verifier (cairn export + verify)...")
-        verifier_report, verifier_detail = _run_canonical_verifier(
+        verifier_report, verifier_detail = run_canonical_verifier(
             dsn, project, key_path, tmpdir, since_timestamp
         )
         print(f"  {verifier_detail}")

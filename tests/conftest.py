@@ -9,6 +9,50 @@ from pathlib import Path
 import pytest
 from _dbutil import postgres_reachable, resolve_test_dsn
 
+# Env vars that influence cairn behavior at runtime.  Tests must never
+# inherit the operator's real config (suite.env + live env) — on a
+# dogfooding box that causes false failures and, worse, could write to
+# the live regista store if a mock boundary slips (WI-026).
+_CONFIG_ENV_VARS = [
+    # Config resolution (resolve_config)
+    "REGISTA_DSN", "CAIRN_DSN",
+    "REGISTA_KEY_PATH", "CAIRN_KEY_PATH",
+    "REGISTA_KEY_REF", "CAIRN_KEY_REF",
+    "CAIRN_PROJECT",
+    "CAIRN_HARNESS_NAME", "CAIRN_HARNESS_VERSION",
+    "PRINCIPAL_ID",
+    "CAIRN_STATE_DIR",
+    "CAIRN_DISABLE",
+    "CAIRN_CONTENT_KEY_REF", "CAIRN_CONTENT_KEY_PATH",
+    "CAIRN_CONTENT_ENCRYPTION",
+    "AGENT_SUITE_CONFIG",
+    # Doctor / install / hook runtime
+    "CAIRN_BRIDGE_PATH",
+    "CAIRN_CAPTURE_DIR",
+    "CAIRN_CLAUDE_SETTINGS",
+    "CAIRN_OPENCODE_CONFIG",
+    "CAIRN_HERMES_HOME",
+    "CAIRN_CLAUDE_PROJECTS",
+    "CAIRN_MAX_ATTESTATION_AGE_HOURS",
+    "CLAUDE_PROJECT_DIR",
+]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_config_env(monkeypatch):
+    """Isolate every test from the operator's real config.
+
+    Clears all CAIRN_*/REGISTA_*/PRINCIPAL_ID/AGENT_SUITE_CONFIG env vars,
+    patches ``_load_suite_env`` to return ``{}``, and resets the
+    import-time ``_SUITE_ENV_PATHS`` cache so no test reads the
+    operator's ``suite.env`` file or settings paths.  ``REGISTA_TEST_DSN``
+    is preserved so DB-dependent tests can still find the test database.
+    """
+    for var in _CONFIG_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr("cairn._config._load_suite_env", lambda: {})
+    monkeypatch.setattr("cairn._config._SUITE_ENV_PATHS", [])
+
 
 @pytest.fixture
 def hmac_keys(tmp_path: Path) -> Path:

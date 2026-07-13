@@ -3,15 +3,14 @@
 Closes the gap between constructed ProofEvent tests and the live
 e2e_proof.py script by exercising the three untested functions:
 
-- ``_query_events``: SQL -> ProofEvent round-trip against a real regista store
-- ``_run_canonical_verifier``: subprocess export+verify path
-- ``_parse_verifier_report``: JSON -> VerificationReport parse
+- ``query_events``: SQL -> ProofEvent round-trip against a real regista store
+- ``run_canonical_verifier``: subprocess export+verify path
+- ``parse_verifier_report``: JSON -> VerificationReport parse
 """
 
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -22,17 +21,12 @@ import psycopg
 import pytest
 
 from cairn.proof import find_session_attestation, find_tool_call_ends
-
-_SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "e2e_proof.py"
-_spec = importlib.util.spec_from_file_location("e2e_proof", _SCRIPT_PATH)
-assert _spec is not None and _spec.loader is not None
-_e2e_module = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_e2e_module)
-
-_get_baseline_seq = _e2e_module._get_baseline_seq
-_parse_verifier_report = _e2e_module._parse_verifier_report
-_query_events = _e2e_module._query_events
-_run_canonical_verifier = _e2e_module._run_canonical_verifier
+from cairn.proof_runner import (
+    get_baseline_seq,
+    parse_verifier_report,
+    query_events,
+    run_canonical_verifier,
+)
 
 _UNSET: Any = object()
 
@@ -149,7 +143,7 @@ def test_query_events_round_trips_into_proof_event(
     file_path = "/tmp/proof/test.txt"
 
     conn = psycopg.connect(dsn)
-    baseline_seq = _get_baseline_seq(conn, project)
+    baseline_seq = get_baseline_seq(conn, project)
     conn.close()
 
     _insert_session_attestation(regista_instance, session_id)
@@ -162,7 +156,7 @@ def test_query_events_round_trips_into_proof_event(
     )
 
     conn = psycopg.connect(dsn)
-    events = _query_events(conn, project, baseline_seq)
+    events = query_events(conn, project, baseline_seq)
     conn.close()
 
     assert len(events) >= 2
@@ -214,7 +208,7 @@ def test_query_events_respects_baseline(
     _insert_tool_call_end(regista_instance, session_id, tool="Bash")
 
     conn = psycopg.connect(dsn)
-    all_events = _query_events(conn, project, 0)
+    all_events = query_events(conn, project, 0)
     conn.close()
 
     assert len(all_events) >= 3
@@ -224,7 +218,7 @@ def test_query_events_respects_baseline(
     mid_seq = all_seqs[len(all_seqs) // 2]
 
     conn = psycopg.connect(dsn)
-    filtered = _query_events(conn, project, mid_seq)
+    filtered = query_events(conn, project, mid_seq)
     conn.close()
 
     for ev in filtered:
@@ -241,7 +235,7 @@ def test_query_events_handles_null_on_behalf_of(
     session_id = str(uuid.uuid4())
 
     conn = psycopg.connect(dsn)
-    baseline_seq = _get_baseline_seq(conn, project)
+    baseline_seq = get_baseline_seq(conn, project)
     conn.close()
 
     _insert_tool_call_end(
@@ -270,7 +264,7 @@ def test_query_events_handles_null_on_behalf_of(
     )
 
     conn = psycopg.connect(dsn)
-    events = _query_events(conn, project, baseline_seq)
+    events = query_events(conn, project, baseline_seq)
     conn.close()
 
     assert len(events) >= 1
@@ -314,7 +308,7 @@ def test_run_canonical_verifier_with_clean_bundle(
 
     hmac_keys.chmod(0o600)
 
-    report, detail = _run_canonical_verifier(
+    report, detail = run_canonical_verifier(
         dsn, project, str(hmac_keys), tmp_path, since,
     )
 
@@ -357,7 +351,7 @@ def test_parse_verifier_report_parses_json(tmp_path: Path) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(json.dumps(report_data))
 
-    report = _parse_verifier_report(report_path)
+    report = parse_verifier_report(report_path)
 
     assert report is not None
     assert report.signature_failed == 0
@@ -375,5 +369,5 @@ def test_parse_verifier_report_parses_json(tmp_path: Path) -> None:
 
 
 def test_parse_verifier_report_returns_none_for_missing_file() -> None:
-    result = _parse_verifier_report(Path("/nonexistent/path.json"))
+    result = parse_verifier_report(Path("/nonexistent/path.json"))
     assert result is None
