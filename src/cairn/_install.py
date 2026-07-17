@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,18 @@ def _python_command() -> str:
     return "python3"
 
 CAIRN_HOOK_COMMAND = f"{_python_command()} -m cairn._claude_hook"
+CAIRN_CODEX_HOOK_COMMAND = f"{_python_command()} -m cairn._codex_hook"
+
+# Codex hook events cairn attests (Plan 011). Only these are registered — no
+# false "wired" signal for events the adapter does not handle. Tool events carry
+# a "*" matcher; SessionStart/Stop are not tool-matched.
+CODEX_HOOK_EVENTS: dict[str, str] = {
+    "SessionStart": "session-start",
+    "PreToolUse": "pre",
+    "PostToolUse": "post",
+    "Stop": "stop",
+}
+_CODEX_TOOL_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
 
 # Note: CAIRN_HOOK_COMMAND is evaluated at import time on the machine
 # running install-harness. If settings.json is synced across platforms,
@@ -116,6 +129,15 @@ class InstallAction:
     keys: list[str] | None = None
 
 
+class InstallStatus(StrEnum):
+    """Contract status for one harness installation result."""
+
+    INSTALLED = "installed"
+    DEGRADED = "degraded"
+    UNSUPPORTED = "unsupported"
+    FAILED = "failed"
+
+
 @dataclass
 class InstallResult:
     tool: str = "cairn"
@@ -123,6 +145,7 @@ class InstallResult:
     user: str | None = None
     actions: list[InstallAction] = field(default_factory=list)
     no_op: bool = False
+    status: InstallStatus = InstallStatus.INSTALLED
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -139,6 +162,7 @@ class InstallResult:
                 for a in self.actions
             ],
             "no_op": self.no_op,
+            "status": self.status.value,
         }
 
 
@@ -469,7 +493,7 @@ def _save_json(path: Path, data: dict[str, Any]) -> None:
 def _is_cairn_hook_entry(entry: dict[str, Any]) -> bool:
     for h in entry.get("hooks", []):
         cmd = h.get("command", "")
-        if "cairn._claude_hook" in cmd or "cairn_hook" in cmd:
+        if "cairn._claude_hook" in cmd or "cairn._codex_hook" in cmd or "cairn_hook" in cmd:
             return True
     return False
 
@@ -645,6 +669,125 @@ def _uninstall_claude(
 
 
 # ----------------------------------------------------------------------
+# Codex (Plan 011)
+# ----------------------------------------------------------------------
+
+
+def _codex_hooks_path() -> Path:
+    """Where cairn writes Codex hook registrations: ``$CODEX_HOME/hooks.json``
+    (``~/.codex/hooks.json`` when ``CODEX_HOME`` is unset).  ``$CAIRN_CODEX_HOOKS``
+    overrides it for tests/isolation."""
+    override = os.environ.get("CAIRN_CODEX_HOOKS")
+    if override:
+        return Path(override)
+    home = os.environ.get("CODEX_HOME")
+    base = Path(home) if home else Path.home() / ".codex"
+    return base / "hooks.json"
+
+
+def _install_codex(
+    cfg: Any,
+    *,
+    dry_run: bool,
+    uninstall: bool,
+    user: str | None,
+) -> InstallResult:
+    """Merge cairn's hook group into Codex's ``hooks.json``.
+
+    Hooks-only: unlike Claude, **no env vars or secrets are written into Codex
+    config** (Plan 007 Decision 3 / Plan 011 Decision 6). The hook processes read
+    REGISTA_DSN / PRINCIPAL_ID / harness identity from the ambient environment,
+    and the adapter detects the live Codex version at attestation time. Existing
+    user hooks and unrelated config are preserved (surgical merge).
+    """
+    path = _codex_hooks_path()
+    result = InstallResult(harness="codex", user=user)
+    data = _load_json(path)
+
+    if uninstall:
+        return _uninstall_codex(path, data, dry_run=dry_run, result=result)
+
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        hooks = {}
+        data["hooks"] = hooks
+    changed = False
+
+    for event, action in CODEX_HOOK_EVENTS.items():
+        event_hooks = hooks.setdefault(event, [])
+        if not isinstance(event_hooks, list):
+            event_hooks = []
+            hooks[event] = event_hooks
+        if any(_is_cairn_hook_entry(e) for e in event_hooks if isinstance(e, dict)):
+            continue
+        inner = {
+            "type": "command",
+            "command": f"{CAIRN_CODEX_HOOK_COMMAND} {action}",
+            "timeout": 10,
+        }
+        new_entry: dict[str, Any] = {"hooks": [inner]}
+        if event in _CODEX_TOOL_EVENTS:
+            new_entry = {"matcher": "*", "hooks": [inner]}
+        event_hooks.append(new_entry)
+        changed = True
+        result.actions.append(
+            InstallAction(
+                "merge_json",
+                str(path),
+                f"register cairn {event} hook",
+                keys=[f"hooks.{event}"],
+            )
+        )
+
+    if not result.actions:
+        result.no_op = True
+    elif not dry_run and changed:
+        _save_json(path, data)
+
+    return result
+
+
+def _uninstall_codex(
+    path: Path,
+    data: dict[str, Any],
+    *,
+    dry_run: bool,
+    result: InstallResult,
+) -> InstallResult:
+    hooks = data.get("hooks", {})
+    changed = False
+    if isinstance(hooks, dict):
+        for event in CODEX_HOOK_EVENTS:
+            event_hooks = hooks.get(event, [])
+            if not isinstance(event_hooks, list):
+                continue
+            kept = [e for e in event_hooks if not (isinstance(e, dict) and _is_cairn_hook_entry(e))]
+            if len(kept) < len(event_hooks):
+                changed = True
+                result.actions.append(
+                    InstallAction(
+                        "merge_json",
+                        str(path),
+                        f"remove cairn {event} hook",
+                        keys=[f"hooks.{event}"],
+                    )
+                )
+                if kept:
+                    hooks[event] = kept
+                else:
+                    hooks.pop(event, None)
+
+    if not result.actions:
+        result.no_op = True
+    elif not dry_run and changed:
+        if not data.get("hooks"):
+            data.pop("hooks", None)
+        _save_json(path, data)
+
+    return result
+
+
+# ----------------------------------------------------------------------
 # OpenCode
 # ----------------------------------------------------------------------
 
@@ -802,7 +945,9 @@ def run_install_harness(
 ) -> list[InstallResult]:
     cfg = resolve_config()
     if harness == "all":
-        targets = ["claude", "opencode", "hermes"]
+        # ``all`` is the stable suite set.  Component-private targets such as
+        # Hermes remain explicitly selectable but never enter this expansion.
+        targets = ["claude", "opencode"]
     else:
         targets = [harness]
     results: list[InstallResult] = []
@@ -813,17 +958,18 @@ def run_install_harness(
             results.append(_install_opencode(cfg, dry_run=dry_run, uninstall=uninstall, user=user))
         elif t == "hermes":
             results.append(_install_hermes(cfg, dry_run=dry_run, uninstall=uninstall, user=user))
-        elif t in ("agy", "codex"):
+        elif t == "codex":
+            results.append(_install_codex(cfg, dry_run=dry_run, uninstall=uninstall, user=user))
+        elif t == "agy":
             results.append(InstallResult(
                 harness=t,
                 user=user,
-                no_op=True,
+                status=InstallStatus.UNSUPPORTED,
                 actions=[
                     InstallAction(
-                        "skip",
+                        "unsupported",
                         "",
-                        f"{t} adapter not yet implemented "
-                        f"(Plan 010 WI-5.{'3' if t == 'agy' else '4'} deferred)",
+                        f"{t} adapter is not implemented; no harness wiring was changed",
                     )
                 ],
             ))
@@ -839,7 +985,13 @@ def format_results_human(
     lines: list[str] = []
     prefix = "[dry-run] " if dry_run else ""
     for r in results:
-        if r.no_op:
+        if r.status is InstallStatus.UNSUPPORTED:
+            status = "unsupported (not wired)"
+        elif r.status is InstallStatus.DEGRADED:
+            status = "degraded"
+        elif r.status is InstallStatus.FAILED:
+            status = "failed"
+        elif r.no_op:
             status = "already wired (no-op)" if not uninstall else "nothing to remove (no-op)"
         elif uninstall:
             status = "uninstalled"
@@ -852,3 +1004,11 @@ def format_results_human(
             tag = a.kind.upper()
             lines.append(f"  {tag:12s} {a.detail}")
     return "\n".join(lines)
+
+
+def results_succeeded(results: list[InstallResult]) -> bool:
+    """Return whether every result represents a successful installation state."""
+
+    # Cairn has no suite-tier context here. Degraded therefore fails closed;
+    # only a caller with an explicit tier policy may choose to permit it.
+    return all(result.status is InstallStatus.INSTALLED for result in results)
