@@ -1,7 +1,36 @@
 # Plan 011 — Codex lifecycle provenance
 
-**Status:** Proposed 2026-07-10.
+**Status:** Core adapter + installer landed 2026-07-17. `cairn._codex_hook`
+attests SessionStart, PreToolUse, PostToolUse, and Stop; `install-harness codex`
+merges the hook group into `$CODEX_HOME/hooks.json`. Verified end-to-end (real
+CLI + real bridge subprocess: begin→end pairs by `(turn_id, tool_use_id)` and is
+consumed, Stop emits `{}`, no degradation). **Deferred:** SubagentStart/Stop
+delegation lifecycle (WI-2.3 — subagent *tool* activity IS attributed via
+`agent_id`/`agent_type`), concurrency-stress hardening (WI-2.4), Codex-aware
+doctor (WI-3.2), and the live adversarial proof (WI-4.1, billable).
+**Original status:** Proposed 2026-07-10.
 **Author:** GPT-5.6 Sol, from the suite Codex integration audit.
+
+## Implementation notes (2026-07-17)
+
+- **Reuses the Claude adapter's machinery** (`_run_bridge`, `_state_dir`,
+  `_compute_output_digest`, `_extract_files`, `_mark_degraded`, `_capture_raw`)
+  — only the Codex-specific field names, the explicit `tool_use_id` correlation
+  (Decision 3), and the Stop JSON-output contract (Decision 5) are new.
+- **Hooks-only install — NO secrets/env in Codex config** (Decision 6 / Plan 007
+  Decision 3). The hook processes read `REGISTA_DSN`/`PRINCIPAL_ID`/harness
+  identity from the ambient environment; the adapter detects the live Codex
+  version at attestation time. This differs from the Claude installer, which
+  writes an `env` block into `settings.json`.
+- **Only the four handled events are registered** — no false "wired" signal for
+  events the adapter does not attest. Existing user hooks and unrelated config
+  are preserved (surgical merge; uninstall removes only cairn entries).
+- **Codex stays out of the stable `all`** expansion (still `claude`, `opencode`),
+  consistent with the hardened suite Plan 007 (atomic cross-component promotion).
+- Authoritative Codex hook schema confirmed against
+  https://learn.chatgpt.com/docs/hooks (fields: `session_id`, `turn_id`,
+  `tool_name`/`tool_use_id`/`tool_input`/`tool_response`, `agent_id`/`agent_type`,
+  `hook_event_name`; Stop requires JSON on stdout; `$CODEX_HOME/hooks.json`).
 **Strategic role:** Add honest tool-call, session, and subagent provenance for
 local Codex using the now-documented lifecycle hook protocol.
 

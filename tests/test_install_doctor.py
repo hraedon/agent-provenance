@@ -49,6 +49,9 @@ def claude_settings(tmp_path: Path) -> Path:
 def _isolate_settings(monkeypatch, tmp_path):
     monkeypatch.setenv("CAIRN_CLAUDE_SETTINGS", str(tmp_path / "claude.json"))
     monkeypatch.setenv("CAIRN_OPENCODE_CONFIG", str(tmp_path / "opencode.json"))
+    # Isolate Codex hooks.json so tests never touch the host's real ~/.codex.
+    monkeypatch.setenv("CAIRN_CODEX_HOOKS", str(tmp_path / "codex" / "hooks.json"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
 
 # ----------------------------------------------------------------------
@@ -327,15 +330,81 @@ def test_run_install_harness_all_excludes_private_hermes_target(cfg, monkeypatch
     assert [result.harness for result in results] == ["claude", "opencode"]
 
 
-def test_run_install_harness_codex_is_honestly_unsupported(cfg, monkeypatch):
-    monkeypatch.setattr("cairn._install.resolve_config", lambda: cfg)
+def _codex_hooks_file(tmp_path: Path) -> Path:
+    return tmp_path / "codex" / "hooks.json"
 
-    [result] = run_install_harness("codex")
 
-    assert result.status is InstallStatus.UNSUPPORTED
+def test_install_codex_wires_hooks_only_no_env(cfg, tmp_path, monkeypatch):
+    from cairn._install import _install_codex
+
+    result = _install_codex(cfg, dry_run=False, uninstall=False, user=None)
+
+    assert result.status is InstallStatus.INSTALLED
     assert result.no_op is False
-    assert result.actions[0].kind == "unsupported"
-    assert result.to_dict()["status"] == "unsupported"
+    data = json.loads(_codex_hooks_file(tmp_path).read_text())
+    # All four attested events registered, pointing at the Codex hook module.
+    assert set(data["hooks"]) == {"SessionStart", "PreToolUse", "PostToolUse", "Stop"}
+    cmd = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "cairn._codex_hook pre" in cmd
+    # Tool events carry a matcher; SessionStart/Stop do not.
+    assert data["hooks"]["PreToolUse"][0]["matcher"] == "*"
+    assert "matcher" not in data["hooks"]["Stop"][0]
+    # Decision 6: NO secrets/env are written into Codex config.
+    assert "env" not in data
+
+
+def test_install_codex_idempotent(cfg, tmp_path):
+    from cairn._install import _install_codex
+
+    _install_codex(cfg, dry_run=False, uninstall=False, user=None)
+    result = _install_codex(cfg, dry_run=False, uninstall=False, user=None)
+    assert result.no_op is True
+
+
+def test_install_codex_dry_run_writes_nothing(cfg, tmp_path):
+    from cairn._install import _install_codex
+
+    result = _install_codex(cfg, dry_run=True, uninstall=False, user=None)
+    assert result.no_op is False
+    assert not _codex_hooks_file(tmp_path).exists()
+
+
+def test_install_codex_preserves_user_hooks(cfg, tmp_path):
+    from cairn._install import _install_codex
+
+    hooks_file = _codex_hooks_file(tmp_path)
+    hooks_file.parent.mkdir(parents=True)
+    hooks_file.write_text(json.dumps({
+        "hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "./scripts/mine.sh"}
+        ]}]}
+    }))
+
+    _install_codex(cfg, dry_run=False, uninstall=False, user=None)
+    data = json.loads(hooks_file.read_text())
+    cmds = [h["command"] for e in data["hooks"]["PostToolUse"] for h in e["hooks"]]
+    assert "./scripts/mine.sh" in cmds  # user hook preserved
+    assert any("cairn._codex_hook post" in c for c in cmds)  # cairn added alongside
+
+
+def test_uninstall_codex_removes_only_cairn(cfg, tmp_path):
+    from cairn._install import _install_codex
+
+    hooks_file = _codex_hooks_file(tmp_path)
+    hooks_file.parent.mkdir(parents=True)
+    hooks_file.write_text(json.dumps({
+        "hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "./scripts/mine.sh"}
+        ]}]}
+    }))
+    _install_codex(cfg, dry_run=False, uninstall=False, user=None)
+    result = _install_codex(cfg, dry_run=False, uninstall=True, user=None)
+
+    assert result.no_op is False
+    data = json.loads(hooks_file.read_text())
+    cmds = [h["command"] for e in data["hooks"].get("PostToolUse", []) for h in e["hooks"]]
+    assert cmds == ["./scripts/mine.sh"]  # user hook survives, cairn removed
+    assert "SessionStart" not in data["hooks"]  # cairn-only event pruned
 
 
 # ----------------------------------------------------------------------
@@ -373,18 +442,18 @@ def test_degraded_result_fails_closed_without_tier_policy():
     assert results_succeeded([result]) is False
 
 
-def test_install_harness_codex_cli_exits_nonzero(monkeypatch):
+def test_install_harness_codex_cli_exits_zero_and_wires(cfg, monkeypatch):
     from click.testing import CliRunner
 
     from cairn._cli import main
 
-    monkeypatch.setattr("cairn._install.resolve_config", lambda: object())
+    monkeypatch.setattr("cairn._install.resolve_config", lambda: cfg)
     result = CliRunner().invoke(main, ["install-harness", "codex", "--json"])
 
-    assert result.exit_code == 1
+    assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload[0]["status"] == "unsupported"
-    assert payload[0]["no_op"] is False
+    assert payload[0]["harness"] == "codex"
+    assert payload[0]["status"] == "installed"
 
 
 # ----------------------------------------------------------------------
