@@ -12,6 +12,7 @@ from cairn._config import CairnEnvConfig, resolve_config
 from cairn._doctor import run_doctor
 from cairn._install import (
     InstallResult,
+    InstallStatus,
     _detect_harness_version,
     _install_claude,
     _install_hermes,
@@ -313,10 +314,28 @@ def test_uninstall_hermes_noop_on_clean(cfg, hermes_home):
 def test_run_install_harness_all(cfg, monkeypatch):
     monkeypatch.setattr("cairn._install.resolve_config", lambda: cfg)
     results = run_install_harness("all", dry_run=True, uninstall=False, user=None)
-    assert len(results) == 3
+    assert len(results) == 2
     assert results[0].harness == "claude"
     assert results[1].harness == "opencode"
-    assert results[2].harness == "hermes"
+
+
+def test_run_install_harness_all_excludes_private_hermes_target(cfg, monkeypatch):
+    monkeypatch.setattr("cairn._install.resolve_config", lambda: cfg)
+
+    results = run_install_harness("all", dry_run=True)
+
+    assert [result.harness for result in results] == ["claude", "opencode"]
+
+
+def test_run_install_harness_codex_is_honestly_unsupported(cfg, monkeypatch):
+    monkeypatch.setattr("cairn._install.resolve_config", lambda: cfg)
+
+    [result] = run_install_harness("codex")
+
+    assert result.status is InstallStatus.UNSUPPORTED
+    assert result.no_op is False
+    assert result.actions[0].kind == "unsupported"
+    assert result.to_dict()["status"] == "unsupported"
 
 
 # ----------------------------------------------------------------------
@@ -335,6 +354,37 @@ def test_format_results_uninstall():
     r = InstallResult(harness="claude", no_op=False, actions=[])
     out = format_results_human([r], dry_run=False, uninstall=True)
     assert "uninstalled" in out
+
+
+def test_format_results_unsupported_is_not_noop_success():
+    result = InstallResult(harness="codex", status=InstallStatus.UNSUPPORTED)
+
+    out = format_results_human([result], dry_run=False)
+
+    assert "unsupported (not wired)" in out
+    assert "no-op" not in out
+
+
+def test_degraded_result_fails_closed_without_tier_policy():
+    from cairn._install import results_succeeded
+
+    result = InstallResult(harness="codex", status=InstallStatus.DEGRADED)
+
+    assert results_succeeded([result]) is False
+
+
+def test_install_harness_codex_cli_exits_nonzero(monkeypatch):
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    monkeypatch.setattr("cairn._install.resolve_config", lambda: object())
+    result = CliRunner().invoke(main, ["install-harness", "codex", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload[0]["status"] == "unsupported"
+    assert payload[0]["no_op"] is False
 
 
 # ----------------------------------------------------------------------

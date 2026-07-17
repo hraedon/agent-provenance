@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +117,15 @@ class InstallAction:
     keys: list[str] | None = None
 
 
+class InstallStatus(StrEnum):
+    """Contract status for one harness installation result."""
+
+    INSTALLED = "installed"
+    DEGRADED = "degraded"
+    UNSUPPORTED = "unsupported"
+    FAILED = "failed"
+
+
 @dataclass
 class InstallResult:
     tool: str = "cairn"
@@ -123,6 +133,7 @@ class InstallResult:
     user: str | None = None
     actions: list[InstallAction] = field(default_factory=list)
     no_op: bool = False
+    status: InstallStatus = InstallStatus.INSTALLED
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -139,6 +150,7 @@ class InstallResult:
                 for a in self.actions
             ],
             "no_op": self.no_op,
+            "status": self.status.value,
         }
 
 
@@ -802,7 +814,9 @@ def run_install_harness(
 ) -> list[InstallResult]:
     cfg = resolve_config()
     if harness == "all":
-        targets = ["claude", "opencode", "hermes"]
+        # ``all`` is the stable suite set.  Component-private targets such as
+        # Hermes remain explicitly selectable but never enter this expansion.
+        targets = ["claude", "opencode"]
     else:
         targets = [harness]
     results: list[InstallResult] = []
@@ -817,13 +831,12 @@ def run_install_harness(
             results.append(InstallResult(
                 harness=t,
                 user=user,
-                no_op=True,
+                status=InstallStatus.UNSUPPORTED,
                 actions=[
                     InstallAction(
-                        "skip",
+                        "unsupported",
                         "",
-                        f"{t} adapter not yet implemented "
-                        f"(Plan 010 WI-5.{'3' if t == 'agy' else '4'} deferred)",
+                        f"{t} adapter is not implemented; no harness wiring was changed",
                     )
                 ],
             ))
@@ -839,7 +852,13 @@ def format_results_human(
     lines: list[str] = []
     prefix = "[dry-run] " if dry_run else ""
     for r in results:
-        if r.no_op:
+        if r.status is InstallStatus.UNSUPPORTED:
+            status = "unsupported (not wired)"
+        elif r.status is InstallStatus.DEGRADED:
+            status = "degraded"
+        elif r.status is InstallStatus.FAILED:
+            status = "failed"
+        elif r.no_op:
             status = "already wired (no-op)" if not uninstall else "nothing to remove (no-op)"
         elif uninstall:
             status = "uninstalled"
@@ -852,3 +871,11 @@ def format_results_human(
             tag = a.kind.upper()
             lines.append(f"  {tag:12s} {a.detail}")
     return "\n".join(lines)
+
+
+def results_succeeded(results: list[InstallResult]) -> bool:
+    """Return whether every result represents a successful installation state."""
+
+    # Cairn has no suite-tier context here. Degraded therefore fails closed;
+    # only a caller with an explicit tier policy may choose to permit it.
+    return all(result.status is InstallStatus.INSTALLED for result in results)

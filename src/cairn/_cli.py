@@ -820,7 +820,7 @@ def install_harness(
     json_output: bool,
 ) -> None:
     """Wire cairn's interception (hooks + default-on env) into a named harness."""
-    from ._install import format_results_human, run_install_harness
+    from ._install import format_results_human, results_succeeded, run_install_harness
 
     results = run_install_harness(harness, dry_run=dry_run, uninstall=uninstall, user=user)
 
@@ -829,6 +829,8 @@ def install_harness(
     else:
         click.echo(format_results_human(results, dry_run=dry_run, uninstall=uninstall))
 
+    if not results_succeeded(results):
+        sys.exit(1)
     if dry_run:
         sys.exit(2)
 
@@ -842,7 +844,7 @@ def install_harness(
 @click.option("--json", "json_output", is_flag=True)
 def uninstall_harness(harness: str, dry_run: bool, json_output: bool) -> None:
     """Reverse a prior ``cairn install-harness`` — removes only cairn's wiring."""
-    from ._install import format_results_human, run_install_harness
+    from ._install import format_results_human, results_succeeded, run_install_harness
 
     results = run_install_harness(harness, dry_run=dry_run, uninstall=True)
 
@@ -851,6 +853,8 @@ def uninstall_harness(harness: str, dry_run: bool, json_output: bool) -> None:
     else:
         click.echo(format_results_human(results, dry_run=dry_run, uninstall=True))
 
+    if not results_succeeded(results):
+        sys.exit(1)
     if dry_run:
         sys.exit(2)
 
