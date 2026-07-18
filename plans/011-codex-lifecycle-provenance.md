@@ -1,15 +1,26 @@
 # Plan 011 — Codex lifecycle provenance
 
-**Status:** Core adapter + installer landed 2026-07-17. `cairn._codex_hook`
-attests SessionStart, PreToolUse, PostToolUse, and Stop; `install-harness codex`
-merges the hook group into `$CODEX_HOME/hooks.json`. Verified end-to-end (real
-CLI + real bridge subprocess: begin→end pairs by `(turn_id, tool_use_id)` and is
-consumed, Stop emits `{}`, no degradation). **Deferred:** SubagentStart/Stop
-delegation lifecycle (WI-2.3 — subagent *tool* activity IS attributed via
-`agent_id`/`agent_type`), concurrency-stress hardening (WI-2.4), Codex-aware
-doctor (WI-3.2), and the live adversarial proof (WI-4.1, billable).
+**Status:** Core adapter, direct installer, component-owned plugin, and honest
+Codex doctor landed 2026-07-18. `cairn._codex_hook` attests SessionStart and
+Pre/PostToolUse; Stop safely cleans correlation state and emits the required
+non-blocking JSON response. `install-harness codex` merges the hook group
+into `$CODEX_HOME/hooks.json`, while `plugins/cairn` provides the suite-owned
+marketplace path. The two delivery paths are alternatives; doctor fails when
+both are active because Codex would run both copies. Plugin add/list/remove and
+cache contents are verified with the real Codex 0.144.5 CLI under an isolated
+`CODEX_HOME`. **Deferred:** SubagentStart/Stop delegation lifecycle (WI-2.3 —
+subagent *tool* activity IS attributed via `agent_id`/`agent_type`),
+concurrency-stress hardening (WI-2.4), and the full live adversarial session
+(WI-4.1, billable). Hook trust remains an operator `/hooks` check because Codex
+does not expose persisted trust through a machine-readable CLI.
 **Original status:** Proposed 2026-07-10.
 **Author:** GPT-5.6 Sol, from the suite Codex integration audit.
+
+**Packaging gate:** Cairn now declares the Regista 0.5.1 public-facade range
+and uses the sibling checkout as uv's development source, matching the suite
+constellation. A standalone uv checkout remains gated on publishing or pushing
+that Regista facade, after which the source override should become a pinned
+tag, commit, or package release.
 
 ## Implementation notes (2026-07-17)
 
@@ -25,12 +36,27 @@ doctor (WI-3.2), and the live adversarial proof (WI-4.1, billable).
 - **Only the four handled events are registered** — no false "wired" signal for
   events the adapter does not attest. Existing user hooks and unrelated config
   are preserved (surgical merge; uninstall removes only cairn entries).
+- **No raw Codex response is persisted.** Tool output contributes a full
+  SHA-256 digest and byte count; non-zero failures store a digest-only error
+  summary. The optional raw-fixture capture path used by the Claude adapter is
+  not invoked by the Codex adapter. The local activity marker contains only a
+  timestamp, event name, and one-way session-id digest.
+- **Current tool coverage follows Codex 0.144.5 documentation.** Local function
+  tools—including unified exec, apply_patch, MCP, and subagent dispatch—use the
+  Pre/PostToolUse path. Hosted tools such as WebSearch and specialized paths
+  that opt out remain explicitly outside Cairn's capture claim.
+- **Doctor separates observable states.** It validates direct/plugin wiring,
+  rejects duplicate paths, checks the effective hooks feature and visible
+  managed-only policy, reports named degradation, and records recent successful
+  bridge activity. Trust is always reported as unverified until the operator
+  reviews `/hooks`; no unsupported internal Codex state is inspected.
 - **Codex stays out of the stable `all`** expansion (still `claude`, `opencode`),
   consistent with the hardened suite Plan 007 (atomic cross-component promotion).
 - Authoritative Codex hook schema confirmed against
   https://learn.chatgpt.com/docs/hooks (fields: `session_id`, `turn_id`,
   `tool_name`/`tool_use_id`/`tool_input`/`tool_response`, `agent_id`/`agent_type`,
-  `hook_event_name`; Stop requires JSON on stdout; `$CODEX_HOME/hooks.json`).
+  `hook_event_name`; Stop requires JSON on stdout; `$CODEX_HOME/hooks.json`;
+  plugin default `hooks/hooks.json`; `commandWindows` override supported).
 **Strategic role:** Add honest tool-call, session, and subagent provenance for
 local Codex using the now-documented lifecycle hook protocol.
 
@@ -44,9 +70,10 @@ capture correctness remains a prerequisite.
   cwd, event, tool, and subagent fields.
 - `PreToolUse` and `PostToolUse` cover Bash, `apply_patch`, and MCP tool
   calls and expose a correlating `tool_use_id`.
-- Coverage is explicitly incomplete for richer unified-exec shell paths,
-  WebSearch, and other non-shell/non-MCP tools. Cairn must attest this scope
-  limitation instead of claiming complete capture.
+- Coverage includes the documented local function-tool path (including unified
+  exec) but remains explicitly incomplete for hosted WebSearch and specialized
+  paths that opt out. Cairn attests this limitation instead of claiming
+  complete capture.
 - Session/subagent hooks expose `session_id`, `turn_id`, `agent_id`, and
   `agent_type`. Subagent hooks use the parent session id.
 - Transcript paths are convenient but explicitly unstable. This plan does not

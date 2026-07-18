@@ -1,0 +1,28 @@
+{
+  "name": "cairn",
+  "version": "0.1.0",
+  "description": "Tamper-evident provenance for local Codex lifecycle and tool activity",
+  "author": {
+    "name": "Cairn contributors"
+  },
+  "license": "MIT",
+  "keywords": [
+    "audit",
+    "provenance",
+    "codex"
+  ],
+  "interface": {
+    "displayName": "Cairn",
+    "shortDescription": "Cryptographic provenance for Codex activity.",
+    "longDescription": "Records digest-only lifecycle and local tool-call provenance from configured Codex hooks into Regista.",
+    "developerName": "Cairn contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Lifecycle hooks",
+      "Audit provenance"
+    ],
+    "defaultPrompt": [
+      "Check whether Cairn provenance is healthy."
+    ]
+  }
+}

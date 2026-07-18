@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -65,7 +67,28 @@ def test_session_start_attests_codex_with_named_scope(monkeypatch):
     assert call["harnesses"][0] == {"name": "codex", "version": "0.144.1"}
     # Decision 7: scope names captured AND uncaptured tool paths.
     assert "Bash" in call["scope_statement"]
+    assert "unified exec" in call["scope_statement"]
     assert "WebSearch" in call["scope_statement"]
+    assert "session_id" not in json.loads(
+        (Path(os.environ["CAIRN_STATE_DIR"]) / "codex-health.json").read_text()
+    )
+
+
+def test_session_start_attests_plugin_config_digest_only(monkeypatch, tmp_path):
+    bridge = _stub_bridge(monkeypatch, {"status": "ok"})
+    monkeypatch.setattr(ch, "_detect_codex_version", lambda: "0.144.5")
+    plugin = tmp_path / "plugin"
+    hooks = plugin / "hooks" / "hooks.json"
+    hooks.parent.mkdir(parents=True)
+    hooks.write_text('{"token":"must-not-cross-bridge"}')
+    monkeypatch.setenv("PLUGIN_ROOT", str(plugin))
+    _feed(monkeypatch, {"session_id": "s1", "hook_event_name": "SessionStart"})
+
+    ch.handle_session_start()
+
+    call = bridge.calls[0]
+    assert call["harness_config_digests"]["codex"].startswith("sha256:")
+    assert "must-not-cross-bridge" not in json.dumps(call)
 
 
 # --- PreToolUse / PostToolUse correlation -----------------------------------
@@ -104,8 +127,22 @@ def test_pre_then_post_pairs_by_tool_use_id(monkeypatch, tmp_path):
     assert end["result_summary"]["stdout_digest"].startswith("sha256:") or end[
         "result_summary"
     ]["stdout_digest"]
+    assert "stdout" not in end["result_summary"]
+    assert "file1" not in json.dumps(end)
     # State file consumed on end.
     assert list((tmp_path / "sessions" / "s1").glob("*.json")) == []
+
+
+def test_codex_never_writes_raw_capture_payloads(monkeypatch, tmp_path):
+    capture = tmp_path / "raw-capture"
+    monkeypatch.setenv("CAIRN_CAPTURE_DIR", str(capture))
+    _stub_bridge(monkeypatch, {"status": "ok", "work_item_id": "wi-secret"})
+    payload = _pre(args={"command": "echo highly-sensitive-value"})
+    _feed(monkeypatch, payload)
+
+    ch.handle_pre()
+
+    assert not capture.exists()
 
 
 def test_post_nonzero_exit_from_structured_response(monkeypatch, tmp_path):
@@ -122,7 +159,9 @@ def test_post_nonzero_exit_from_structured_response(monkeypatch, tmp_path):
     ch.handle_post()
     end = bridge.calls[0]
     assert end["result_summary"]["exit_code"] == 3
-    assert end["error"]
+    assert end["error"].startswith("tool call failed (response sha256:")
+    assert "boom" not in end["error"]
+    assert "stdout" not in end["result_summary"]
 
 
 def test_post_without_begin_is_named_degradation(monkeypatch, tmp_path):

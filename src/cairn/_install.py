@@ -12,6 +12,7 @@ Hermes target: ``~/.hermes/.env`` + ``~/.hermes/plugins/observability/cairn/``
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -36,10 +37,11 @@ def _python_command() -> str:
 
 CAIRN_HOOK_COMMAND = f"{_python_command()} -m cairn._claude_hook"
 CAIRN_CODEX_HOOK_COMMAND = f"{_python_command()} -m cairn._codex_hook"
+CAIRN_CODEX_HOOK_COMMAND_WINDOWS = "python -m cairn._codex_hook"
 
-# Codex hook events cairn attests (Plan 011). Only these are registered — no
-# false "wired" signal for events the adapter does not handle. Tool events carry
-# a "*" matcher; SessionStart/Stop are not tool-matched.
+# Codex hook events Cairn handles (Plan 011). SessionStart and tool events
+# attest; Stop performs state cleanup and emits Codex's required JSON response.
+# Tool events carry a "*" matcher; SessionStart/Stop are not tool-matched.
 CODEX_HOOK_EVENTS: dict[str, str] = {
     "SessionStart": "session-start",
     "PreToolUse": "pre",
@@ -81,6 +83,19 @@ _ENV_VARS = [
 ]
 
 CAIRN_SENTINEL = "// cairn-managed"
+
+
+class ConfigLoadError(Exception):
+    """Raised when an existing config file cannot be read or parsed.
+
+    The caller must NOT overwrite the file — doing so would clobber
+    the user's content.  Instead, report a FAILED install result.
+    """
+
+    def __init__(self, path: Path, reason: str) -> None:
+        self.path = path
+        self.reason = reason
+        super().__init__(f"{path}: {reason}")
 
 
 def _detect_harness_version(harness: str) -> str | None:
@@ -211,10 +226,13 @@ _HERMES_ENV_END = "# END cairn-harness-managed"
 
 
 def _parse_env_file(path: Path) -> list[str]:
-    """Read .env file lines, returning [] if missing."""
+    """Read .env file lines, returning [] if missing or unreadable."""
     if not path.is_file():
         return []
-    return path.read_text().splitlines()
+    try:
+        return path.read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
 
 
 def _find_managed_block(lines: list[str]) -> tuple[int, int] | None:
@@ -406,8 +424,7 @@ def _install_hermes(
     if not any(a.kind != "skip" for a in result.actions):
         result.no_op = True
     elif not dry_run and changed:
-        env_path.parent.mkdir(parents=True, exist_ok=True)
-        env_path.write_text("\n".join(lines) + "\n")
+        _save_text_file(env_path, "\n".join(lines) + "\n")
 
     return result
 
@@ -442,7 +459,7 @@ def _uninstall_hermes(
 
     if not dry_run and changed:
         if lines:
-            env_path.write_text("\n".join(lines) + "\n")
+            _save_text_file(env_path, "\n".join(lines) + "\n")
         elif env_path.is_file():
             env_path.unlink()
 
@@ -476,25 +493,331 @@ def _uninstall_hermes(
 
 
 def _load_json(path: Path) -> dict[str, Any]:
-    if path.is_file():
-        try:
-            data: dict[str, Any] = json.loads(path.read_text())
-            return data
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
+    """Load JSON from *path*.
+
+    Returns ``{}`` when the file does not exist (clean-slate install).
+
+    Raises :class:`ConfigLoadError` when the file *exists* but cannot
+    be read or parsed — the caller must refuse to write, preventing
+    silent clobbering of user content.
+    """
+    if not path.is_file():
+        return {}
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigLoadError(path, f"unreadable: {exc}") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ConfigLoadError(path, f"invalid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ConfigLoadError(
+            path, f"expected JSON object, got {type(data).__name__}"
+        )
+    return data
 
 
 def _save_json(path: Path, data: dict[str, Any]) -> None:
+    """Atomically write JSON to *path* with owner-only permissions.
+
+    Uses a temp file + ``os.replace`` so an interrupted write cannot
+    corrupt the existing file.  Permissions are set to ``0o600`` on
+    every write because these files contain DSNs and key paths.
+    """
+    import tempfile
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+    content = json.dumps(data, indent=2, sort_keys=False) + "\n"
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".config-", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    except OSError:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
-def _is_cairn_hook_entry(entry: dict[str, Any]) -> bool:
-    for h in entry.get("hooks", []):
-        cmd = h.get("command", "")
-        if "cairn._claude_hook" in cmd or "cairn._codex_hook" in cmd or "cairn_hook" in cmd:
+def _save_text_file(path: Path, content: str) -> None:
+    """Atomically write text to *path* with owner-only permissions.
+
+    Same atomic-write + ``0o600`` pattern as :func:`_save_json`, for
+    non-JSON files that contain secrets (e.g. Hermes ``.env``).
+    """
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".config-", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    except OSError:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+# ------------------------------------------------------------------
+# Manifest — hash-based hook ownership (Plan 011 WI-3.1)
+#
+# The manifest records SHA-256 hashes of hook entries cairn has
+# installed, so uninstall can identify them precisely — even across
+# version changes that alter the command string.  This replaces the
+# former substring match (``"cairn._claude_hook" in cmd``) which could
+# falsely identify user-authored hooks that merely reference cairn.
+# ------------------------------------------------------------------
+
+
+def _manifest_path() -> Path:
+    """Return the path to cairn's harness manifest.
+
+    Override with ``CAIRN_MANIFEST_PATH`` for tests.
+    """
+    override = os.environ.get("CAIRN_MANIFEST_PATH")
+    if override:
+        return Path(override)
+    return Path.home() / ".cairn" / "harness-manifest.json"
+
+
+def _load_manifest() -> dict[str, Any]:
+    """Load the manifest, returning an empty skeleton if missing or corrupt."""
+    path = _manifest_path()
+    if not path.is_file():
+        return {"version": 1, "installs": {}}
+    try:
+        data = json.loads(path.read_text())
+        if not (isinstance(data, dict) and isinstance(data.get("installs"), dict)):
+            return {"version": 1, "installs": {}}
+        # Validate per-harness sub-structure: each install must be a dict
+        # with a dict ``hook_hashes`` (if present).  Each ``hook_hashes``
+        # event value must be a list.
+        installs = data["installs"]
+        for harness, install in list(installs.items()):
+            if not isinstance(install, dict):
+                del installs[harness]
+                continue
+            hh = install.get("hook_hashes")
+            if not isinstance(hh, dict):
+                install["hook_hashes"] = {}
+                hh = install["hook_hashes"]
+            for event, hashes in list(hh.items()):
+                if not isinstance(hashes, list):
+                    del hh[event]
+        return data
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        pass
+    return {"version": 1, "installs": {}}
+
+
+def _save_manifest(manifest: dict[str, Any]) -> None:
+    """Persist the manifest.  Best-effort: failures are logged, not fatal.
+
+    Uses an atomic write (temp file + ``os.replace``) so an interrupted
+    write cannot corrupt the manifest.
+    """
+    import tempfile
+
+    path = _manifest_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.parent.chmod(0o700)
+        except OSError:
+            pass
+        content = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".manifest-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(content)
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, path)
+        except OSError:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        print(f"cairn: WARNING: could not save harness manifest: {exc}", file=sys.stderr)
+
+
+def _compute_entry_hash(entry: dict[str, Any]) -> str:
+    """Compute SHA-256 hash of canonical JSON representation of a hook entry."""
+    canonical = json.dumps(entry, sort_keys=True)
+    return f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()}"
+
+
+def _expected_hook_entry(harness: str, event: str) -> dict[str, Any] | None:
+    """Return the exact hook entry cairn would create for *harness*+*event*."""
+    if harness == "claude":
+        action = HOOK_EVENTS.get(event)
+        if not action:
+            return None
+        return {
+            "matcher": "*",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"{CAIRN_HOOK_COMMAND} {action}",
+                    "timeout": 10,
+                }
+            ],
+        }
+    if harness == "codex":
+        action = CODEX_HOOK_EVENTS.get(event)
+        if not action:
+            return None
+        inner = {
+            "type": "command",
+            "command": f"{CAIRN_CODEX_HOOK_COMMAND} {action}",
+            "commandWindows": f"{CAIRN_CODEX_HOOK_COMMAND_WINDOWS} {action}",
+            "timeout": 10,
+        }
+        if event in _CODEX_TOOL_EVENTS:
+            return {"matcher": "*", "hooks": [inner]}
+        return {"hooks": [inner]}
+    return None
+
+
+def _expected_entry_hash(harness: str, event: str) -> str | None:
+    """Return the hash of the entry cairn would create, or ``None``."""
+    entry = _expected_hook_entry(harness, event)
+    if entry is None:
+        return None
+    return _compute_entry_hash(entry)
+
+
+def _cairn_hook_commands(harness: str) -> frozenset[str]:
+    """Return the set of exact command strings cairn generates for *harness*.
+
+    Used as a fallback for ownership detection when the manifest is
+    unavailable (pre-manifest installs).  This is **exact** match, NOT
+    substring — a user hook that merely references cairn will not match.
+    """
+    cmds: set[str] = set()
+    if harness == "claude":
+        for action in HOOK_EVENTS.values():
+            cmds.add(f"{CAIRN_HOOK_COMMAND} {action}")
+    elif harness == "codex":
+        for action in CODEX_HOOK_EVENTS.values():
+            cmds.add(f"{CAIRN_CODEX_HOOK_COMMAND} {action}")
+    return frozenset(cmds)
+
+
+def _manifest_hashes(
+    manifest: dict[str, Any], harness: str, event: str
+) -> set[str]:
+    """Return the set of recorded hashes for *harness*+*event*."""
+    install = manifest.get("installs", {}).get(harness, {})
+    return set(install.get("hook_hashes", {}).get(event, []))
+
+
+def _record_manifest(
+    manifest: dict[str, Any],
+    harness: str,
+    event: str,
+    entry: dict[str, Any],
+) -> None:
+    """Record a hook entry's hash in the manifest."""
+    installs = manifest.setdefault("installs", {})
+    install = installs.setdefault(harness, {})
+    hook_hashes = install.setdefault("hook_hashes", {})
+    hashes = hook_hashes.setdefault(event, [])
+    h = _compute_entry_hash(entry)
+    if h not in hashes:
+        hashes.append(h)
+
+
+def _clear_manifest_event(
+    manifest: dict[str, Any], harness: str, event: str
+) -> None:
+    """Remove all recorded hashes for *harness*+*event*."""
+    install = manifest.get("installs", {}).get(harness, {})
+    install.get("hook_hashes", {}).pop(event, None)
+
+
+def _is_cairn_hook_entry(
+    entry: dict[str, Any],
+    *,
+    harness: str = "",
+    event: str = "",
+    manifest: dict[str, Any] | None = None,
+) -> bool:
+    """Check if *entry* is a hook cairn owns.
+
+    Ownership is determined by (in order):
+
+    1. **Manifest hash match** — the entry's SHA-256 is in the manifest
+       for this *harness*+*event*.  This catches entries from previous
+       cairn versions whose command string may have changed.
+    2. **Expected entry hash match** — the entry exactly matches what
+       cairn would create right now for *harness*+*event*.
+    3. **Exact command fallback** — the entry's command string is one
+       of the known cairn commands (exact match, not substring).
+    4. **Legacy script fallback** — ``python[3] /path/cairn_hook.py``,
+       gated on *harness* being specified.
+
+    This replaces the former substring check
+    (``"cairn._claude_hook" in cmd``) which could falsely identify
+    user-authored hooks that merely reference cairn.
+    """
+    if not isinstance(entry, dict):
+        return False
+
+    raw_hooks = entry.get("hooks", [])
+    if not isinstance(raw_hooks, list):
+        return False
+    hook_list = [h for h in raw_hooks if isinstance(h, dict)]
+
+    entry_hash = _compute_entry_hash(entry)
+
+    # 1. Manifest match (handles version changes)
+    if manifest is not None and harness:
+        if entry_hash in _manifest_hashes(manifest, harness, event):
             return True
+
+    # 2. Expected entry match (current version)
+    if harness and event:
+        expected_hash = _expected_entry_hash(harness, event)
+        if expected_hash is not None and entry_hash == expected_hash:
+            return True
+
+    # 3. Fallback: exact command match (not substring)
+    if harness:
+        known_cmds = _cairn_hook_commands(harness)
+        for h in hook_list:
+            cmd = h.get("command", "")
+            if cmd in known_cmds:
+                return True
+
+    # 4. Legacy script fallback (pre-module invocation).
+    # Catches old-format installs: ``python[3] /path/cairn_hook.py <action>``.
+    # Gated on *harness* to avoid false positives when called without
+    # context.  Uses exact basename match (``Path(t).name == "cairn_hook.py"``)
+    # — a user script named ``evil_cairn_hook.py`` will NOT match.
+    if harness:
+        for h in hook_list:
+            cmd = h.get("command", "")
+            tokens = cmd.split()
+            if len(tokens) >= 2 and tokens[0] in ("python", "python3"):
+                if any(Path(t).name == "cairn_hook.py" for t in tokens[1:]):
+                    return True
+
     return False
 
 
@@ -525,13 +848,37 @@ def _install_claude(
 ) -> InstallResult:
     path = _claude_settings_path()
     result = InstallResult(harness="claude", user=user)
-    data = _load_json(path)
+    try:
+        data = _load_json(path)
+    except ConfigLoadError as exc:
+        result.status = InstallStatus.FAILED
+        result.actions.append(
+            InstallAction(
+                "error",
+                str(path),
+                f"refused to clobber unreadable config: {exc.reason}",
+            )
+        )
+        return result
+
+    manifest = _load_manifest()
 
     if uninstall:
-        return _uninstall_claude(path, data, dry_run=dry_run, result=result)
+        result = _uninstall_claude(
+            path, data, dry_run=dry_run, result=result, manifest=manifest
+        )
+        if not dry_run and not result.no_op:
+            _save_manifest(manifest)
+        return result
 
     env = data.setdefault("env", {})
+    if not isinstance(env, dict):
+        env = {}
+        data["env"] = env
     hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        hooks = {}
+        data["hooks"] = hooks
     changed = False
 
     desired_env = _env_values(cfg, "claude-code")
@@ -581,7 +928,16 @@ def _install_claude(
 
     for event, action in HOOK_EVENTS.items():
         event_hooks = hooks.setdefault(event, [])
-        already = any(_is_cairn_hook_entry(e) for e in event_hooks)
+        if not isinstance(event_hooks, list):
+            event_hooks = []
+            hooks[event] = event_hooks
+        already = any(
+            _is_cairn_hook_entry(
+                e, harness="claude", event=event, manifest=manifest
+            )
+            for e in event_hooks
+            if isinstance(e, dict)
+        )
         if already:
             continue
         new_entry = {
@@ -596,6 +952,7 @@ def _install_claude(
         }
         event_hooks.append(new_entry)
         changed = True
+        _record_manifest(manifest, "claude", event, new_entry)
         result.actions.append(
             InstallAction(
                 "merge_json",
@@ -609,6 +966,7 @@ def _install_claude(
         result.no_op = True
     elif not dry_run and changed:
         _save_json(path, data)
+        _save_manifest(manifest)
 
     return result
 
@@ -619,15 +977,31 @@ def _uninstall_claude(
     *,
     dry_run: bool,
     result: InstallResult,
+    manifest: dict[str, Any] | None = None,
 ) -> InstallResult:
     hooks = data.get("hooks", {})
+    if not isinstance(hooks, dict):
+        hooks = {}
     env = data.get("env", {})
+    if not isinstance(env, dict):
+        env = {}
     changed = False
 
     for event in HOOK_EVENTS:
         event_hooks = hooks.get(event, [])
+        if not isinstance(event_hooks, list):
+            continue
         original_len = len(event_hooks)
-        event_hooks = [e for e in event_hooks if not _is_cairn_hook_entry(e)]
+        event_hooks = [
+            e
+            for e in event_hooks
+            if not (
+                isinstance(e, dict)
+                and _is_cairn_hook_entry(
+                    e, harness="claude", event=event, manifest=manifest
+                )
+            )
+        ]
         if len(event_hooks) < original_len:
             changed = True
             result.actions.append(
@@ -642,6 +1016,8 @@ def _uninstall_claude(
                 hooks[event] = event_hooks
             else:
                 hooks.pop(event, None)
+            if manifest is not None and not dry_run:
+                _clear_manifest_event(manifest, "claude", event)
 
     for key in _ENV_VARS:
         if key in env:
@@ -702,10 +1078,28 @@ def _install_codex(
     """
     path = _codex_hooks_path()
     result = InstallResult(harness="codex", user=user)
-    data = _load_json(path)
+    try:
+        data = _load_json(path)
+    except ConfigLoadError as exc:
+        result.status = InstallStatus.FAILED
+        result.actions.append(
+            InstallAction(
+                "error",
+                str(path),
+                f"refused to clobber unreadable config: {exc.reason}",
+            )
+        )
+        return result
+
+    manifest = _load_manifest()
 
     if uninstall:
-        return _uninstall_codex(path, data, dry_run=dry_run, result=result)
+        result = _uninstall_codex(
+            path, data, dry_run=dry_run, result=result, manifest=manifest
+        )
+        if not dry_run and not result.no_op:
+            _save_manifest(manifest)
+        return result
 
     hooks = data.setdefault("hooks", {})
     if not isinstance(hooks, dict):
@@ -718,11 +1112,16 @@ def _install_codex(
         if not isinstance(event_hooks, list):
             event_hooks = []
             hooks[event] = event_hooks
-        if any(_is_cairn_hook_entry(e) for e in event_hooks if isinstance(e, dict)):
+        if any(
+            _is_cairn_hook_entry(e, harness="codex", event=event, manifest=manifest)
+            for e in event_hooks
+            if isinstance(e, dict)
+        ):
             continue
         inner = {
             "type": "command",
             "command": f"{CAIRN_CODEX_HOOK_COMMAND} {action}",
+            "commandWindows": f"{CAIRN_CODEX_HOOK_COMMAND_WINDOWS} {action}",
             "timeout": 10,
         }
         new_entry: dict[str, Any] = {"hooks": [inner]}
@@ -730,6 +1129,7 @@ def _install_codex(
             new_entry = {"matcher": "*", "hooks": [inner]}
         event_hooks.append(new_entry)
         changed = True
+        _record_manifest(manifest, "codex", event, new_entry)
         result.actions.append(
             InstallAction(
                 "merge_json",
@@ -743,6 +1143,7 @@ def _install_codex(
         result.no_op = True
     elif not dry_run and changed:
         _save_json(path, data)
+        _save_manifest(manifest)
 
     return result
 
@@ -753,6 +1154,7 @@ def _uninstall_codex(
     *,
     dry_run: bool,
     result: InstallResult,
+    manifest: dict[str, Any] | None = None,
 ) -> InstallResult:
     hooks = data.get("hooks", {})
     changed = False
@@ -761,7 +1163,16 @@ def _uninstall_codex(
             event_hooks = hooks.get(event, [])
             if not isinstance(event_hooks, list):
                 continue
-            kept = [e for e in event_hooks if not (isinstance(e, dict) and _is_cairn_hook_entry(e))]
+            kept = [
+                e
+                for e in event_hooks
+                if not (
+                    isinstance(e, dict)
+                    and _is_cairn_hook_entry(
+                        e, harness="codex", event=event, manifest=manifest
+                    )
+                )
+            ]
             if len(kept) < len(event_hooks):
                 changed = True
                 result.actions.append(
@@ -776,6 +1187,8 @@ def _uninstall_codex(
                     hooks[event] = kept
                 else:
                     hooks.pop(event, None)
+                if manifest is not None and not dry_run:
+                    _clear_manifest_event(manifest, "codex", event)
 
     if not result.actions:
         result.no_op = True
@@ -801,12 +1214,26 @@ def _install_opencode(
 ) -> InstallResult:
     path = _opencode_config_path()
     result = InstallResult(harness="opencode", user=user)
-    data = _load_json(path)
+    try:
+        data = _load_json(path)
+    except ConfigLoadError as exc:
+        result.status = InstallStatus.FAILED
+        result.actions.append(
+            InstallAction(
+                "error",
+                str(path),
+                f"refused to clobber unreadable config: {exc.reason}",
+            )
+        )
+        return result
 
     if uninstall:
         return _uninstall_opencode(path, data, dry_run=dry_run, result=result)
 
     env = data.setdefault("env", {})
+    if not isinstance(env, dict):
+        env = {}
+        data["env"] = env
     desired_env = _env_values(cfg, "opencode")
     if user:
         desired_env["PRINCIPAL_ID"] = user
@@ -839,7 +1266,14 @@ def _install_opencode(
 
     plugin_path = _find_opencode_plugin()
     if plugin_path:
-        plugins = data.setdefault("plugin", {}).setdefault("sources", [])
+        plugin_data = data.setdefault("plugin", {})
+        if not isinstance(plugin_data, dict):
+            plugin_data = {}
+            data["plugin"] = plugin_data
+        plugins = plugin_data.setdefault("sources", [])
+        if not isinstance(plugins, list):
+            plugins = []
+            plugin_data["sources"] = plugins
         already = any(
             (isinstance(p, dict) and p.get("source", "") == str(plugin_path))
             or (isinstance(p, str) and p == str(plugin_path))
@@ -855,9 +1289,10 @@ def _install_opencode(
                     keys=["plugin.sources"],
                 )
             )
-        result.actions.append(
-            InstallAction("skip", str(plugin_path), "plugin already registered")
-        )
+        else:
+            result.actions.append(
+                InstallAction("skip", str(plugin_path), "plugin already registered")
+            )
     else:
         result.actions.append(
             InstallAction(
@@ -882,6 +1317,8 @@ def _uninstall_opencode(
     result: InstallResult,
 ) -> InstallResult:
     env = data.get("env", {})
+    if not isinstance(env, dict):
+        env = {}
     changed = False
 
     for key in _ENV_VARS:
@@ -895,7 +1332,11 @@ def _uninstall_opencode(
     plugin_path = _find_opencode_plugin()
     if plugin_path:
         plugin_data = data.get("plugin", {})
+        if not isinstance(plugin_data, dict):
+            plugin_data = {}
         sources = plugin_data.get("sources", [])
+        if not isinstance(sources, list):
+            sources = []
         original = len(sources)
         sources = [
             s

@@ -23,13 +23,14 @@ re-implements the parts that differ for Codex:
   non-blocking ``{}`` and never requests continuation (Decision 5): provenance
   must not stop or rewrite the user's Codex turn.
 
-Scope (attested honestly, Decision 7): Bash, ``apply_patch``, and MCP tool calls
-are captured via Pre/PostToolUse.  Richer unified-exec shell paths, WebSearch,
-and other non-shell/non-MCP tools are NOT captured and are named as out of scope
-in the session attestation.  Subagent *tool* activity is attributed via the
-top-level ``agent_id``/``agent_type``; the SubagentStart/Stop delegation
-lifecycle (Plan 011 WI-2.3) and concurrency-stress hardening (WI-2.4) are not
-yet implemented.
+Scope (attested honestly, Decision 7): local function tools (including Bash /
+unified exec, ``apply_patch``, MCP calls, and subagent dispatch) are captured
+via Pre/PostToolUse.  Hosted tools such as WebSearch and specialized paths that
+opt out of the local function-tool hook path are NOT captured and are named as
+out of scope in the session attestation.  Subagent *tool* activity is
+attributed via the top-level ``agent_id``/``agent_type``; the
+SubagentStart/Stop delegation lifecycle (Plan 011 WI-2.3) and
+concurrency-stress hardening (WI-2.4) are not yet implemented.
 
 Design invariant: a hook failure is recorded in the bounded per-session
 degradation log and never propagates — every entry point returns cleanly (and
@@ -38,11 +39,14 @@ degradation log and never propagates — every entry point returns cleanly (and
 
 from __future__ import annotations
 
+import datetime
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +54,6 @@ from ._claude_hook import (
     _FALLBACK_SESSION_ID,
     _FALLBACK_TOOL_NAME,
     _TRANSPORT_CAP,
-    _capture_raw,
     _compute_output_digest,
     _extract_files,
     _mark_degraded,
@@ -59,9 +62,9 @@ from ._claude_hook import (
     _state_dir,
 )
 
-# hook_event_name -> install action token (and back). Only the events cairn
-# attests are registered; everything else is intentionally absent rather than
-# wired to a no-op (no false "wired" signal).
+# hook_event_name -> install action token (and back). Only events Cairn handles
+# are registered; SessionStart and tool events attest, while Stop performs
+# cleanup and emits Codex's required non-blocking JSON response.
 CODEX_HOOK_ACTIONS: dict[str, str] = {
     "SessionStart": "session-start",
     "PreToolUse": "pre",
@@ -71,8 +74,58 @@ CODEX_HOOK_ACTIONS: dict[str, str] = {
 
 # Tool paths this adapter captures vs. the ones it cannot see, named verbatim in
 # the session scope attestation so no auditor mistakes silence for coverage.
-_CAPTURED_TOOLS = "Bash, apply_patch, MCP tool calls"
-_UNCAPTURED_TOOLS = "unified-exec shell paths, WebSearch, other non-shell/non-MCP tools"
+_CAPTURED_TOOLS = (
+    "local function tools including Bash/unified exec, apply_patch, MCP calls, "
+    "and Agent/spawn_agent dispatch"
+)
+_UNCAPTURED_TOOLS = (
+    "hosted tools such as WebSearch and specialized tool paths that opt out "
+    "of Codex's local function-tool hook path"
+)
+
+_CODEX_HEALTH_FILE = "codex-health.json"
+
+
+def _record_activity(session_id: str, event: str) -> None:
+    """Record non-secret local proof that a Codex bridge call succeeded.
+
+    Doctor cannot inspect Codex's persisted hook trust: the supported operator
+    surface is the interactive ``/hooks`` browser.  This marker therefore does
+    not claim trust.  It records only a timestamp, event name, and a one-way
+    digest of the session id so doctor can distinguish configured-only wiring
+    from a hook that has actually reached Cairn.
+    """
+    base = Path(os.environ.get("CAIRN_STATE_DIR", tempfile.gettempdir() + "/cairn-sessions"))
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        try:
+            base.chmod(0o700)
+        except OSError:
+            pass
+        payload = {
+            "schema_version": 1,
+            "harness": "codex",
+            "event": event,
+            "last_success_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "session_digest": "sha256:"
+            + hashlib.sha256(session_id.encode("utf-8", errors="replace")).hexdigest(),
+        }
+        fd, tmp_name = tempfile.mkstemp(dir=str(base), prefix=".codex-health-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as handle:
+                json.dump(payload, handle, sort_keys=True)
+                handle.write("\n")
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, base / _CODEX_HEALTH_FILE)
+        except OSError:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+    except OSError:
+        # Health telemetry must never make an otherwise successful provenance
+        # write interfere with the Codex turn.
+        return
 
 
 def _read_input() -> tuple[str, dict[str, Any]]:
@@ -129,6 +182,31 @@ def _detect_codex_version() -> str | None:
     return m.group(1) if m else None
 
 
+def _config_digest() -> str | None:
+    """Digest the active Cairn hook definition without reading credentials.
+
+    Plugin hooks receive ``PLUGIN_ROOT`` from Codex.  The direct fallback uses
+    ``$CODEX_HOME/hooks.json``.  Only the digest crosses the bridge; config
+    content is never logged or persisted by Cairn.
+    """
+    plugin_root = os.environ.get("PLUGIN_ROOT")
+    if plugin_root:
+        candidate = Path(plugin_root) / "hooks" / "hooks.json"
+    else:
+        codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+        candidate = codex_home / "hooks.json"
+    if not candidate.is_file():
+        return None
+    digest = hashlib.sha256()
+    try:
+        with candidate.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return f"sha256:{digest.hexdigest()}"
+
+
 def handle_session_start() -> None:
     _, hook_input = _read_input()
     session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
@@ -140,21 +218,26 @@ def handle_session_start() -> None:
         f"In scope: {harness_name}. Captured tool paths: {_CAPTURED_TOOLS}. "
         f"NOT captured: {_UNCAPTURED_TOOLS}."
     )
+    config_digest = _config_digest()
+    payload: dict[str, Any] = {
+        "action": "attest_session",
+        "session_id": session_id,
+        "harnesses": [{"name": harness_name, "version": harness_version}],
+        "scope_statement": scope,
+    }
+    if config_digest is not None:
+        payload["harness_config_digests"] = {"codex": config_digest}
     reply = _run_bridge(
-        {
-            "action": "attest_session",
-            "session_id": session_id,
-            "harnesses": [{"name": harness_name, "version": harness_version}],
-            "scope_statement": scope,
-        }
+        payload
     )
     if not reply or reply.get("status") != "ok":
-        _mark_degraded(session_id, "session_start", "session attestation bridge call failed")
+        _mark_degraded(session_id, "codex:session_start", "session attestation bridge call failed")
+    else:
+        _record_activity(session_id, "SessionStart")
 
 
 def handle_pre() -> None:
-    raw, hook_input = _read_input()
-    _capture_raw("codex-pre", raw)
+    _, hook_input = _read_input()
     session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
     tool_name = hook_input.get("tool_name", _FALLBACK_TOOL_NAME)
     tool_input = hook_input.get("tool_input", {})
@@ -163,7 +246,7 @@ def handle_pre() -> None:
 
     state_file = _tool_state_file(session_id, hook_input)
     if state_file is None:
-        _mark_degraded(session_id, "pre", f"missing tool_use_id for {tool_name}")
+        _mark_degraded(session_id, "codex:pre", f"missing tool_use_id for {tool_name}")
         return
 
     subagent = _subagent(hook_input)
@@ -181,7 +264,9 @@ def handle_pre() -> None:
     if reply and reply.get("status") == "ok":
         work_item_id = reply.get("work_item_id")
         if not work_item_id:
-            _mark_degraded(session_id, "pre", "bridge returned ok but no work_item_id")
+            _mark_degraded(
+                session_id, "codex:pre", "bridge returned ok but no work_item_id"
+            )
             return
         state_file.parent.mkdir(parents=True, exist_ok=True)
         state_file.write_text(
@@ -190,12 +275,11 @@ def handle_pre() -> None:
             )
         )
     else:
-        _mark_degraded(session_id, "pre", f"bridge call failed for {tool_name}")
+        _mark_degraded(session_id, "codex:pre", f"bridge call failed for {tool_name}")
 
 
 def handle_post() -> None:
-    raw, hook_input = _read_input()
-    _capture_raw("codex-post", raw)
+    _, hook_input = _read_input()
     session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
     tool_name = hook_input.get("tool_name", _FALLBACK_TOOL_NAME)
     tool_input = hook_input.get("tool_input", {})
@@ -209,19 +293,23 @@ def handle_post() -> None:
         response = json.dumps(response, sort_keys=True, default=str)
     stdout_digest, bytes_total = _compute_output_digest(response)
     truncated = len(response) > _TRANSPORT_CAP
-    stdout_text = response[:_TRANSPORT_CAP]
-
     state_file = _tool_state_file(session_id, hook_input)
     if state_file is None:
-        _mark_degraded(session_id, "post", f"missing tool_use_id for {tool_name}")
+        _mark_degraded(session_id, "codex:post", f"missing tool_use_id for {tool_name}")
         return
     if not state_file.is_file():
-        _mark_degraded(session_id, "post", f"no begin state for {tool_name} (orphan end)")
+        _mark_degraded(
+            session_id,
+            "codex:post",
+            f"no begin state for {tool_name} (orphan end)",
+        )
         return
     try:
         state = json.loads(state_file.read_text())
     except (json.JSONDecodeError, OSError):
-        _mark_degraded(session_id, "post", f"state file unreadable for {tool_name}")
+        _mark_degraded(
+            session_id, "codex:post", f"state file unreadable for {tool_name}"
+        )
         state_file.unlink(missing_ok=True)
         return
 
@@ -245,20 +333,29 @@ def handle_post() -> None:
         "session_id": session_id,
         "result_summary": {
             "exit_code": exit_code,
-            "stdout": stdout_text,
             "stdout_digest": stdout_digest,
             "stdout_digest_alg": "sha256",
             "stdout_bytes_total": bytes_total,
             "stdout_truncated": truncated,
         },
         "files": _extract_files(tool_name, tool_input),
-        "error": (stdout_text[:500] or "tool call failed") if exit_code != 0 else None,
+        # Never persist raw failure output: it can contain credentials or PII.
+        # The full response digest remains independently reproducible.
+        "error": (
+            f"tool call failed (response sha256:{stdout_digest})"
+            if exit_code != 0
+            else None
+        ),
     }
     if subagent:
         payload["subagent"] = subagent
     reply = _run_bridge(payload)
     if not reply or reply.get("status") != "ok":
-        _mark_degraded(session_id, "post", f"bridge call failed for {tool_name} end")
+        _mark_degraded(
+            session_id, "codex:post", f"bridge call failed for {tool_name} end"
+        )
+    else:
+        _record_activity(session_id, "PostToolUse")
     state_file.unlink(missing_ok=True)
 
 
@@ -304,7 +401,11 @@ def main(argv: list[str] | None = None) -> int:
         handler()
     except Exception as exc:  # never break the Codex turn (Decision 5)
         try:
-            _mark_degraded(_FALLBACK_SESSION_ID, action, f"unhandled hook error: {exc}")
+            _mark_degraded(
+                _FALLBACK_SESSION_ID,
+                f"codex:{action or 'unknown'}",
+                f"unhandled hook error: {exc}",
+            )
         except Exception:
             pass
         if action == "stop":
