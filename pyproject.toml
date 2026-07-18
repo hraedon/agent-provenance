@@ -20,11 +20,17 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "regista @ git+https://github.com/hraedon/regista.git@dd22197eaafe11afabdae488b6908a5729b3b343",
+    "regista>=0.5.1,<0.6",
     "rfc8785>=0.1.4",
     "structlog>=24.1",
     "click>=8.1",
 ]
+
+[tool.uv.sources]
+# The required Regista 0.5.1 public facade is currently available from the
+# suite sibling checkout but not yet from a published index/tag. Replace this
+# development override with a pinned published source once that facade lands.
+regista = { path = "../regista", editable = true }
 
 [project.optional-dependencies]
 dev = [

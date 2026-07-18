@@ -1,0 +1,55 @@
+{
+  "description": "Cairn digest-only provenance for local Codex lifecycle and tool activity.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -m cairn._codex_hook session-start",
+            "commandWindows": "python -m cairn._codex_hook session-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -m cairn._codex_hook pre",
+            "commandWindows": "python -m cairn._codex_hook pre",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -m cairn._codex_hook post",
+            "commandWindows": "python -m cairn._codex_hook post",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -m cairn._codex_hook stop",
+            "commandWindows": "python -m cairn._codex_hook stop",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

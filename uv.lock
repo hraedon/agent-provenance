@@ -96,7 +96,7 @@ requires-dist = [
     { name = "pynacl", marker = "extra == 'dev'", specifier = ">=1.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
-    { name = "regista", git = "https://github.com/hraedon/regista.git?rev=dd22197eaafe11afabdae488b6908a5729b3b343" },
+    { name = "regista", editable = "../regista" },
     { name = "rfc8785", specifier = ">=0.1.4" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "structlog", specifier = ">=24.1" },
@@ -822,17 +822,51 @@ wheels = [
 
 [[package]]
 name = "regista"
-version = "0.5.0"
-source = { git = "https://github.com/hraedon/regista.git?rev=dd22197eaafe11afabdae488b6908a5729b3b343#dd22197eaafe11afabdae488b6908a5729b3b343" }
+version = "0.5.1"
+source = { editable = "../regista" }
 dependencies = [
     { name = "jsonschema" },
     { name = "prometheus-client" },
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg-pool" },
+    { name = "pynacl" },
     { name = "python-dateutil" },
     { name = "pyyaml" },
     { name = "structlog" },
 ]
+
+[package.metadata]
+requires-dist = [
+    { name = "asn1crypto", marker = "extra == 'timestamping'", specifier = ">=1.5" },
+    { name = "azure-identity", marker = "extra == 'azure'", specifier = ">=1.16" },
+    { name = "azure-keyvault-secrets", marker = "extra == 'azure'", specifier = ">=4.8" },
+    { name = "cryptography", marker = "extra == 'encryption'", specifier = ">=42.0" },
+    { name = "fastapi", marker = "extra == 'sidecar'", specifier = ">=0.115" },
+    { name = "httpx", marker = "extra == 'sidecar'", specifier = ">=0.27" },
+    { name = "hvac", marker = "extra == 'vault'", specifier = ">=2.0" },
+    { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.100" },
+    { name = "jsonschema", specifier = ">=4.21" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
+    { name = "opentimestamps", marker = "extra == 'anchoring'", specifier = ">=0.4" },
+    { name = "prometheus-client", specifier = ">=0.20" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
+    { name = "psycopg-pool", specifier = ">=3.2,<4" },
+    { name = "pydantic", marker = "extra == 'sidecar'", specifier = ">=2.7" },
+    { name = "pynacl", specifier = ">=1.5" },
+    { name = "pynacl", marker = "extra == 'ed25519'", specifier = ">=1.5" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
+    { name = "python-dateutil", specifier = ">=2.9" },
+    { name = "pyyaml", specifier = ">=6.0" },
+    { name = "rfc8785", marker = "extra == 'vendor-check'", specifier = "==0.1.4" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
+    { name = "structlog", specifier = ">=24.1" },
+    { name = "types-jsonschema", marker = "extra == 'dev'" },
+    { name = "types-python-dateutil", marker = "extra == 'dev'" },
+    { name = "types-pyyaml", marker = "extra == 'dev'" },
+    { name = "uvicorn", extras = ["standard"], marker = "extra == 'sidecar'", specifier = ">=0.30" },
+]
+provides-extras = ["dev", "sidecar", "ed25519", "encryption", "vendor-check", "timestamping", "anchoring", "vault", "azure", "windows"]
 
 [[package]]
 name = "rfc8785"

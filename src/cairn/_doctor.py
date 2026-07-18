@@ -11,7 +11,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import subprocess
 import tempfile
+import tomllib
+from pathlib import Path
 from typing import Any
 
 logging.basicConfig(level=logging.CRITICAL)
@@ -29,7 +33,14 @@ except ImportError:
 
 from . import __version__ as _cairn_version  # noqa: E402
 from ._config import resolve_config  # noqa: E402
-from ._install import HOOK_EVENTS, _claude_settings_path, _is_cairn_hook_entry  # noqa: E402
+from ._install import (  # noqa: E402
+    CODEX_HOOK_EVENTS,
+    HOOK_EVENTS,
+    _claude_settings_path,
+    _codex_hooks_path,
+    _is_cairn_hook_entry,
+    _load_manifest,
+)
 
 
 def _check_config(cfg: Any) -> dict[str, Any]:
@@ -128,23 +139,40 @@ def _check_regista(cfg: Any) -> tuple[dict[str, Any], Any]:
         return {"name": "regista", "status": "fail", "detail": f"unreachable: {exc}"}, None
 
 
-def _check_harness_wired(cfg: Any) -> dict[str, Any]:
+def _check_harness_wired(cfg: Any, *, required: bool = True) -> dict[str, Any]:
     path = _claude_settings_path()
     if not path.is_file():
-        return {"name": "harness_wired", "status": "fail", "detail": f"no settings.json at {path}"}
+        return {
+            "name": "harness_wired",
+            "status": "fail" if required else "skip",
+            "detail": f"Claude Code not configured (no settings.json at {path})",
+        }
     try:
         data = json.loads(path.read_text())
     except Exception:
         return {"name": "harness_wired", "status": "fail", "detail": f"cannot parse {path}"}
 
     hooks = data.get("hooks", {})
+    if not isinstance(hooks, dict):
+        hooks = {}
+    manifest = _load_manifest()
     missing_events: list[str] = []
     for event in HOOK_EVENTS:
         event_hooks = hooks.get(event, [])
-        if not any(_is_cairn_hook_entry(e) for e in event_hooks):
+        if not isinstance(event_hooks, list):
+            event_hooks = []
+        if not any(
+            _is_cairn_hook_entry(
+                e, harness="claude", event=event, manifest=manifest
+            )
+            for e in event_hooks
+            if isinstance(e, dict)
+        ):
             missing_events.append(event)
 
     env = data.get("env", {})
+    if not isinstance(env, dict):
+        env = {}
     has_dsn = bool(env.get("REGISTA_DSN") or env.get("CAIRN_DSN"))
     has_project = bool(env.get("CAIRN_PROJECT"))
 
@@ -172,16 +200,301 @@ def _check_harness_wired(cfg: Any) -> dict[str, Any]:
     }
 
 
-def _check_bridge() -> dict[str, Any]:
-    import shutil
+def _codex_plugin_state() -> tuple[str, str | None]:
+    """Return ``(state, version)`` for the component-owned ``cairn`` plugin.
 
+    Codex's stable machine-readable surface is ``plugin list --json``.  Hook
+    trust is deliberately not inferred here because Codex exposes that only
+    through the interactive ``/hooks`` browser.
+    """
+    if shutil.which("codex") is None:
+        return "cli_absent", None
+    try:
+        result = subprocess.run(
+            ["codex", "plugin", "list", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown", None
+    if result.returncode != 0:
+        return "unknown", None
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return "unknown", None
+    installed = payload.get("installed", []) if isinstance(payload, dict) else []
+    if not isinstance(installed, list):
+        return "unknown", None
+    for entry in installed:
+        if not isinstance(entry, dict) or entry.get("name") != "cairn":
+            continue
+        version = entry.get("version")
+        if entry.get("enabled") is False:
+            return "disabled", version if isinstance(version, str) else None
+        return "enabled", version if isinstance(version, str) else None
+    return "absent", None
+
+
+def _check_codex_harness_wired(cfg: Any) -> dict[str, Any]:
+    """Validate direct or plugin-owned Codex hook wiring without false trust.
+
+    Direct ``hooks.json`` installation and plugin installation are alternative
+    delivery paths.  Having both active would execute Cairn twice for each
+    matching event, so doctor treats that as a configuration error.
+    """
+    path = _codex_hooks_path()
+    direct_present = path.is_file()
+    direct_cairn_present = False
+    direct_ok = False
+    missing_events: list[str] = []
+    if direct_present:
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            return {
+                "name": "codex_harness_wired",
+                "status": "fail",
+                "detail": f"cannot parse {path}",
+            }
+        hooks = data.get("hooks", {}) if isinstance(data, dict) else {}
+        if not isinstance(hooks, dict):
+            hooks = {}
+        manifest = _load_manifest()
+        for event in CODEX_HOOK_EVENTS:
+            entries = hooks.get(event, [])
+            found = isinstance(entries, list) and any(
+                _is_cairn_hook_entry(
+                    entry,
+                    harness="codex",
+                    event=event,
+                    manifest=manifest,
+                )
+                for entry in entries
+                if isinstance(entry, dict)
+            )
+            direct_cairn_present = direct_cairn_present or found
+            if not found:
+                missing_events.append(event)
+        direct_ok = direct_cairn_present and not missing_events
+
+    plugin_state, plugin_version = _codex_plugin_state()
+    plugin_enabled = plugin_state == "enabled"
+    configured_for_codex = str(getattr(cfg, "harness_name", "")).lower() == "codex"
+
+    if direct_ok and plugin_enabled:
+        return {
+            "name": "codex_harness_wired",
+            "status": "fail",
+            "detail": (
+                "Cairn is configured through both direct hooks.json and the enabled "
+                "plugin; remove one path to prevent duplicate attestations"
+            ),
+        }
+    if direct_cairn_present and missing_events:
+        return {
+            "name": "codex_harness_wired",
+            "status": "fail",
+            "detail": f"direct Codex wiring missing hooks: {', '.join(missing_events)}",
+        }
+    if plugin_state == "disabled":
+        return {
+            "name": "codex_harness_wired",
+            "status": "fail",
+            "detail": f"Cairn Codex plugin v{plugin_version or '?'} is installed but disabled",
+        }
+    if direct_ok:
+        return {
+            "name": "codex_harness_wired",
+            "status": "ok",
+            "detail": f"direct Codex hooks configured in {path}",
+        }
+    if plugin_enabled:
+        return {
+            "name": "codex_harness_wired",
+            "status": "ok",
+            "detail": f"Cairn Codex plugin v{plugin_version or '?'} installed and enabled",
+        }
+    if configured_for_codex:
+        detail = "Codex selected but neither direct Cairn hooks nor the Cairn plugin are active"
+        if plugin_state == "unknown":
+            detail += " (plugin state could not be read)"
+        return {"name": "codex_harness_wired", "status": "fail", "detail": detail}
+    return {
+        "name": "codex_harness_wired",
+        "status": "skip",
+        "detail": "Codex integration not configured",
+    }
+
+
+def _codex_hooks_feature_enabled() -> bool | None:
+    """Read Codex's effective public feature listing for the ``hooks`` flag."""
+    if shutil.which("codex") is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["codex", "features", "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if fields and fields[0] == "hooks" and fields[-1] in {"true", "false"}:
+            return fields[-1] == "true"
+    return None
+
+
+def _managed_only_hooks_visible() -> bool:
+    """Detect visible local policy that suppresses user/plugin hooks.
+
+    Cloud/MDM policy is not guaranteed to be readable as a local file, so this
+    check is intentionally narrow and the trust check retains an uncertainty
+    warning even when this returns false.
+    """
+    codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    candidates = [codex_home / "requirements.toml"]
+    if os.name != "nt":
+        candidates.append(Path("/etc/codex/requirements.toml"))
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            data = tomllib.loads(path.read_text())
+        except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError):
+            continue
+        if data.get("allow_managed_hooks_only") is True:
+            return True
+    return False
+
+
+def _check_codex_hook_policy(*, wired: bool) -> dict[str, Any]:
+    if not wired:
+        return {
+            "name": "codex_hook_policy",
+            "status": "skip",
+            "detail": "Codex integration not wired",
+        }
+    enabled = _codex_hooks_feature_enabled()
+    if enabled is False:
+        return {
+            "name": "codex_hook_policy",
+            "status": "fail",
+            "detail": "Codex hooks feature is disabled by effective configuration",
+        }
+    if _managed_only_hooks_visible():
+        return {
+            "name": "codex_hook_policy",
+            "status": "fail",
+            "detail": "visible Codex policy allows managed hooks only; Cairn hooks are skipped",
+        }
+    if enabled is None:
+        return {
+            "name": "codex_hook_policy",
+            "status": "warn",
+            "detail": "could not verify the effective Codex hooks feature state",
+        }
+    return {
+        "name": "codex_hook_policy",
+        "status": "ok",
+        "detail": "Codex hooks feature is enabled",
+    }
+
+
+def _check_codex_hook_trust(*, wired: bool) -> dict[str, Any]:
+    if not wired:
+        return {
+            "name": "codex_hook_trust",
+            "status": "skip",
+            "detail": "Codex integration not wired",
+        }
+    return {
+        "name": "codex_hook_trust",
+        "status": "warn",
+        "detail": (
+            "hook trust is not exposed by the Codex CLI; review the exact Cairn "
+            "definitions with /hooks before relying on capture"
+        ),
+    }
+
+
+def _check_codex_activity(*, wired: bool) -> dict[str, Any]:
+    """Report local, non-secret proof of successful hook-to-bridge activity."""
+    if not wired:
+        return {
+            "name": "codex_hook_activity",
+            "status": "skip",
+            "detail": "Codex integration not wired",
+        }
+    cfg = resolve_config()
+    base = Path(cfg.state_dir)
+    degradation_count = 0
+    try:
+        for path in base.glob("*/degradation.log"):
+            if not path.is_file():
+                continue
+            try:
+                for line in path.read_text().splitlines():
+                    record = json.loads(line)
+                    if isinstance(record, dict) and str(record.get("action", "")).startswith(
+                        "codex:"
+                    ):
+                        degradation_count += 1
+                        break
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                continue
+    except OSError:
+        degradation_count = 0
+    if degradation_count:
+        return {
+            "name": "codex_hook_activity",
+            "status": "fail",
+            "detail": f"{degradation_count} session degradation log(s) require review",
+        }
+
+    marker = base / "codex-health.json"
+    if not marker.is_file():
+        return {
+            "name": "codex_hook_activity",
+            "status": "warn",
+            "detail": "wired but no successful Codex hook activity has been observed locally",
+        }
+    try:
+        payload = json.loads(marker.read_text())
+        timestamp = payload.get("last_success_at")
+        event = payload.get("event")
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return {
+            "name": "codex_hook_activity",
+            "status": "warn",
+            "detail": "Codex activity marker is unreadable",
+        }
+    if not isinstance(timestamp, str) or not isinstance(event, str):
+        return {
+            "name": "codex_hook_activity",
+            "status": "warn",
+            "detail": "Codex activity marker is malformed",
+        }
+    return {
+        "name": "codex_hook_activity",
+        "status": "ok",
+        "detail": f"successful {event} bridge activity observed at {timestamp}",
+    }
+
+
+def _check_bridge() -> dict[str, Any]:
     bridge = shutil.which("cairn-bridge")
     if bridge:
         return {"name": "bridge", "status": "ok", "detail": f"cairn-bridge at {bridge}"}
     return {
         "name": "bridge",
         "status": "warn",
-        "detail": "cairn-bridge not on PATH (hooks use python3 -m cairn._claude_hook)",
+        "detail": "cairn-bridge not on PATH (hooks use python3 -m cairn hook modules)",
     }
 
 
@@ -339,11 +652,17 @@ def run_doctor(*, json_output: bool = False) -> int:
     cfg = resolve_config()
 
     regista_check, newest_event_ts = _check_regista(cfg)
+    codex_wired = _check_codex_harness_wired(cfg)
+    codex_active = codex_wired["status"] in {"ok", "warn"}
     checks = [
         _check_config(cfg),
         _check_key_file(cfg),
         regista_check,
-        _check_harness_wired(cfg),
+        _check_harness_wired(cfg, required=not codex_active),
+        codex_wired,
+        _check_codex_hook_policy(wired=codex_active),
+        _check_codex_hook_trust(wired=codex_active),
+        _check_codex_activity(wired=codex_active),
         _check_bridge(),
         _check_content_encryption(cfg),
         _check_attestation_freshness(

@@ -11,13 +11,19 @@ import pytest
 from cairn._config import CairnEnvConfig, resolve_config
 from cairn._doctor import run_doctor
 from cairn._install import (
+    ConfigLoadError,
     InstallResult,
     InstallStatus,
+    _compute_entry_hash,
     _detect_harness_version,
     _install_claude,
+    _install_codex,
     _install_hermes,
     _is_cairn_hook_entry,
+    _load_json,
+    _load_manifest,
     _uninstall_claude,
+    _uninstall_codex,
     format_results_human,
     run_install_harness,
 )
@@ -51,6 +57,8 @@ def _isolate_settings(monkeypatch, tmp_path):
     monkeypatch.setenv("CAIRN_OPENCODE_CONFIG", str(tmp_path / "opencode.json"))
     # Isolate Codex hooks.json so tests never touch the host's real ~/.codex.
     monkeypatch.setenv("CAIRN_CODEX_HOOKS", str(tmp_path / "codex" / "hooks.json"))
+    # Isolate the manifest so tests never touch the host's real ~/.cairn.
+    monkeypatch.setenv("CAIRN_MANIFEST_PATH", str(tmp_path / "manifest.json"))
     monkeypatch.delenv("CODEX_HOME", raising=False)
 
 
@@ -178,7 +186,7 @@ def test_uninstall_claude_noop_on_clean(cfg, claude_settings):
 
 
 # ----------------------------------------------------------------------
-# _is_cairn_hook_entry
+# _is_cairn_hook_entry — hash-based ownership (Plan 011 WI-3.1)
 # ----------------------------------------------------------------------
 
 
@@ -189,22 +197,60 @@ def test_is_cairn_hook_entry_detects_module():
             {"type": "command", "command": "python3 -m cairn._claude_hook pre"}
         ],
     }
-    assert _is_cairn_hook_entry(entry)
+    assert _is_cairn_hook_entry(entry, harness="claude", event="PreToolUse")
 
 
 def test_is_cairn_hook_entry_detects_legacy():
+    """Legacy ``cairn_hook.py`` script invocation is detected via the
+    narrow token-based fallback (not the former broad substring match)."""
     entry = {
         "matcher": "*",
         "hooks": [
             {"type": "command", "command": "python3 /path/cairn_hook.py pre"}
         ],
     }
-    assert _is_cairn_hook_entry(entry)
+    assert _is_cairn_hook_entry(entry, harness="claude", event="PreToolUse")
 
 
 def test_is_cairn_hook_entry_rejects_foreign():
     entry = {"matcher": "*", "hooks": [{"type": "command", "command": "echo other-hook"}]}
-    assert not _is_cairn_hook_entry(entry)
+    assert not _is_cairn_hook_entry(entry, harness="claude", event="PreToolUse")
+
+
+def test_is_cairn_hook_entry_rejects_cairn_substring_in_user_cmd():
+    """A user hook that merely references 'cairn' in its command must NOT
+    be identified as cairn-owned (the bug the substring match caused)."""
+    entry = {
+        "matcher": "Bash",
+        "hooks": [
+            {"type": "command", "command": "echo cairn._claude_hook && /bin/false"}
+        ],
+    }
+    assert not _is_cairn_hook_entry(entry, harness="claude", event="PreToolUse")
+
+
+def test_is_cairn_hook_entry_detects_via_manifest():
+    """An entry that doesn't match current commands but is in the manifest
+    is detected (handles version changes)."""
+    entry = {
+        "matcher": "*",
+        "hooks": [
+            {"type": "command", "command": "python3 -m cairn._old_hook pre", "timeout": 10}
+        ],
+    }
+    manifest = {
+        "version": 1,
+        "installs": {
+            "claude": {
+                "hook_hashes": {
+                    "PreToolUse": [_compute_entry_hash(entry)]
+                }
+            }
+        },
+    }
+    assert _is_cairn_hook_entry(
+        entry, harness="claude", event="PreToolUse", manifest=manifest
+    )
 
 
 # ----------------------------------------------------------------------
@@ -454,6 +500,125 @@ def test_install_harness_codex_cli_exits_zero_and_wires(cfg, monkeypatch):
     payload = json.loads(result.output)
     assert payload[0]["harness"] == "codex"
     assert payload[0]["status"] == "installed"
+
+
+def test_codex_doctor_validates_direct_wiring(cfg, monkeypatch):
+    from cairn._doctor import _check_codex_harness_wired
+
+    _install_codex(cfg, dry_run=False, uninstall=False, user=None)
+    monkeypatch.setattr("cairn._doctor._codex_plugin_state", lambda: ("absent", None))
+
+    check = _check_codex_harness_wired(cfg)
+
+    assert check["status"] == "ok"
+    assert "direct Codex hooks" in check["detail"]
+
+
+def test_codex_doctor_rejects_duplicate_direct_and_plugin_wiring(cfg, monkeypatch):
+    from cairn._doctor import _check_codex_harness_wired
+
+    _install_codex(cfg, dry_run=False, uninstall=False, user=None)
+    monkeypatch.setattr(
+        "cairn._doctor._codex_plugin_state", lambda: ("enabled", "0.1.0")
+    )
+
+    check = _check_codex_harness_wired(cfg)
+
+    assert check["status"] == "fail"
+    assert "duplicate attestations" in check["detail"]
+
+
+def test_codex_doctor_plugin_ignores_unrelated_direct_hooks(cfg, monkeypatch, tmp_path):
+    from cairn._doctor import _check_codex_harness_wired
+    from cairn._install import _codex_hooks_path
+
+    hooks_file = _codex_hooks_path()
+    hooks_file.parent.mkdir(parents=True)
+    hooks_file.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{"type": "command", "command": "./my-policy"}],
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "cairn._doctor._codex_plugin_state", lambda: ("enabled", "0.1.0")
+    )
+
+    check = _check_codex_harness_wired(cfg)
+
+    assert check["status"] == "ok"
+    assert "plugin" in check["detail"]
+
+
+def test_codex_doctor_fails_closed_when_selected_but_unwired(monkeypatch):
+    from cairn._doctor import _check_codex_harness_wired
+
+    selected = CairnEnvConfig(harness_name="codex")
+    monkeypatch.setattr("cairn._doctor._codex_plugin_state", lambda: ("absent", None))
+
+    check = _check_codex_harness_wired(selected)
+
+    assert check["status"] == "fail"
+    assert "neither direct" in check["detail"]
+
+
+def test_codex_doctor_never_claims_machine_readable_hook_trust() -> None:
+    from cairn._doctor import _check_codex_hook_trust
+
+    check = _check_codex_hook_trust(wired=True)
+
+    assert check["status"] == "warn"
+    assert "/hooks" in check["detail"]
+    assert "not exposed" in check["detail"]
+
+
+def test_codex_doctor_reports_disabled_hooks_feature(monkeypatch) -> None:
+    from cairn._doctor import _check_codex_hook_policy
+
+    monkeypatch.setattr("cairn._doctor._codex_hooks_feature_enabled", lambda: False)
+    monkeypatch.setattr("cairn._doctor._managed_only_hooks_visible", lambda: False)
+
+    check = _check_codex_hook_policy(wired=True)
+
+    assert check["status"] == "fail"
+    assert "disabled" in check["detail"]
+
+
+def test_codex_doctor_activity_uses_digest_only_marker(monkeypatch, tmp_path):
+    from cairn._codex_hook import _record_activity
+    from cairn._doctor import _check_codex_activity
+
+    monkeypatch.setenv("CAIRN_STATE_DIR", str(tmp_path / "state"))
+    _record_activity("secret-session-id", "SessionStart")
+
+    marker_text = (tmp_path / "state" / "codex-health.json").read_text()
+    check = _check_codex_activity(wired=True)
+
+    assert "secret-session-id" not in marker_text
+    assert check["status"] == "ok"
+    assert "SessionStart" in check["detail"]
+
+
+def test_codex_doctor_activity_fails_on_degradation(monkeypatch, tmp_path):
+    from cairn._claude_hook import _mark_degraded
+    from cairn._doctor import _check_codex_activity
+
+    state = tmp_path / "state"
+    monkeypatch.setenv("CAIRN_STATE_DIR", str(state))
+    _mark_degraded("session-digest", "codex:post", "bridge failure")
+
+    check = _check_codex_activity(wired=True)
+
+    assert check["status"] == "fail"
+    assert "degradation" in check["detail"]
 
 
 # ----------------------------------------------------------------------
@@ -764,3 +929,413 @@ def test_install_wires_subagent_and_compact_hooks(tmp_path, monkeypatch):
     assert HOOK_EVENTS["SubagentStop"] == "subagent-stop"
     assert HOOK_EVENTS["PostCompact"] == "post-compact"
     assert "PostToolBatch" not in HOOK_EVENTS
+
+
+# ----------------------------------------------------------------------
+# ConfigLoadError — refuse to clobber unreadable/invalid JSON
+# ----------------------------------------------------------------------
+
+
+def test_load_json_returns_empty_for_missing_file(tmp_path: Path):
+    assert _load_json(tmp_path / "nonexistent.json") == {}
+
+
+def test_load_json_raises_on_invalid_json(tmp_path: Path):
+    path = tmp_path / "bad.json"
+    path.write_text("{not valid json")
+    with pytest.raises(ConfigLoadError, match="invalid JSON"):
+        _load_json(path)
+
+
+def test_load_json_raises_on_non_dict_json(tmp_path: Path):
+    path = tmp_path / "list.json"
+    path.write_text("[1, 2, 3]")
+    with pytest.raises(ConfigLoadError, match="expected JSON object"):
+        _load_json(path)
+
+
+def test_install_claude_fails_on_invalid_json(cfg, claude_settings):
+    """Install must NOT clobber a file with invalid JSON."""
+    original_content = "{broken"
+    claude_settings.write_text(original_content)
+
+    result = _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+
+    assert result.status is InstallStatus.FAILED
+    # File must be unchanged.
+    assert claude_settings.read_text() == original_content
+
+
+def test_install_codex_fails_on_invalid_json(cfg, tmp_path):
+    """Codex install must NOT clobber a file with invalid JSON."""
+    from cairn._install import _codex_hooks_path
+
+    hooks_file = _codex_hooks_path()
+    hooks_file.parent.mkdir(parents=True, exist_ok=True)
+    original_content = "{broken"
+    hooks_file.write_text(original_content)
+
+    result = _install_codex(cfg, dry_run=False, uninstall=False, user=None)
+
+    assert result.status is InstallStatus.FAILED
+    assert hooks_file.read_text() == original_content
+
+
+def test_install_claude_uninstall_fails_on_invalid_json(cfg, claude_settings):
+    """Uninstall must also refuse to touch an unreadable config."""
+    original_content = "{broken"
+    claude_settings.write_text(original_content)
+
+    result = _install_claude(cfg, dry_run=False, uninstall=True, user=None)
+
+    assert result.status is InstallStatus.FAILED
+    assert claude_settings.read_text() == original_content
+
+
+# ----------------------------------------------------------------------
+# Manifest — hash-based ownership (Plan 011 WI-3.1)
+# ----------------------------------------------------------------------
+
+
+def test_manifest_records_installed_hooks(cfg, claude_settings):
+    """After install, the manifest contains hashes for every hook event."""
+    _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+
+    manifest = _load_manifest()
+    claude_install = manifest["installs"]["claude"]
+    hook_hashes = claude_install["hook_hashes"]
+    for event in [
+        "PreToolUse", "PostToolUse", "SessionStart", "SessionEnd",
+        "Stop", "PostToolUseFailure", "MessageDisplay",
+        "SubagentStart", "SubagentStop", "PostCompact",
+    ]:
+        assert event in hook_hashes
+        assert len(hook_hashes[event]) == 1
+        assert hook_hashes[event][0].startswith("sha256:")
+
+
+def test_uninstall_via_manifest_removes_hook_after_command_change(
+    cfg, claude_settings, monkeypatch
+):
+    """When cairn's command format changes between versions, uninstall
+    still removes old hooks via the manifest — the old entry's hash is
+    in the manifest even though the current expected entry differs."""
+    _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+
+    # Simulate a version change: cairn now generates a different command.
+    monkeypatch.setattr("cairn._install.CAIRN_HOOK_COMMAND", "python3 -m cairn._new_hook")
+
+    # Uninstall should still find and remove the old hooks via the manifest.
+    result = _install_claude(cfg, dry_run=False, uninstall=True, user=None)
+
+    assert not result.no_op
+    data = json.loads(claude_settings.read_text()) if claude_settings.exists() else {}
+    assert "hooks" not in data or not data.get("hooks")
+
+
+def test_uninstall_preserves_hook_with_cairn_substring(cfg, claude_settings):
+    """A user-authored hook that merely references 'cairn' in its command
+    must survive uninstall (the substring match bug)."""
+    user_hook = {
+        "matcher": "Bash",
+        "hooks": [
+            {
+                "type": "command",
+                "command": "echo cairn._claude_hook && /bin/true",
+                "timeout": 5,
+            }
+        ],
+    }
+    existing = {"hooks": {"PreToolUse": [user_hook]}}
+    claude_settings.write_text(json.dumps(existing))
+
+    result = _uninstall_claude(
+        claude_settings, json.loads(claude_settings.read_text()),
+        dry_run=False, result=InstallResult(harness="claude"),
+    )
+    assert result.no_op  # nothing to remove — user hook is not cairn-owned
+
+    data = json.loads(claude_settings.read_text())
+    pre_hooks = data.get("hooks", {}).get("PreToolUse", [])
+    assert len(pre_hooks) == 1
+    assert pre_hooks[0]["hooks"][0]["command"] == "echo cairn._claude_hook && /bin/true"
+
+
+def test_uninstall_codex_preserves_hook_with_cairn_substring(cfg, tmp_path):
+    """Same substring safety for Codex hooks."""
+    hooks_file = _codex_hooks_file(tmp_path)
+    hooks_file.parent.mkdir(parents=True)
+    user_hook = {
+        "matcher": "Bash",
+        "hooks": [
+            {
+                "type": "command",
+                "command": "echo cairn._codex_hook && /bin/true",
+                "timeout": 5,
+            }
+        ],
+    }
+    hooks_file.write_text(json.dumps({"hooks": {"PreToolUse": [user_hook]}}))
+
+    result = _uninstall_codex(
+        hooks_file, json.loads(hooks_file.read_text()),
+        dry_run=False, result=InstallResult(harness="codex"),
+    )
+    assert result.no_op
+
+    data = json.loads(hooks_file.read_text())
+    pre_hooks = data.get("hooks", {}).get("PreToolUse", [])
+    assert len(pre_hooks) == 1
+    assert "echo cairn._codex_hook" in pre_hooks[0]["hooks"][0]["command"]
+
+
+# ----------------------------------------------------------------------
+# Adversarial review round 1 hardening
+# ----------------------------------------------------------------------
+
+
+def test_load_manifest_treats_corrupt_installs_as_empty(tmp_path, monkeypatch):
+    """A manifest with a non-dict 'installs' must be reset, not crash."""
+    manifest_path = tmp_path / "manifest.json"
+    monkeypatch.setenv("CAIRN_MANIFEST_PATH", str(manifest_path))
+    manifest_path.write_text(json.dumps({"version": 1, "installs": "corrupt"}))
+
+    manifest = _load_manifest()
+    assert manifest == {"version": 1, "installs": {}}
+
+
+def test_is_cairn_hook_entry_rejects_evil_cairn_hook_py():
+    """A user script named evil_cairn_hook.py must NOT be detected as
+    cairn-owned (the former endswith fallback was too broad)."""
+    entry = {
+        "matcher": "*",
+        "hooks": [
+            {"type": "command", "command": "python3 /home/user/evil_cairn_hook.py pre"}
+        ],
+    }
+    assert not _is_cairn_hook_entry(entry, harness="claude", event="PreToolUse")
+
+
+def test_is_cairn_hook_entry_returns_false_for_non_dict():
+    """Defense-in-depth: non-dict entries don't crash."""
+    assert not _is_cairn_hook_entry("not-a-dict", harness="claude", event="PreToolUse")  # type: ignore[arg-type]
+    assert not _is_cairn_hook_entry(None, harness="claude", event="PreToolUse")  # type: ignore[arg-type]
+
+
+def test_install_claude_handles_non_dict_hook_entries(cfg, claude_settings):
+    """Claude install must not crash on malformed hook entries (non-dict)."""
+    existing = {"hooks": {"PreToolUse": ["not-a-dict", 42]}}
+    claude_settings.write_text(json.dumps(existing))
+
+    result = _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+
+    assert result.status is InstallStatus.INSTALLED
+    data = json.loads(claude_settings.read_text())
+    pre_hooks = data["hooks"]["PreToolUse"]
+    # Non-dict entries preserved, cairn hook appended.
+    assert "not-a-dict" in pre_hooks
+    assert any(
+        isinstance(e, dict) and _is_cairn_hook_entry(e, harness="claude", event="PreToolUse")
+        for e in pre_hooks
+    )
+
+
+def test_install_claude_coerces_non_dict_env_and_hooks(cfg, claude_settings):
+    """Claude install must not crash when env/hooks are wrong type."""
+    existing = {"env": "not-a-dict", "hooks": "also-not-a-dict"}
+    claude_settings.write_text(json.dumps(existing))
+
+    result = _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+
+    assert result.status is InstallStatus.INSTALLED
+    data = json.loads(claude_settings.read_text())
+    assert isinstance(data["env"], dict)
+    assert isinstance(data["hooks"], dict)
+    assert "REGISTA_DSN" in data["env"]
+
+
+def test_install_opencode_fails_on_invalid_json(cfg, tmp_path, monkeypatch):
+    """OpenCode install must NOT clobber a file with invalid JSON."""
+    from cairn._install import _install_opencode
+
+    path = tmp_path / "opencode.json"
+    monkeypatch.setenv("CAIRN_OPENCODE_CONFIG", str(path))
+    original_content = "{broken"
+    path.write_text(original_content)
+
+    result = _install_opencode(cfg, dry_run=False, uninstall=False, user=None)
+
+    assert result.status is InstallStatus.FAILED
+    assert path.read_text() == original_content
+
+
+# ----------------------------------------------------------------------
+# Adversarial review round 2 hardening
+# ----------------------------------------------------------------------
+
+
+def test_install_claude_coerces_non_list_event_hooks(cfg, claude_settings):
+    """Claude install must not crash when event hook list is wrong type."""
+    existing = {"hooks": {"PreToolUse": "not-a-list"}}
+    claude_settings.write_text(json.dumps(existing))
+
+    result = _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+
+    assert result.status is InstallStatus.INSTALLED
+    data = json.loads(claude_settings.read_text())
+    assert isinstance(data["hooks"]["PreToolUse"], list)
+
+
+def test_uninstall_claude_handles_non_dict_hooks_and_env(cfg, claude_settings):
+    """Claude uninstall must not crash on non-dict hooks/env."""
+    existing = {"hooks": "not-a-dict", "env": "also-not-a-dict"}
+    claude_settings.write_text(json.dumps(existing))
+
+    result = _uninstall_claude(
+        claude_settings, json.loads(claude_settings.read_text()),
+        dry_run=False, result=InstallResult(harness="claude"),
+    )
+
+    assert result.no_op  # nothing to remove in malformed config
+
+
+def test_install_opencode_coerces_non_dict_env(cfg, tmp_path, monkeypatch):
+    """OpenCode install must not crash when env is wrong type."""
+    from cairn._install import _install_opencode
+
+    path = tmp_path / "opencode.json"
+    monkeypatch.setenv("CAIRN_OPENCODE_CONFIG", str(path))
+    path.write_text(json.dumps({"env": "not-a-dict"}))
+
+    result = _install_opencode(cfg, dry_run=False, uninstall=False, user=None)
+
+    assert result.status is InstallStatus.INSTALLED
+    data = json.loads(path.read_text())
+    assert isinstance(data["env"], dict)
+    assert "REGISTA_DSN" in data["env"]
+
+
+def test_load_manifest_validates_per_harness_structure(tmp_path, monkeypatch):
+    """A manifest with a non-dict per-harness value is cleaned up, not crashed."""
+    manifest_path = tmp_path / "manifest.json"
+    monkeypatch.setenv("CAIRN_MANIFEST_PATH", str(manifest_path))
+    manifest_path.write_text(json.dumps({
+        "version": 1,
+        "installs": {
+            "claude": "corrupt",
+            "codex": {"hook_hashes": "also-corrupt"},
+        }
+    }))
+
+    manifest = _load_manifest()
+    assert "claude" not in manifest["installs"]
+    assert manifest["installs"]["codex"]["hook_hashes"] == {}
+
+
+def test_doctor_handles_non_dict_hooks(monkeypatch, tmp_path):
+    """Doctor must not crash on non-dict hooks in settings.json."""
+    monkeypatch.setenv("CAIRN_CLAUDE_SETTINGS", str(tmp_path / "claude.json"))
+    settings_path = tmp_path / "claude.json"
+    settings_path.write_text(json.dumps({"hooks": "not-a-dict", "env": "also-not"}))
+    monkeypatch.setattr(
+        "cairn._doctor.resolve_config",
+        lambda: CairnEnvConfig(dsn=None, key_path=None, project=None),
+    )
+
+    exit_code = run_doctor(json_output=True)
+    assert exit_code == 1  # fails because config is not set up, but doesn't crash
+
+
+def test_load_manifest_cleans_non_list_hook_hashes_event(tmp_path, monkeypatch):
+    """A manifest with a non-list hook_hashes[event] value is cleaned up."""
+    manifest_path = tmp_path / "manifest.json"
+    monkeypatch.setenv("CAIRN_MANIFEST_PATH", str(manifest_path))
+    manifest_path.write_text(json.dumps({
+        "version": 1,
+        "installs": {
+            "claude": {
+                "hook_hashes": {"PreToolUse": "not-a-list"}
+            }
+        }
+    }))
+
+    manifest = _load_manifest()
+    hh = manifest["installs"]["claude"]["hook_hashes"]
+    assert "PreToolUse" not in hh
+
+
+def test_save_json_sets_restrictive_permissions(tmp_path):
+    """_save_json creates files with 0o600 permissions."""
+    import stat
+
+    from cairn._install import _save_json
+
+    path = tmp_path / "test.json"
+    _save_json(path, {"key": "value"})
+    mode = stat.S_IMODE(path.stat().st_mode)
+    assert mode == 0o600
+
+
+def test_save_json_preserves_restrictive_permissions_on_overwrite(tmp_path):
+    """_save_json maintains 0o600 on every write, not just new files."""
+    import stat
+
+    from cairn._install import _save_json
+
+    path = tmp_path / "test.json"
+    _save_json(path, {"key": "value1"})
+    _save_json(path, {"key": "value2"})
+    mode = stat.S_IMODE(path.stat().st_mode)
+    assert mode == 0o600
+
+
+# ----------------------------------------------------------------------
+# Adversarial review round 5 hardening
+# ----------------------------------------------------------------------
+
+
+def test_load_json_raises_on_non_utf8_file(tmp_path):
+    """Binary/non-UTF-8 config files must raise ConfigLoadError, not crash."""
+    path = tmp_path / "bad.json"
+    path.write_bytes(b"\xff\xfe{not valid")
+    with pytest.raises(ConfigLoadError, match="unreadable"):
+        _load_json(path)
+
+
+def test_is_cairn_hook_entry_handles_malformed_hooks_field():
+    """Entries with non-list hooks or non-dict hook items don't crash."""
+    assert not _is_cairn_hook_entry(
+        {"hooks": "not-a-list"}, harness="claude", event="PreToolUse"
+    )
+    assert not _is_cairn_hook_entry(
+        {"hooks": None}, harness="claude", event="PreToolUse"
+    )
+    assert not _is_cairn_hook_entry(
+        {"hooks": [None, "string", 42]}, harness="claude", event="PreToolUse"
+    )
+
+
+def test_load_manifest_normalizes_null_hook_hashes(tmp_path, monkeypatch):
+    """A manifest with hook_hashes: null is normalized, not crashed."""
+    manifest_path = tmp_path / "manifest.json"
+    monkeypatch.setenv("CAIRN_MANIFEST_PATH", str(manifest_path))
+    manifest_path.write_text(json.dumps({
+        "version": 1,
+        "installs": {"claude": {"hook_hashes": None}}
+    }))
+
+    manifest = _load_manifest()
+    assert manifest["installs"]["claude"]["hook_hashes"] == {}
+
+
+def test_parse_env_file_handles_unreadable_file(tmp_path):
+    """Hermes .env read failures are swallowed, not crashed."""
+    from cairn._install import _parse_env_file
+
+    path = tmp_path / "unreadable.env"
+    path.write_text("KEY=val\n")
+    path.chmod(0o000)
+    try:
+        assert _parse_env_file(path) == []
+    finally:
+        path.chmod(0o600)
