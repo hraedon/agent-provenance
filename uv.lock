@@ -71,7 +71,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
-    { name = "regista" },
+    { name = "regista-hraedon" },
     { name = "rfc8785" },
     { name = "structlog" },
 ]
@@ -96,7 +96,7 @@ requires-dist = [
     { name = "pynacl", marker = "extra == 'dev'", specifier = ">=1.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
-    { name = "regista", editable = "../regista" },
+    { name = "regista-hraedon", editable = "../regista" },
     { name = "rfc8785", specifier = ">=0.1.4" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "structlog", specifier = ">=24.1" },
@@ -821,7 +821,7 @@ wheels = [
 ]
 
 [[package]]
-name = "regista"
+name = "regista-hraedon"
 version = "0.5.1"
 source = { editable = "../regista" }
 dependencies = [
