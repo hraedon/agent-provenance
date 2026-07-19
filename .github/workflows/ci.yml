@@ -23,7 +23,12 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: |
+          # regista is a public sibling repo, not on PyPI — install from git
+          # before the editable install so cairn's regista>=0.5.1,<0.6 pin can
+          # resolve. Matches the agent-notes/dossier CI pattern.
+          pip install "regista @ git+https://github.com/hraedon/regista.git@main"
+          pip install -e ".[dev]"
 
       # Denylist is never committed — it comes from the CAIRN_FORBIDDEN_IDENTIFIERS
       # repository secret (gpo-lens pattern). No-op until the secret is set.
