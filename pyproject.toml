@@ -20,17 +20,18 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "regista>=0.5.1,<0.6",
+    "regista-hraedon>=0.5.1,<0.6",
     "rfc8785>=0.1.4",
     "structlog>=24.1",
     "click>=8.1",
 ]
 
 [tool.uv.sources]
-# The required Regista 0.5.1 public facade is currently available from the
-# suite sibling checkout but not yet from a published index/tag. Replace this
-# development override with a pinned published source once that facade lands.
-regista = { path = "../regista", editable = true }
+# regista-hraedon is published on PyPI (distribution renamed from `regista`;
+# the import name is still `regista`). This editable mapping overrides the
+# published wheel with the local sibling checkout so `uv lock` / `uv run`
+# resolve against the working tree during development.
+regista-hraedon = { path = "../regista", editable = true }
 
 [project.optional-dependencies]
 dev = [
