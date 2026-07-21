@@ -12,6 +12,11 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      matrix:
+        # 3.13/3.14 per the suite Python-version policy (was 3.11 — the B3 audit
+        # flagged the drift). The conformance kit also requires py>=3.12.
+        python-version: ["3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v5
@@ -19,7 +24,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
 
       - name: Install dependencies
@@ -27,8 +32,9 @@ jobs:
           # regista-hraedon is published on PyPI (renamed distribution; the
           # import name is still `regista`). Install before the editable
           # install so cairn's regista-hraedon>=0.5.1,<0.6 pin can resolve.
-          # Matches the agent-notes/dossier CI pattern.
-          pip install "regista-hraedon==0.5.1"
+          # Pinned to 0.5.3 to match SUITE.lock (the B3 audit flagged the 0.5.1
+          # drift). Matches the agent-notes/dossier CI pattern.
+          pip install "regista-hraedon==0.5.3"
           pip install -e ".[dev]"
 
       # Denylist is never committed — it comes from the CAIRN_FORBIDDEN_IDENTIFIERS

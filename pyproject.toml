@@ -42,10 +42,14 @@ dev = [
     "asn1crypto>=1.5",
     "pynacl>=1.5",
     "cryptography>=42.0",
+    # CLI contract v1 conformance kit (Plan 018 WI-2 / Plan 019 B1). A published
+    # PyPI wheel (requires py>=3.12, so CI runs 3.13/3.14); consumed only by
+    # tests/test_cli_conformance.py, never imported by runtime code.
+    "agent-suite-conformance==1.0.0",
 ]
 
 [project.scripts]
-cairn = "cairn._cli:main"
+cairn = "cairn._cli:cli_entry"
 cairn-bridge = "cairn._bridge:main"
 
 [tool.hatch.build.targets.wheel]
