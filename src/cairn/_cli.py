@@ -54,7 +54,16 @@ def _load_key_set(keys_path: Path) -> dict[str, bytes]:
     (``public_key`` field for verification, ``secret`` for signing).
     For Ed25519 verification, only the public key is needed.
     """
-    key_data = json.loads(keys_path.read_text())
+    try:
+        key_data = json.loads(keys_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        # Match the sibling loaders (_load_witness_keys / _read_previous_bundle
+        # _hash): a malformed key file is an operational error, not a traceback.
+        raise click.ClickException(f"Cannot read key file {keys_path}: {exc}")
+    if not isinstance(key_data, dict) or not isinstance(key_data.get("keys"), list):
+        raise click.ClickException(
+            f"Key file {keys_path} must be a JSON object with a 'keys' array"
+        )
     key_set: dict[str, bytes] = {}
     for entry in key_data["keys"]:
         key_id: str = entry["key_id"]
@@ -915,5 +924,110 @@ def portal(
         click.echo(result, nl=False)
 
 
+def emit_error(
+    code: str,
+    message: str,
+    *,
+    use_json: bool,
+    detail: str | None = None,
+    retryable: bool = False,
+    exit_code: int = 1,
+) -> int:
+    """Report an operational error per suite CLI contract v1 §3 and return the code.
+
+    Under a JSON request the common error envelope is the single stdout
+    document; otherwise the human ``Error:`` message goes to *stderr* (click's
+    convention). No path prints an error and exits 0. The envelope shape is
+    validated by ``agent_suite.conformance`` in the tests; it is reproduced here
+    so runtime code never imports the dev-only kit.
+    """
+    if use_json:
+        click.echo(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": code,
+                        "message": message,
+                        "detail": detail,
+                        "retryable": retryable,
+                        "partial": None,
+                    },
+                },
+                indent=2,
+            )
+        )
+    else:
+        click.echo(f"Error: {message}", err=True)
+        if detail:
+            click.echo(f"  {detail}", err=True)
+    return exit_code
+
+
+def _wants_json(argv: list[str]) -> bool:
+    """Whether the invocation asked for JSON output.
+
+    cairn's JSON convention is mixed: harness/doctor verbs take a ``--json``
+    flag, the report verbs take ``--format json``. The error boundary honours
+    both so a --json-shaped failure lands the envelope on stdout, not stderr.
+    """
+    if "--json" in argv or "--format=json" in argv:
+        return True
+    for i in range(len(argv) - 1):
+        if argv[i] == "--format" and argv[i + 1] == "json":
+            return True
+    return False
+
+
+def cli_entry() -> int:
+    """Console-script entry point and last-resort error boundary (contract §3/§4).
+
+    Runs the click group with ``standalone_mode=False`` so this wrapper owns the
+    exit taxonomy instead of click's ``sys.exit``:
+
+    - usage errors (``UsageError`` and its subclasses, incl. ``BadParameter``)
+      keep click's exit 2 and human message on stderr;
+    - an operational ``ClickException`` becomes a ``CAIRN_ERROR`` envelope;
+    - any other uncaught exception becomes ``INTERNAL_ERROR`` instead of a
+      traceback (§4);
+    - a command that called ``sys.exit(n)`` directly keeps its code (so
+      ``install-harness --dry-run`` = 2 and ``doctor``'s verdict codes survive);
+    - a closed downstream pipe is swallowed the CPython way (§4).
+    """
+    argv = sys.argv[1:]
+    json_mode = _wants_json(argv)
+    try:
+        result = main.main(args=argv, standalone_mode=False)
+        # standalone_mode=False returns the command's value (None) or, for the
+        # eager --version/--help path, click's Exit code as an int.
+        return result if isinstance(result, int) else 0
+    except click.UsageError as exc:
+        exc.show()
+        return exc.exit_code if isinstance(exc.exit_code, int) else 2
+    except click.ClickException as exc:
+        return emit_error("CAIRN_ERROR", exc.format_message(), use_json=json_mode)
+    except click.exceptions.Abort:
+        click.echo("Aborted!", err=True)
+        return 1
+    except BrokenPipeError:
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except (OSError, ValueError):
+            pass
+        return 1
+    except SystemExit as exc:
+        code = exc.code
+        if isinstance(code, int):
+            return code
+        return 0 if code is None else 1
+    except Exception as exc:  # last-resort boundary: never surface a traceback
+        return emit_error(
+            "INTERNAL_ERROR",
+            f"unexpected {type(exc).__name__}: {exc}",
+            use_json=json_mode,
+        )
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(cli_entry())
