@@ -45,6 +45,21 @@ This project is part of a constellation:
 - **MIT license, single-person OSS posture.** See README §8. Architectural
   choices should not encode a hypothetical commercial future.
 
+## Build / test / lint
+
+```bash
+make dev            # install deps against the SUITE.lock-locked substrate (Plan 019 B2)
+make test           # pytest (Postgres-dependent tests skip without a DSN)
+make lint           # ruff check src tests
+make typecheck      # mypy src
+```
+
+**Develop against the locked substrate.** `SUITE.lock` is the single source of
+truth for *what to develop against*: `make dev` (and CI) install regista at the
+released version it pins, not `main`/an editable checkout, so integration skew
+surfaces before interop time. For deliberate cross-member work, set
+`DEV_AGAINST=main|<ref>|sibling`. See `docs/develop-against-lock.md`.
+
 ## Work tracking (issues)
 
 Work-items for this project live in **regista** — the single source of truth. regista is the authoritative, signed, hash-chained event log; the local agent-notes store is a read projection of it. **Do not create physical breadcrumb files** (`breadcrumbs/`, `*.breadcrumb.md`) — those are retired. (This also retires the old `mcp__breadcrumb__file_breadcrumb` MCP tool and the `breadcrumbs_dir`/`/tmp/active/` projection expectation — file via the CLI instead.)
