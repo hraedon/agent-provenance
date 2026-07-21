@@ -1,24 +1,50 @@
-# SUITE.lock — the known-good version matrix for the agent-provenance
-# (cairn) deployment.  The suite install reads this file to pin regista
-# to a verified-good SHA so that a fresh sanctioned machine ends with
-# attestation-on across the chosen harness(es) (Plan 008 WI-3.2).
+# SUITE.lock — cairn (agent-provenance) face compatibility manifest.
 #
-# Update the regista.ref and pyproject.toml together.
+# Records the exact released version of the suite spine (regista) this release
+# of cairn was tested against. A suite release is green when every component's
+# SUITE.lock agrees with the umbrella agent-suite/SUITE.lock.
+#
+# This is the in-repo *single source of truth for what to develop against*
+# (Plan 019 B2). It must AGREE with the umbrella agent-suite/SUITE.lock
+# ([components.regista] version + revision there); the umbrella is the generated
+# authority and this face-local copy is vendored so cairn dev + CI resolve the
+# spine WITHOUT cloning agent-suite. `scripts/dev-install.py` reads
+# `[spine].version` and installs `regista-hraedon==<version>` from PyPI by
+# default; `scripts/suite_lock.py` is the resolver. See docs/develop-against-lock.md.
+#
+# Regista is published to PyPI as `regista-hraedon` (import name stays `regista`).
+# The pinned SHA/`describe` still records the exact commit for the local sibling
+# workflow (`DEV_AGAINST=sibling`).
+#
+# (Shape note: this file was YAML `regista.ref` through Plan 008; Plan 019 B2
+# converts it to the uniform TOML `[spine]` shape the resolver reads directly,
+# and fixes the drift — the old YAML pinned regista `>=0.4.0` / SHA dd22197
+# while CI installed 0.5.3.)
 
-component: cairn
-version: "0.1.0"
-python: ">=3.11"
+[component]
+name = "cairn"
+version = "0.1.0"
 
-regista:
-  ref: dd22197eaafe11afabdae488b6908a5729b3b343
-  source: github.com/hraedon/regista
-  version: ">=0.4.0"
-  # Pin to a commit SHA, never a branch.  cairn and regista are a
-  # known-good pair recorded here.
+[spine]
+name = "regista"
+# PyPI distribution (renamed from `regista`; import name is still `regista`).
+distribution = "regista-hraedon"
+repo = "hraedon/regista"
+# The released PyPI version this cairn release develops + tests against.
+# Must equal agent-suite/SUITE.lock [components.regista].version.
+version = "0.5.3"
+# The git SHA of regista this cairn release was tested against == the umbrella's
+# [components.regista].revision == the v0.5.3 tag commit.
+# Resolve the local sibling with: git -C ../regista checkout <sha>
+sha = "9718b941939884fee94c260f19efe3e4040c456b"
+describe = "v0.5.3"
+# Mirrors the floor declared in pyproject.toml (the published lower bound); the
+# exact version to develop against is `version` above, not this floor.
+pyproject_floor = "regista-hraedon>=0.5.1,<0.6"
 
 # Harness wiring (cairn install-harness):
 #   claude   — ~/.claude/settings.json hooks + env
 #   opencode — ~/.config/opencode/opencode.json plugin + env
 #
-# After install, a new agent session attests by default.  CAIRN_DISABLE
-# is the explicit, audit-visible escape hatch.
+# After install, a new agent session attests by default. CAIRN_DISABLE is the
+# explicit, audit-visible escape hatch.

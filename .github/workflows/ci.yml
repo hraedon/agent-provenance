@@ -27,15 +27,16 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install dependencies
+      - name: Install dependencies (develop-against-lock, Plan 019 B2)
         run: |
-          # regista-hraedon is published on PyPI (renamed distribution; the
-          # import name is still `regista`). Install before the editable
-          # install so cairn's regista-hraedon>=0.5.1,<0.6 pin can resolve.
-          # Pinned to 0.5.3 to match SUITE.lock (the B3 audit flagged the 0.5.1
-          # drift). Matches the agent-notes/dossier CI pattern.
-          pip install "regista-hraedon==0.5.3"
-          pip install -e ".[dev]"
+          # The paved installer reads SUITE.lock [spine].version and installs
+          # regista-hraedon at that locked release from PyPI (today 0.5.3),
+          # then `-e .[dev]`. Same install shape as local `make dev`, so CI and
+          # a developer's machine develop against the same shipped substrate.
+          # No hardcoded version pin here — it would silently drift from
+          # SUITE.lock (the 0.5.1-vs-0.5.3 class the B3 audit flagged).
+          # tests/test_develop_against_lock.py is the mechanical control.
+          python scripts/dev-install.py
 
       # Denylist is never committed — it comes from the CAIRN_FORBIDDEN_IDENTIFIERS
       # repository secret (gpo-lens pattern). No-op until the secret is set.
