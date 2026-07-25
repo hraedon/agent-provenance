@@ -38,7 +38,7 @@ version = "0.5.3"
 # time, NOT the v0.5.3 tag — 0.5.3 has post-tag commits).
 # Resolve the local sibling with: git -C ../regista checkout <sha>
 sha = "44eb8ffdfe49df5ee271a3fc8f09ce5dccd57443"
-describe = "v0.5.3-2-g44eb8ff"
+describe = "v0.5.3"
 # Mirrors the floor declared in pyproject.toml (the published lower bound); the
 # exact version to develop against is `version` above, not this floor.
 pyproject_floor = "regista-hraedon>=0.5.1,<0.6"
