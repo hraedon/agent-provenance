@@ -45,7 +45,7 @@ dev = [
     # CLI contract v1 conformance kit (Plan 018 WI-2 / Plan 019 B1). A published
     # PyPI wheel (requires py>=3.12, so CI runs 3.13/3.14); consumed only by
     # tests/test_cli_conformance.py, never imported by runtime code.
-    "agent-suite-conformance==1.0.0",
+    "agent-suite-conformance==1.0.0; python_version >= '3.12'",
 ]
 
 [project.scripts]

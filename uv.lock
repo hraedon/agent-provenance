@@ -3,7 +3,17 @@ revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.15'",
-    "python_full_version < '3.15'",
+    "python_full_version >= '3.12' and python_full_version < '3.15'",
+    "python_full_version < '3.12'",
+]
+
+[[package]]
+name = "agent-suite-conformance"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b3/5a/657e429bc9398ae41d91646f28c28cf4e49e46f4f9b3ab4ff40bce33d37c/agent_suite_conformance-1.0.0.tar.gz", hash = "sha256:c986cf6bc5dee522319461c1ee056e24008b503517f17795975151b9af8c2be9", size = 6489, upload-time = "2026-07-21T00:09:16.605Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b8/e2/08110f18b265aaa6d6caef582b302b3aa34e92df0aff007a0871446dadc3/agent_suite_conformance-1.0.0-py3-none-any.whl", hash = "sha256:dfacbbadf693ee630a59e982c3fff4ab003f69385a2f8b08aa32e5e2709af71e", size = 6462, upload-time = "2026-07-21T00:09:15.389Z" },
 ]
 
 [[package]]
@@ -78,6 +88,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "agent-suite-conformance", marker = "python_full_version >= '3.12'" },
     { name = "asn1crypto" },
     { name = "cryptography" },
     { name = "mypy" },
@@ -89,6 +100,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "agent-suite-conformance", marker = "python_full_version >= '3.12' and extra == 'dev'", specifier = "==1.0.0" },
     { name = "asn1crypto", marker = "extra == 'dev'", specifier = ">=1.5" },
     { name = "click", specifier = ">=8.1" },
     { name = "cryptography", marker = "extra == 'dev'", specifier = ">=42.0" },
@@ -822,7 +834,7 @@ wheels = [
 
 [[package]]
 name = "regista-hraedon"
-version = "0.5.1"
+version = "0.5.3"
 source = { editable = "../regista" }
 dependencies = [
     { name = "jsonschema" },
@@ -837,6 +849,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "agent-suite-conformance", marker = "python_full_version >= '3.12' and extra == 'dev'", specifier = "==1.0.0" },
     { name = "asn1crypto", marker = "extra == 'timestamping'", specifier = ">=1.5" },
     { name = "azure-identity", marker = "extra == 'azure'", specifier = ">=1.16" },
     { name = "azure-keyvault-secrets", marker = "extra == 'azure'", specifier = ">=4.8" },
