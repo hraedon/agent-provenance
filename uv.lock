@@ -110,7 +110,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "regista-hraedon", editable = "../regista" },
     { name = "rfc8785", specifier = ">=0.1.4" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5,<0.16" },
     { name = "structlog", specifier = ">=24.1" },
 ]
 provides-extras = ["dev"]
@@ -872,7 +872,7 @@ requires-dist = [
     { name = "python-dateutil", specifier = ">=2.9" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "rfc8785", marker = "extra == 'vendor-check'", specifier = "==0.1.4" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5,<0.16" },
     { name = "structlog", specifier = ">=24.1" },
     { name = "types-jsonschema", marker = "extra == 'dev'" },
     { name = "types-python-dateutil", marker = "extra == 'dev'" },

@@ -37,7 +37,7 @@ regista-hraedon = { path = "../regista", editable = true }
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
-    "ruff>=0.5",
+    "ruff>=0.5,<0.16",
     "mypy>=1.10",
     "asn1crypto>=1.5",
     "pynacl>=1.5",
