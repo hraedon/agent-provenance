@@ -71,15 +71,12 @@ jobs:
         run: bun test
         working-directory: integrations/opencode
 
-  # The lock is only a lock if something checks it. regista and agent-wake both
-  # shipped a uv.lock that had silently stopped matching pyproject.toml — CI
-  # installs unlocked, so nothing noticed until `uv run` failed on a clean
-  # checkout. This job is the whole fix: it resolves, it does not install.
-  lockfile:
-    name: Lockfile is current
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
-      - name: Verify uv.lock agrees with pyproject.toml
-        run: uv lock --check
+
+  # NOTE — deliberately no `uv lock --check` job here, unlike the rest of the
+  # suite. This repo's [tool.uv.sources] maps regista-hraedon to an editable
+  # ../regista sibling checkout for local development, so the committed
+  # uv.lock records `editable = "../regista"` — a path that does not exist in
+  # CI. `uv lock --check` therefore fails with "Distribution not found"
+  # regardless of whether the lock is actually current. The lock here is a
+  # developer convenience, not a reproducible CI input; CI resolves through
+  # scripts/dev-install.py against the SUITE.lock-pinned version instead.
