@@ -22,7 +22,7 @@
 # while CI installed 0.5.3.)
 
 [component]
-name = "cairn"
+name = "agent-provenance"
 version = "0.1.0"
 
 [spine]
