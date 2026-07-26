@@ -19,7 +19,7 @@ Environment::
     CAIRN_HARNESS_NAME   Harness name (default: opencode)
     CAIRN_HARNESS_VERSION Harness version (default: detected)
     PRINCIPAL_ID         Human principal (default: detected from OS user)
-    CAIRN_DISABLE        If set to any value, silently exits 0
+    CAIRN_DISABLE        If set to a truthy value (1/true/yes/on), silently exits 0
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ structlog.configure(
 from regista import Regista  # noqa: E402
 
 from cairn import CairnAdapter, CairnConfig  # noqa: E402
-from cairn._config import resolve_config  # noqa: E402
+from cairn._config import _parse_bool, resolve_config  # noqa: E402
 from cairn.schema import hash_payload  # noqa: E402
 
 _MAX_INPUT_BYTES = 10 * 1024 * 1024  # 10 MiB safety limit on stdin
@@ -120,7 +120,7 @@ def _cleanup_temp_key(path: str) -> None:
 
 
 def main() -> None:
-    if os.environ.get("CAIRN_DISABLE"):
+    if _parse_bool(os.environ.get("CAIRN_DISABLE")):
         return
 
     raw = sys.stdin.read(_MAX_INPUT_BYTES)

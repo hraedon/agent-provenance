@@ -41,6 +41,7 @@ UsageCase = conformance.UsageCase
 run_broken_pipe_case = conformance.run_broken_pipe_case
 run_error_case = conformance.run_error_case
 run_usage_case = conformance.run_usage_case
+assert_cases_declared = conformance.assert_cases_declared
 
 # `python -m cairn` invokes the *bridge*, not the CLI; the CLI is the `cairn`
 # console script installed next to this interpreter.
@@ -83,6 +84,13 @@ BROKEN_PIPE_CASES = [
         env={"HOME": _EMPTY_HOME},
     ),
 ]
+
+assert_cases_declared(
+    minimum=1,
+    error=ERROR_CASES,
+    usage=USAGE_CASES,
+    broken_pipe=BROKEN_PIPE_CASES,
+)
 
 
 @pytest.mark.parametrize("case", ERROR_CASES, ids=lambda c: c.name)
