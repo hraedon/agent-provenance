@@ -38,8 +38,10 @@ from ._install import (  # noqa: E402
     HOOK_EVENTS,
     _claude_settings_path,
     _codex_hooks_path,
+    _find_opencode_plugin,
     _is_cairn_hook_entry,
     _load_manifest,
+    _opencode_config_path,
 )
 
 
@@ -92,17 +94,43 @@ def _check_key_file(cfg: Any) -> dict[str, Any]:
         return {"name": "key_file", "status": "fail", "detail": f"cannot read key file: {exc}"}
 
 
-def _check_regista(cfg: Any) -> tuple[dict[str, Any], Any]:
-    """Probe the regista store.
+def _verify_chain(sub: Any) -> tuple[str, bool | None]:
+    """Use regista's canonical replay API to determine chain integrity.
 
-    Returns ``(check, newest_event_ts)`` where ``newest_event_ts`` is the
-    timestamp of the most recent event in the project (``read_events``
-    without filters orders newest-first), or ``None`` when the store is
-    unreachable or empty.  The freshness check (WI-4.1) consumes the
-    timestamp so doctor opens only one connection.
+    Returns ``(chain_state, chain_ok)``. ``chain_ok`` is ``True`` when the
+    replay reports no drift and no halted events, ``False`` when drift or
+    a halt is detected, and ``None`` when the verification API is unavailable
+    or an error prevented a verdict. ``chain_state`` is an honest string label
+    (``verified``, ``drift``, ``unsupported``, ``error``) for callers and
+    reports.
+    """
+    if not hasattr(sub, "replay"):
+        return "unsupported", None
+    try:
+        report = sub.replay()
+    except Exception:
+        return "error", None
+    if report.replayed_drift > 0 or report.halted > 0:
+        return "drift", False
+    return "verified", True
+
+
+def _check_regista(cfg: Any) -> tuple[dict[str, Any], Any, str | None, bool | None]:
+    """Probe the regista store and verify the chain.
+
+    Returns ``(check, newest_event_ts, chain_state, chain_ok)``.  The chain
+    verdict is obtained from regista's canonical ``replay`` API, not inferred
+    from mere connectivity (Plan 018 / WI-026 follow-up).  When replay is
+    unavailable or fails, ``chain_ok`` is ``None`` and ``chain_state`` names
+    the reason honestly.
     """
     if not cfg.is_configured:
-        return {"name": "regista", "status": "skip", "detail": "not configured"}, None
+        return (
+            {"name": "regista", "status": "skip", "detail": "not configured"},
+            None,
+            "unconfigured",
+            None,
+        )
     try:
         from regista import Regista
 
@@ -125,18 +153,25 @@ def _check_regista(cfg: Any) -> tuple[dict[str, Any], Any]:
             try:
                 events = sub.read_events(limit=1)
                 newest_ts = events[0].timestamp if events else None
-                return {
+                regista_check = {
                     "name": "regista",
                     "status": "ok",
                     "detail": f"reachable, {len(events)} event(s) in project '{cfg.project}'",
-                }, newest_ts
+                }
+                chain_state, chain_ok = _verify_chain(sub)
+                return regista_check, newest_ts, chain_state, chain_ok
             finally:
                 sub.close()
         finally:
             if temp_key is not None:
                 os.unlink(temp_key)
     except Exception as exc:
-        return {"name": "regista", "status": "fail", "detail": f"unreachable: {exc}"}, None
+        return (
+            {"name": "regista", "status": "fail", "detail": f"unreachable: {exc}"},
+            None,
+            "unreachable",
+            None,
+        )
 
 
 def _check_harness_wired(cfg: Any, *, required: bool = True) -> dict[str, Any]:
@@ -197,6 +232,97 @@ def _check_harness_wired(cfg: Any, *, required: bool = True) -> dict[str, Any]:
         "name": "harness_wired",
         "status": "ok",
         "detail": f"hooks + env configured in {path}",
+    }
+
+
+def _check_opencode_harness_wired(cfg: Any) -> dict[str, Any]:
+    """Validate OpenCode wiring: plugin source registered + env present."""
+    configured_for_opencode = str(getattr(cfg, "harness_name", "")).lower() == "opencode"
+    path = _opencode_config_path()
+    if not path.is_file():
+        if configured_for_opencode:
+            return {
+                "name": "opencode_harness_wired",
+                "status": "fail",
+                "detail": f"OpenCode selected but no config file at {path}",
+            }
+        return {
+            "name": "opencode_harness_wired",
+            "status": "skip",
+            "detail": f"OpenCode not configured (no config at {path})",
+        }
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return {
+            "name": "opencode_harness_wired",
+            "status": "fail",
+            "detail": f"cannot parse {path}",
+        }
+
+    env = data.get("env", {}) if isinstance(data, dict) else {}
+    if not isinstance(env, dict):
+        env = {}
+    has_dsn = bool(env.get("REGISTA_DSN") or env.get("CAIRN_DSN"))
+    has_project = bool(env.get("CAIRN_PROJECT"))
+
+    plugin_data = data.get("plugin", {}) if isinstance(data, dict) else {}
+    if not isinstance(plugin_data, dict):
+        plugin_data = {}
+    sources = plugin_data.get("sources", [])
+    if not isinstance(sources, list):
+        sources = []
+
+    plugin_path = _find_opencode_plugin()
+    plugin_registered = False
+    if plugin_path is not None:
+        plugin_str = str(plugin_path)
+        for s in sources:
+            if isinstance(s, dict) and s.get("source") == plugin_str:
+                plugin_registered = True
+            elif isinstance(s, str) and s == plugin_str:
+                plugin_registered = True
+
+    if plugin_path is None:
+        if configured_for_opencode:
+            return {
+                "name": "opencode_harness_wired",
+                "status": "fail",
+                "detail": "cairn OpenCode plugin cannot be located in the installed package",
+            }
+        return {
+            "name": "opencode_harness_wired",
+            "status": "skip",
+            "detail": "cairn OpenCode plugin not found in package",
+        }
+
+    if plugin_registered and has_dsn and has_project:
+        return {
+            "name": "opencode_harness_wired",
+            "status": "ok",
+            "detail": f"cairn plugin + env configured in {path}",
+        }
+    if plugin_registered:
+        missing = []
+        if not has_dsn:
+            missing.append("DSN")
+        if not has_project:
+            missing.append("PROJECT")
+        return {
+            "name": "opencode_harness_wired",
+            "status": "warn",
+            "detail": f"plugin registered but env missing: {', '.join(missing)}",
+        }
+    if configured_for_opencode:
+        return {
+            "name": "opencode_harness_wired",
+            "status": "fail",
+            "detail": f"OpenCode selected but cairn plugin not registered in {path}",
+        }
+    return {
+        "name": "opencode_harness_wired",
+        "status": "skip",
+        "detail": "OpenCode integration not configured",
     }
 
 
@@ -487,6 +613,47 @@ def _check_codex_activity(*, wired: bool) -> dict[str, Any]:
     }
 
 
+def _check_chain_integrity(
+    chain_state: str | None, chain_ok: bool | None
+) -> dict[str, Any]:
+    """Honest health for the canonical replay chain verdict.
+
+    Drift or replay error is a fail (top-level ``ok`` false, CLI exits nonzero).
+    An unsupported replay API is reported as a warning so we never claim
+    ``chain_ok`` is true.  Reachability is handled by the separate ``regista``
+    check.
+    """
+    if chain_state == "verified" and chain_ok is True:
+        return {
+            "name": "chain_integrity",
+            "status": "ok",
+            "detail": "canonical replay verified no drift or halted events",
+        }
+    if chain_state == "drift":
+        return {
+            "name": "chain_integrity",
+            "status": "fail",
+            "detail": "canonical replay detected chain drift or halted events",
+        }
+    if chain_state == "error":
+        return {
+            "name": "chain_integrity",
+            "status": "fail",
+            "detail": "chain replay failed; integrity verdict is unknown",
+        }
+    if chain_state == "unsupported":
+        return {
+            "name": "chain_integrity",
+            "status": "warn",
+            "detail": "regista version does not expose the canonical replay API",
+        }
+    return {
+        "name": "chain_integrity",
+        "status": "skip",
+        "detail": f"not checked ({chain_state or 'unavailable'})",
+    }
+
+
 def _check_bridge() -> dict[str, Any]:
     bridge = shutil.which("cairn-bridge")
     if bridge:
@@ -651,14 +818,16 @@ def _check_attestation_freshness(
 def run_doctor(*, json_output: bool = False) -> int:
     cfg = resolve_config()
 
-    regista_check, newest_event_ts = _check_regista(cfg)
+    regista_check, newest_event_ts, chain_state, chain_ok = _check_regista(cfg)
     codex_wired = _check_codex_harness_wired(cfg)
     codex_active = codex_wired["status"] in {"ok", "warn"}
     checks = [
         _check_config(cfg),
         _check_key_file(cfg),
         regista_check,
+        _check_chain_integrity(chain_state, chain_ok),
         _check_harness_wired(cfg, required=not codex_active),
+        _check_opencode_harness_wired(cfg),
         codex_wired,
         _check_codex_hook_policy(wired=codex_active),
         _check_codex_hook_trust(wired=codex_active),
@@ -685,7 +854,8 @@ def run_doctor(*, json_output: bool = False) -> int:
         "regista": {
             "reachable": regista_reachable,
             "project": cfg.project or None,
-            "chain_ok": regista_reachable,
+            "chain_ok": chain_ok,
+            "chain_state": chain_state,
         },
         "checks": checks,
     }

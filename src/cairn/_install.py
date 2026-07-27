@@ -80,6 +80,7 @@ _ENV_VARS = [
     "CAIRN_HARNESS_NAME",
     "CAIRN_HARNESS_VERSION",
     "PRINCIPAL_ID",
+    "CAIRN_ATTEST_ON_START",
 ]
 
 CAIRN_SENTINEL = "// cairn-managed"
@@ -831,6 +832,13 @@ def _env_values(cfg: Any, harness: str) -> dict[str, str | None]:
         "CAIRN_HARNESS_VERSION": cfg.harness_version,
         "PRINCIPAL_ID": cfg.principal_id,
     }
+    # OpenCode session attestation is default-on (Plan 008/009). The plugin
+    # gates the session.started attestation on CAIRN_ATTEST_ON_START; leaving
+    # it unset would make session attestation silently off. We write "1" so
+    # the default install is default-on, while the no-clobber loop below
+    # respects an explicit existing value (including "0" / "false").
+    if harness == "opencode":
+        vals["CAIRN_ATTEST_ON_START"] = "1"
     return vals
 
 
@@ -1365,6 +1373,16 @@ def _uninstall_opencode(
 
 
 def _find_opencode_plugin() -> Path | None:
+    """Return the path to the packaged OpenCode plugin.
+
+    In a built wheel, hatchling's ``force-include`` places ``integrations/``
+    inside the ``cairn`` package directory, so the plugin lives next to the
+    Python modules. In a source checkout, ``integrations/`` is at the repo
+    root. This mirrors the hermes plugin discovery path.
+    """
+    pkg_path = Path(__file__).resolve().parent / "integrations" / "opencode" / "index.js"
+    if pkg_path.is_file():
+        return pkg_path
     root = Path(__file__).resolve().parent.parent.parent
     repo_plugin = root / "integrations" / "opencode" / "index.js"
     if repo_plugin.is_file():

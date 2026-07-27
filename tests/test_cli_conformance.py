@@ -1,8 +1,9 @@
 """cairn's CLI run through the CLI contract v1 conformance kit (Plan 018 WI-2).
 
-The kit is the centrally versioned package ``agent_suite.conformance``, consumed
+The kit is the centrally versioned package ``agent_suite_conformance``, consumed
 pinned as ``agent-suite-conformance==1.0.0`` from PyPI (Plan 019 B1) via the
-``[dev]`` extra — never copied, never imported by runtime code.
+``[dev]`` extra — never copied, never imported by runtime code. Source checkouts
+may still expose the legacy PEP 420 ``agent_suite.conformance`` layout.
 
 cairn's CLI is click (not argparse); the contract boundary is the console entry
 ``cairn._cli:cli_entry``, which runs the group with ``standalone_mode=False`` and
@@ -22,6 +23,10 @@ other hermetic exit-0 JSON verb (the rest write files or mutate config), so a
 - **§2** via a ``UsageCase``: an unknown verb exits 2.
 - **§4** via a ``BrokenPipeCase``: closing ``doctor --json``'s stdout early
   produces no traceback.
+
+The module also implements the 1.1-style empty-dimension guard locally using the
+1.0.0 wheel API, so the conformance gate fails loudly if a refactor empties a
+case dimension.
 """
 
 from __future__ import annotations
@@ -30,10 +35,14 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-conformance = pytest.importorskip("agent_suite.conformance")
+try:
+    import agent_suite_conformance as conformance
+except ModuleNotFoundError:
+    conformance = pytest.importorskip("agent_suite.conformance")
 
 BrokenPipeCase = conformance.BrokenPipeCase
 ErrorCase = conformance.ErrorCase
@@ -41,7 +50,6 @@ UsageCase = conformance.UsageCase
 run_broken_pipe_case = conformance.run_broken_pipe_case
 run_error_case = conformance.run_error_case
 run_usage_case = conformance.run_usage_case
-assert_cases_declared = conformance.assert_cases_declared
 
 # `python -m cairn` invokes the *bridge*, not the CLI; the CLI is the `cairn`
 # console script installed next to this interpreter.
@@ -85,8 +93,28 @@ BROKEN_PIPE_CASES = [
     ),
 ]
 
-assert_cases_declared(
-    minimum=1,
+
+def _assert_cases_declared(**named_groups: list[Any]) -> None:
+    """Local 1.1-style guard: every declared case dimension must be non-empty.
+
+    The 1.0.0 wheel does not ship ``assert_cases_declared``. Implementing the
+    same shape locally keeps the gate fails-closed when a refactor empties a
+    dimension, without depending on an unpublished kit version.
+    """
+    if not named_groups:
+        raise AssertionError(
+            "assert_cases_declared was called with no case groups; a guard that "
+            "protects no dimensions enforces nothing."
+        )
+    short = sorted((name, len(group)) for name, group in named_groups.items() if len(group) < 1)
+    if short:
+        which = ", ".join(f"{name} ({n})" for name, n in short)
+        raise AssertionError(
+            f"conformance gate declared fewer than 1 case(s) for dimension(s): {which}"
+        )
+
+
+_assert_cases_declared(
     error=ERROR_CASES,
     usage=USAGE_CASES,
     broken_pipe=BROKEN_PIPE_CASES,

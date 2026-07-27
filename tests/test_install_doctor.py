@@ -9,16 +9,18 @@ from pathlib import Path
 import pytest
 
 from cairn._config import CairnEnvConfig, resolve_config
-from cairn._doctor import run_doctor
+from cairn._doctor import _check_opencode_harness_wired, run_doctor
 from cairn._install import (
     ConfigLoadError,
     InstallResult,
     InstallStatus,
     _compute_entry_hash,
     _detect_harness_version,
+    _find_opencode_plugin,
     _install_claude,
     _install_codex,
     _install_hermes,
+    _install_opencode,
     _is_cairn_hook_entry,
     _load_json,
     _load_manifest,
@@ -1339,3 +1341,523 @@ def test_parse_env_file_handles_unreadable_file(tmp_path):
         assert _parse_env_file(path) == []
     finally:
         path.chmod(0o600)
+
+
+# ----------------------------------------------------------------------
+# OpenCode plugin discovery + default-on session attestation
+# ----------------------------------------------------------------------
+
+
+def test_find_opencode_plugin_in_wheel_layout(monkeypatch, tmp_path):
+    """In a built wheel, integrations/ lives inside the cairn package dir."""
+    fake_pkg = tmp_path / "site" / "cairn"
+    fake_pkg.mkdir(parents=True)
+    plugin = fake_pkg / "integrations" / "opencode" / "index.js"
+    plugin.parent.mkdir(parents=True)
+    plugin.write_text("// fake wheel-bundled plugin")
+    monkeypatch.setattr("cairn._install.__file__", str(fake_pkg / "_install.py"))
+
+    found = _find_opencode_plugin()
+    assert found == plugin
+
+
+def test_find_opencode_plugin_falls_back_to_repo_root(monkeypatch, tmp_path):
+    """In a source checkout, integrations/ is at the repo root."""
+    fake_pkg = tmp_path / "src" / "cairn"
+    fake_pkg.mkdir(parents=True)
+    repo_root = tmp_path
+    plugin = repo_root / "integrations" / "opencode" / "index.js"
+    plugin.parent.mkdir(parents=True)
+    plugin.write_text("// fake repo-root plugin")
+    monkeypatch.setattr("cairn._install.__file__", str(fake_pkg / "_install.py"))
+
+    found = _find_opencode_plugin()
+    assert found == plugin
+
+
+def test_find_opencode_plugin_returns_none_when_absent(monkeypatch, tmp_path):
+    """When neither wheel nor repo-root layout has the plugin, report None."""
+    fake_pkg = tmp_path / "src" / "cairn"
+    fake_pkg.mkdir(parents=True)
+    monkeypatch.setattr("cairn._install.__file__", str(fake_pkg / "_install.py"))
+    assert _find_opencode_plugin() is None
+
+
+def test_install_opencode_sets_attest_on_start_default(cfg, tmp_path, monkeypatch):
+    """OpenCode session attestation is default-on (CAIRN_ATTEST_ON_START=1)."""
+    path = tmp_path / "opencode.json"
+    monkeypatch.setenv("CAIRN_OPENCODE_CONFIG", str(path))
+
+    result = _install_opencode(cfg, dry_run=False, uninstall=False, user=None)
+
+    data = json.loads(path.read_text())
+    assert data["env"]["CAIRN_ATTEST_ON_START"] == "1"
+    assert result.status is InstallStatus.INSTALLED
+
+
+def test_install_opencode_respects_explicit_attest_on_start(
+    cfg, tmp_path, monkeypatch
+):
+    """An explicit CAIRN_ATTEST_ON_START value is not clobbered."""
+    path = tmp_path / "opencode.json"
+    monkeypatch.setenv("CAIRN_OPENCODE_CONFIG", str(path))
+    path.write_text(json.dumps({"env": {"CAIRN_ATTEST_ON_START": "0"}}))
+
+    result = _install_opencode(cfg, dry_run=False, uninstall=False, user=None)
+
+    data = json.loads(path.read_text())
+    assert data["env"]["CAIRN_ATTEST_ON_START"] == "0"
+    skip_actions = [a for a in result.actions if a.kind == "skip"]
+    assert any("CAIRN_ATTEST_ON_START" in a.detail for a in skip_actions)
+
+
+def test_uninstall_opencode_removes_attest_on_start(cfg, tmp_path, monkeypatch):
+    """Uninstall removes the managed CAIRN_ATTEST_ON_START env var."""
+    path = tmp_path / "opencode.json"
+    monkeypatch.setenv("CAIRN_OPENCODE_CONFIG", str(path))
+    _install_opencode(cfg, dry_run=False, uninstall=False, user=None)
+
+    result = _install_opencode(cfg, dry_run=False, uninstall=True, user=None)
+
+    data = json.loads(path.read_text()) if path.exists() else {}
+    assert "CAIRN_ATTEST_ON_START" not in data.get("env", {})
+    assert not result.no_op
+
+
+# ----------------------------------------------------------------------
+# Doctor — OpenCode wiring and regista chain integrity
+# ----------------------------------------------------------------------
+
+
+def _doctor_report(monkeypatch, cfg: CairnEnvConfig) -> dict[str, object]:
+    """Run doctor --json and return the parsed report."""
+    import io
+    from contextlib import redirect_stdout
+
+    monkeypatch.setattr("cairn._doctor.resolve_config", lambda: cfg)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        run_doctor(json_output=True)
+    return json.loads(buf.getvalue())
+
+
+def test_doctor_opencode_wired_ok(cfg, monkeypatch, tmp_path):
+    """Doctor reports ok when OpenCode config has the cairn plugin + env."""
+    path = tmp_path / "opencode.json"
+    monkeypatch.setenv("CAIRN_OPENCODE_CONFIG", str(path))
+    _install_opencode(cfg, dry_run=False, uninstall=False, user=None)
+
+    check = _check_opencode_harness_wired(cfg)
+
+    assert check["status"] == "ok"
+    assert "plugin + env configured" in check["detail"]
+
+
+def test_doctor_opencode_selected_but_unwired(cfg, monkeypatch, tmp_path):
+    """Doctor fails closed when OpenCode is selected but no config exists."""
+    path = tmp_path / "opencode.json"
+    monkeypatch.setenv("CAIRN_OPENCODE_CONFIG", str(path))
+    selected = CairnEnvConfig(
+        dsn=cfg.dsn,
+        key_path=cfg.key_path,
+        project=cfg.project,
+        harness_name="opencode",
+    )
+
+    check = _check_opencode_harness_wired(selected)
+
+    assert check["status"] == "fail"
+    assert "no config file" in check["detail"]
+
+
+def test_doctor_opencode_config_exists_but_plugin_missing(
+    cfg, monkeypatch, tmp_path
+):
+    """Doctor fails closed when config file exists but cairn plugin is absent."""
+    path = tmp_path / "opencode.json"
+    monkeypatch.setenv("CAIRN_OPENCODE_CONFIG", str(path))
+    path.write_text(json.dumps({"env": {"REGISTA_DSN": "x", "CAIRN_PROJECT": "p"}}))
+    selected = CairnEnvConfig(
+        dsn=cfg.dsn,
+        key_path=cfg.key_path,
+        project=cfg.project,
+        harness_name="opencode",
+    )
+
+    check = _check_opencode_harness_wired(selected)
+
+    assert check["status"] == "fail"
+    assert "not registered" in check["detail"]
+
+
+def test_doctor_opencode_skips_when_not_configured(cfg, monkeypatch, tmp_path):
+    """Doctor skips the OpenCode check when no config file exists."""
+    path = tmp_path / "opencode.json"
+    monkeypatch.setenv("CAIRN_OPENCODE_CONFIG", str(path))
+    check = _check_opencode_harness_wired(cfg)
+    assert check["status"] == "skip"
+
+
+def test_doctor_chain_ok_verified_when_replay_clean(monkeypatch):
+    """regista.chain_ok is True when canonical replay reports no drift."""
+    from regista import ReplayReport
+
+    class _FakeRegista:
+        def __init__(self, **kwargs):
+            pass
+
+        def read_events(self, **kwargs):
+            return []
+
+        def replay(self, **kwargs):
+            return ReplayReport(
+                table_name="test",
+                replayed_ok=1,
+                replayed_drift=0,
+                halted=0,
+                warnings=0,
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("regista.Regista", _FakeRegista)
+    cfg = CairnEnvConfig(
+        dsn="postgresql://x@h/db",
+        key_path="/nonexistent.json",
+        project="test",
+    )
+    report = _doctor_report(monkeypatch, cfg)
+    assert report["regista"]["reachable"] is True
+    assert report["regista"]["chain_ok"] is True
+    assert report["regista"]["chain_state"] == "verified"
+
+
+def test_doctor_chain_ok_false_when_replay_reports_drift(monkeypatch):
+    """regista.chain_ok is False when replay detects drift/tampering."""
+    from regista import ReplayReport
+
+    class _FakeRegista:
+        def __init__(self, **kwargs):
+            pass
+
+        def read_events(self, **kwargs):
+            return []
+
+        def replay(self, **kwargs):
+            return ReplayReport(
+                table_name="test",
+                replayed_ok=0,
+                replayed_drift=1,
+                halted=0,
+                warnings=0,
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("regista.Regista", _FakeRegista)
+    cfg = CairnEnvConfig(
+        dsn="postgresql://x@h/db",
+        key_path="/nonexistent.json",
+        project="test",
+    )
+    report = _doctor_report(monkeypatch, cfg)
+    assert report["regista"]["chain_ok"] is False
+    assert report["regista"]["chain_state"] == "drift"
+
+
+def test_doctor_chain_state_unsupported_when_replay_missing(monkeypatch):
+    """If regista has no replay API, chain state is reported unsupported."""
+    class _FakeRegista:
+        def __init__(self, **kwargs):
+            pass
+
+        def read_events(self, **kwargs):
+            return []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("regista.Regista", _FakeRegista)
+    cfg = CairnEnvConfig(
+        dsn="postgresql://x@h/db",
+        key_path="/nonexistent.json",
+        project="test",
+    )
+    report = _doctor_report(monkeypatch, cfg)
+    assert report["regista"]["chain_ok"] is None
+    assert report["regista"]["chain_state"] == "unsupported"
+
+
+def test_doctor_chain_state_error_when_replay_raises(monkeypatch):
+    """If replay raises, chain state is reported error (unknown verdict)."""
+    class _FakeRegista:
+        def __init__(self, **kwargs):
+            pass
+
+        def read_events(self, **kwargs):
+            return []
+
+        def replay(self, **kwargs):
+            raise RuntimeError("replay unavailable")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("regista.Regista", _FakeRegista)
+    cfg = CairnEnvConfig(
+        dsn="postgresql://x@h/db",
+        key_path="/nonexistent.json",
+        project="test",
+    )
+    report = _doctor_report(monkeypatch, cfg)
+    assert report["regista"]["chain_ok"] is None
+    assert report["regista"]["chain_state"] == "error"
+
+
+@pytest.fixture
+def doctor_ready_cfg(cfg, monkeypatch, tmp_path):
+    """A config whose other doctor checks pass so chain behavior is isolated."""
+    key_path = Path(cfg.key_path)
+    key_path.write_text(json.dumps({"keys": [{"key_id": "doctor-test"}]}))
+    _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    monkeypatch.setattr("cairn._doctor._newest_local_session_activity", lambda: None)
+    monkeypatch.setattr(
+        "cairn._doctor._check_content_encryption",
+        lambda cfg: {"name": "content_encryption", "status": "ok", "detail": "test"},
+    )
+    monkeypatch.setattr(
+        "cairn._doctor._check_bridge",
+        lambda: {"name": "bridge", "status": "ok", "detail": "test"},
+    )
+    monkeypatch.setattr(
+        "cairn._doctor._check_codex_harness_wired",
+        lambda cfg: {"name": "codex_harness_wired", "status": "skip", "detail": "test"},
+    )
+    monkeypatch.setattr(
+        "cairn._doctor._check_codex_hook_policy",
+        lambda *, wired: {"name": "codex_hook_policy", "status": "skip", "detail": "test"},
+    )
+    monkeypatch.setattr(
+        "cairn._doctor._check_codex_hook_trust",
+        lambda *, wired: {"name": "codex_hook_trust", "status": "skip", "detail": "test"},
+    )
+    monkeypatch.setattr(
+        "cairn._doctor._check_codex_activity",
+        lambda *, wired: {"name": "codex_hook_activity", "status": "skip", "detail": "test"},
+    )
+    return cfg
+
+
+def _find_check(report: dict[str, object], name: str) -> dict[str, object]:
+    return next(c for c in report["checks"] if c["name"] == name)
+
+
+def _run_doctor_cli(monkeypatch, cfg, fake_regista):
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    monkeypatch.setattr("regista.Regista", fake_regista)
+    monkeypatch.setattr("cairn._doctor.resolve_config", lambda: cfg)
+    result = CliRunner().invoke(main, ["doctor", "--json"])
+    return result
+
+
+def test_doctor_chain_integrity_verified_ok_and_exits_zero(
+    doctor_ready_cfg, monkeypatch, tmp_path
+):
+    """Verified chain: chain_integrity ok, top-level ok, CLI exits 0."""
+    from regista import ReplayReport
+
+    class _FakeRegista:
+        def __init__(self, **kwargs):
+            pass
+
+        def read_events(self, **kwargs):
+            return []
+
+        def replay(self, **kwargs):
+            return ReplayReport(
+                table_name="test",
+                replayed_ok=1,
+                replayed_drift=0,
+                halted=0,
+                warnings=0,
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("regista.Regista", _FakeRegista)
+    report = _doctor_report(monkeypatch, doctor_ready_cfg)
+
+    chain = _find_check(report, "chain_integrity")
+    assert chain["status"] == "ok"
+    assert report["regista"]["chain_ok"] is True
+    assert report["regista"]["chain_state"] == "verified"
+    assert report["ok"] is True
+    assert report["degraded"] is False
+
+    result = _run_doctor_cli(monkeypatch, doctor_ready_cfg, _FakeRegista)
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["regista"]["chain_ok"] is True
+
+
+def test_doctor_chain_integrity_drift_fails_and_exits_nonzero(
+    doctor_ready_cfg, monkeypatch, tmp_path
+):
+    """Chain drift: chain_integrity fails, top-level ok false, CLI exits nonzero."""
+    from regista import ReplayReport
+
+    class _FakeRegista:
+        def __init__(self, **kwargs):
+            pass
+
+        def read_events(self, **kwargs):
+            return []
+
+        def replay(self, **kwargs):
+            return ReplayReport(
+                table_name="test",
+                replayed_ok=0,
+                replayed_drift=1,
+                halted=0,
+                warnings=0,
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("regista.Regista", _FakeRegista)
+    report = _doctor_report(monkeypatch, doctor_ready_cfg)
+
+    chain = _find_check(report, "chain_integrity")
+    assert chain["status"] == "fail"
+    assert report["regista"]["chain_ok"] is False
+    assert report["regista"]["chain_state"] == "drift"
+    assert report["ok"] is False
+
+    result = _run_doctor_cli(monkeypatch, doctor_ready_cfg, _FakeRegista)
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["regista"]["chain_ok"] is False
+
+
+def test_doctor_chain_integrity_error_fails_and_exits_nonzero(
+    doctor_ready_cfg, monkeypatch, tmp_path
+):
+    """Replay error: chain_integrity fails honestly, top-level ok false."""
+
+    class _FakeRegista:
+        def __init__(self, **kwargs):
+            pass
+
+        def read_events(self, **kwargs):
+            return []
+
+        def replay(self, **kwargs):
+            raise RuntimeError("replay unavailable")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("regista.Regista", _FakeRegista)
+    report = _doctor_report(monkeypatch, doctor_ready_cfg)
+
+    chain = _find_check(report, "chain_integrity")
+    assert chain["status"] == "fail"
+    assert report["regista"]["chain_ok"] is None
+    assert report["regista"]["chain_state"] == "error"
+    assert report["ok"] is False
+
+    result = _run_doctor_cli(monkeypatch, doctor_ready_cfg, _FakeRegista)
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["regista"]["chain_ok"] is None
+
+
+def test_doctor_chain_integrity_unsupported_warns_and_does_not_claim_ok(
+    doctor_ready_cfg, monkeypatch, tmp_path
+):
+    """Unsupported replay API: chain_ok is None (never True) and check warns."""
+
+    class _FakeRegista:
+        def __init__(self, **kwargs):
+            pass
+
+        def read_events(self, **kwargs):
+            return []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("regista.Regista", _FakeRegista)
+    report = _doctor_report(monkeypatch, doctor_ready_cfg)
+
+    chain = _find_check(report, "chain_integrity")
+    assert chain["status"] == "warn"
+    assert report["regista"]["chain_ok"] is None
+    assert report["regista"]["chain_state"] == "unsupported"
+    assert report["ok"] is True
+    assert report["degraded"] is True
+
+    result = _run_doctor_cli(monkeypatch, doctor_ready_cfg, _FakeRegista)
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["regista"]["chain_ok"] is None
+
+
+# ----------------------------------------------------------------------
+# CLI contract — dry-run is success (exit 0)
+# ----------------------------------------------------------------------
+
+
+def test_install_harness_claude_dry_run_exits_zero(cfg, monkeypatch):
+    """A successful dry-run exits 0 per CLI contract v1 §2."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    monkeypatch.setattr("cairn._install.resolve_config", lambda: cfg)
+    result = CliRunner().invoke(
+        main, ["install-harness", "claude", "--dry-run", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload[0]["status"] == "installed"
+    assert payload[0]["no_op"] is False
+
+
+def test_uninstall_harness_claude_dry_run_exits_zero(cfg, monkeypatch):
+    """A successful uninstall dry-run also exits 0."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    monkeypatch.setattr("cairn._install.resolve_config", lambda: cfg)
+    result = CliRunner().invoke(
+        main, ["uninstall-harness", "claude", "--dry-run", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_install_harness_opencode_dry_run_exits_zero(cfg, monkeypatch):
+    """OpenCode dry-run exits 0 and reports the plugin would be registered."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    monkeypatch.setattr("cairn._install.resolve_config", lambda: cfg)
+    result = CliRunner().invoke(
+        main, ["install-harness", "opencode", "--dry-run", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload[0]["status"] == "installed"

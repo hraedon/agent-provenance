@@ -840,8 +840,6 @@ def install_harness(
 
     if not results_succeeded(results):
         sys.exit(1)
-    if dry_run:
-        sys.exit(2)
 
 
 @main.command("uninstall-harness")
@@ -864,8 +862,6 @@ def uninstall_harness(harness: str, dry_run: bool, json_output: bool) -> None:
 
     if not results_succeeded(results):
         sys.exit(1)
-    if dry_run:
-        sys.exit(2)
 
 
 @main.command()
@@ -991,7 +987,7 @@ def cli_entry() -> int:
     - any other uncaught exception becomes ``INTERNAL_ERROR`` instead of a
       traceback (§4);
     - a command that called ``sys.exit(n)`` directly keeps its code (so
-      ``install-harness --dry-run`` = 2 and ``doctor``'s verdict codes survive);
+      ``doctor``'s verdict codes survive);
     - a closed downstream pipe is swallowed the CPython way (§4).
     """
     argv = sys.argv[1:]
