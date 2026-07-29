@@ -16,7 +16,7 @@ resolves the spine without cloning agent-suite; the two locks are kept in
 agreement (this face-local copy is vendored from the umbrella).
 
 CLI:
-    python scripts/suite_lock.py version              # -> 0.5.3
+    python scripts/suite_lock.py version              # -> 0.5.4
     python scripts/suite_lock.py requirement          # -> the pip requirement token(s)
     python scripts/suite_lock.py requirement --dev-against main
 """
