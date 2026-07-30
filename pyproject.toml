@@ -42,12 +42,14 @@ dev = [
     "asn1crypto>=1.5",
     "pynacl>=1.5",
     "cryptography>=42.0",
-    # CLI contract v1 conformance kit (Plan 018 WI-2 / Plan 019 B1). v1.0.0 is
-    # the published PyPI wheel; the meta-guard helpers are implemented locally so
-    # the package remains clean-installable without depending on an unpublished
-    # version. Consumed only by the conformance tests, never imported by runtime
-    # code.
-    "agent-suite-conformance==1.0.0; python_version >= '3.12'",
+    # CLI contract v1 conformance kit (Plan 018 WI-2 / Plan 019 B1 / WI-023).
+    # v1.1.0 ships the WI-026 meta-guard helpers (assert_cases_declared +
+    # ConformanceGateError), so the conformance tests consume them directly from
+    # the kit instead of carrying local copies. The kit requires py>=3.12; cairn's
+    # *runtime* still supports 3.11, so the dep is conditional and the conformance
+    # gate runs on the 3.12+ CI lane. Consumed only by the conformance tests,
+    # never imported by runtime code.
+    "agent-suite-conformance==1.1.0; python_version >= '3.12'",
 ]
 
 [project.scripts]
