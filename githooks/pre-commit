@@ -1,23 +1,33 @@
 #!/usr/bin/env bash
 #
-# cairn local identifier gate.
+# cairn local identifier gate (project-initiation scaffold).
 #
-# Mirrors the CI `identifier-gate` job so a work-domain identifier is caught
-# BEFORE it lands in a commit. The CI gate only runs after push, which is why
-# the same FQDN has leaked through reflections repeatedly: by the time CI
-# flags it, the token is already in history. This hook closes that window.
+# Mirrors the CI `identifier-gate` job so a forbidden work-domain identifier is
+# caught BEFORE it lands in a commit. The CI gate only runs after push, so by the
+# time it flags a token it is already in history; this hook closes that window.
 #
-# Activate (once per clone):   git config core.hooksPath githooks
-# Or run:                      scripts/install-git-hooks.sh
+# Companion hooks (all installed together): `commit-msg` scans the commit message,
+# `pre-push` checks publication plumbing and messages in the push range.
 #
-# The denylist is never committed. It is resolved, in order, from:
-#   1. $CAIRN_FORBIDDEN_IDENTIFIERS (already exported)
-#   2. <repo>/.identifiers-denylist.local   (gitignored)
-#   3. ~/.config/cairn/forbidden-identifiers
+# Activate (once per clone):   scripts/install-git-hooks.sh
 #
-# Layered design: this hook is an EARLY WARNING (fail-open if no denylist is
-# configured, so a fresh clone is not bricked). CI remains the hard gate
-# (fail-closed — the secret is always set there).
+# The denylist is never committed — NAMING A FORBIDDEN IDENTIFIER IN A TRACKED
+# FILE, INCLUDING IN A COMMENT LIKE THIS ONE, IS ITSELF THE LEAK. This comment
+# once named the work domain as an illustrative example; the gate could not match
+# it (multi-word entries were unrepresentable) and the copy of this scaffold in
+# sixteen repositories, eight of them public, published it. Describe the denylist;
+# never quote it.
+#
+# It is resolved, in order, from:
+#   1. $CAIRN_FORBIDDEN_IDENTIFIERS            (already exported, e.g. CI)
+#   2. <repo>/.identifiers-denylist.local            (gitignored, per-repo)
+#   3. ~/.config/agent-suite/forbidden-identifiers   (shared canonical set)
+#
+# The shared canonical denylist holds work-domain identifiers only; homelab/lab
+# identifiers are deliberately NOT in it — lab topology is allowed in public
+# repos (docs/publication-review.md). Multi-word entries must be double-quoted.
+# Fail-open if no denylist is found so a fresh clone is not bricked; CI remains
+# the hard gate.
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
@@ -25,7 +35,7 @@ repo_root="$(git rev-parse --show-toplevel)"
 if [ -z "${CAIRN_FORBIDDEN_IDENTIFIERS:-}" ]; then
   for candidate in \
     "$repo_root/.identifiers-denylist.local" \
-    "$HOME/.config/cairn/forbidden-identifiers"; do
+    "$HOME/.config/agent-suite/forbidden-identifiers"; do
     if [ -f "$candidate" ]; then
       CAIRN_FORBIDDEN_IDENTIFIERS="$(cat "$candidate")"
       export CAIRN_FORBIDDEN_IDENTIFIERS
@@ -36,9 +46,8 @@ fi
 
 if [ -z "${CAIRN_FORBIDDEN_IDENTIFIERS:-}" ]; then
   echo "cairn pre-commit: identifier gate INACTIVE — no denylist found." >&2
-  echo "  Set \$CAIRN_FORBIDDEN_IDENTIFIERS, or create" >&2
-  echo "  .identifiers-denylist.local (gitignored) or" >&2
-  echo "  ~/.config/cairn/forbidden-identifiers to enable it. Allowing commit." >&2
+  echo "  Set \$CAIRN_FORBIDDEN_IDENTIFIERS, or create .identifiers-denylist.local (gitignored)" >&2
+  echo "  or ~/.config/agent-suite/forbidden-identifiers to enable it. Allowing commit." >&2
   exit 0
 fi
 
