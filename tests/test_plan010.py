@@ -483,8 +483,11 @@ def test_doctor_content_encryption_warning():
     assert "OFF" in result["detail"]
 
 
-def test_doctor_content_encryption_ok():
+def test_doctor_content_encryption_ok(monkeypatch):
+    """WI-034: ok requires the key to RESOLVE, not merely to be configured."""
     from cairn._doctor import _check_content_encryption
+
+    monkeypatch.setenv("MY_KEY", "0" * 32)
 
     class MockCfg:
         content_encryption = "on"
@@ -493,6 +496,27 @@ def test_doctor_content_encryption_ok():
 
     result = _check_content_encryption(MockCfg())
     assert result["status"] == "ok"
+
+
+def test_doctor_content_encryption_unresolvable_key_fails(monkeypatch):
+    """A configured-but-unresolvable key used to read green (agent-suite WI-041).
+
+    ``env:MY_KEY`` with no such variable set is exactly the "configured, not
+    resolvable" shape: content encryption would be reported ON while the key it
+    names cannot be fetched.
+    """
+    from cairn._doctor import _check_content_encryption
+
+    monkeypatch.delenv("MY_KEY", raising=False)
+
+    class MockCfg:
+        content_encryption = "on"
+        content_key_ref = "env:MY_KEY"
+        content_key_path = None
+
+    result = _check_content_encryption(MockCfg())
+    assert result["status"] == "fail"
+    assert "does not resolve" in result["detail"]
 
 
 def test_doctor_content_encryption_no_key_warning():
@@ -505,3 +529,49 @@ def test_doctor_content_encryption_no_key_warning():
 
     result = _check_content_encryption(MockCfg())
     assert result["status"] == "warn"
+
+
+def test_doctor_content_encryption_vault_ref_without_hvac_fails(monkeypatch):
+    """A ``vault:`` ref resolves only where hvac is importable in CAIRN's own
+    environment (agent-suite WI-041 trap 3).
+
+    Each suite CLI is its own uv tool venv, so hvac in regista's venv does
+    nothing for cairn's; without it regista registers no vault provider and the
+    ref fails with "Unknown secret provider". Observed live on the qualification
+    host, for both the DSN key ref and the content key.
+    """
+    import importlib.util
+
+    from cairn._doctor import _check_content_encryption
+
+    real_find_spec = importlib.util.find_spec
+
+    def _no_hvac(name, *args, **kwargs):
+        if name == "hvac":
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", _no_hvac)
+
+    class MockCfg:
+        content_encryption = "on"
+        content_key_ref = "vault:kv/agent-suite/qual/cairn/content_key"
+        content_key_path = None
+
+    result = _check_content_encryption(MockCfg())
+    assert result["status"] == "fail"
+    assert "hvac is not importable" in result["detail"]
+    # The remedy it names must exist: cairn declares a [vault] extra.
+    assert "cairn[vault]" in result["detail"]
+
+
+def test_cairn_declares_the_vault_extra_its_doctor_recommends():
+    """The doctor's remedy is only honest if the extra exists."""
+    import tomllib
+    from pathlib import Path
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text())
+    extras = data["project"]["optional-dependencies"]
+    assert "vault" in extras, "cairn doctor names a [vault] extra that does not exist"
+    assert any("vault" in dep for dep in extras["vault"])

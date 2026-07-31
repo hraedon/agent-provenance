@@ -34,6 +34,15 @@ dependencies = [
 regista-hraedon = { path = "../regista", editable = true }
 
 [project.optional-dependencies]
+# A ``vault:`` secret ref resolves only where ``hvac`` is importable in the
+# resolving component's OWN environment — each suite CLI is its own uv tool
+# venv, so hvac in regista's does nothing for cairn's. Without this, a host
+# whose DSN or content key is a vault ref fails with "Unknown secret provider"
+# (observed on the qualification host for both). ``cairn doctor`` names this
+# extra as the remedy, so it has to exist.
+vault = [
+    "regista-hraedon[vault]",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
