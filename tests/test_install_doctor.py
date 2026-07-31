@@ -42,6 +42,7 @@ def cfg(tmp_path: Path) -> CairnEnvConfig:
         harness_version="1.0.0",
         principal_id="human:test",
         state_dir=str(tmp_path / "state"),
+        integrity_dir=str(tmp_path / "integrity"),
         disabled=False,
     )
 
@@ -1441,6 +1442,19 @@ def _doctor_report(monkeypatch, cfg: CairnEnvConfig) -> dict[str, object]:
     return json.loads(buf.getvalue())
 
 
+def _record_integrity(monkeypatch, cfg: CairnEnvConfig) -> int:
+    """Run ``cairn integrity`` so doctor has a recorded verdict (WI-030)."""
+    import io
+    from contextlib import redirect_stdout
+
+    from cairn._doctor import run_integrity
+
+    monkeypatch.setattr("cairn._doctor.resolve_config", lambda: cfg)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        return run_integrity(json_output=True)
+
+
 def test_doctor_opencode_wired_ok(cfg, monkeypatch, tmp_path):
     """Doctor reports ok when OpenCode config has the cairn plugin + env."""
     path = tmp_path / "opencode.json"
@@ -1498,8 +1512,8 @@ def test_doctor_opencode_skips_when_not_configured(cfg, monkeypatch, tmp_path):
     assert check["status"] == "skip"
 
 
-def test_doctor_chain_ok_verified_when_replay_clean(monkeypatch):
-    """regista.chain_ok is True when canonical replay reports no drift."""
+def test_doctor_chain_ok_verified_when_integrity_recorded_clean(monkeypatch, tmp_path):
+    """regista.chain_ok is True when `cairn integrity` recorded a clean replay."""
     from regista import ReplayReport
 
     class _FakeRegista:
@@ -1526,15 +1540,18 @@ def test_doctor_chain_ok_verified_when_replay_clean(monkeypatch):
         dsn="postgresql://x@h/db",
         key_path="/nonexistent.json",
         project="test",
+        state_dir=str(tmp_path / "state"),
+        integrity_dir=str(tmp_path / "integrity"),
     )
+    assert _record_integrity(monkeypatch, cfg) == 0
     report = _doctor_report(monkeypatch, cfg)
     assert report["regista"]["reachable"] is True
     assert report["regista"]["chain_ok"] is True
     assert report["regista"]["chain_state"] == "verified"
 
 
-def test_doctor_chain_ok_false_when_replay_reports_drift(monkeypatch):
-    """regista.chain_ok is False when replay detects drift/tampering."""
+def test_doctor_chain_ok_false_when_integrity_recorded_drift(monkeypatch, tmp_path):
+    """regista.chain_ok is False when the recorded replay detected drift."""
     from regista import ReplayReport
 
     class _FakeRegista:
@@ -1561,14 +1578,17 @@ def test_doctor_chain_ok_false_when_replay_reports_drift(monkeypatch):
         dsn="postgresql://x@h/db",
         key_path="/nonexistent.json",
         project="test",
+        state_dir=str(tmp_path / "state"),
+        integrity_dir=str(tmp_path / "integrity"),
     )
+    assert _record_integrity(monkeypatch, cfg) == 1
     report = _doctor_report(monkeypatch, cfg)
     assert report["regista"]["chain_ok"] is False
     assert report["regista"]["chain_state"] == "drift"
 
 
-def test_doctor_chain_state_unsupported_when_replay_missing(monkeypatch):
-    """If regista has no replay API, chain state is reported unsupported."""
+def test_doctor_chain_state_unsupported_when_replay_missing(monkeypatch, tmp_path):
+    """If regista has no replay API, the recorded state is unsupported."""
     class _FakeRegista:
         def __init__(self, **kwargs):
             pass
@@ -1584,14 +1604,18 @@ def test_doctor_chain_state_unsupported_when_replay_missing(monkeypatch):
         dsn="postgresql://x@h/db",
         key_path="/nonexistent.json",
         project="test",
+        state_dir=str(tmp_path / "state"),
+        integrity_dir=str(tmp_path / "integrity"),
     )
+    assert _record_integrity(monkeypatch, cfg) == 1
     report = _doctor_report(monkeypatch, cfg)
     assert report["regista"]["chain_ok"] is None
     assert report["regista"]["chain_state"] == "unsupported"
 
 
-def test_doctor_chain_state_error_when_replay_raises(monkeypatch):
-    """If replay raises, chain state is reported error (unknown verdict)."""
+def test_doctor_chain_state_error_when_replay_raises(monkeypatch, tmp_path):
+    """A replay exception records no verdict: integrity exits 1 and doctor
+    honestly reports never_run rather than a chain verdict (WI-030 m4)."""
     class _FakeRegista:
         def __init__(self, **kwargs):
             pass
@@ -1610,10 +1634,13 @@ def test_doctor_chain_state_error_when_replay_raises(monkeypatch):
         dsn="postgresql://x@h/db",
         key_path="/nonexistent.json",
         project="test",
+        state_dir=str(tmp_path / "state"),
+        integrity_dir=str(tmp_path / "integrity"),
     )
+    assert _record_integrity(monkeypatch, cfg) == 1
     report = _doctor_report(monkeypatch, cfg)
     assert report["regista"]["chain_ok"] is None
-    assert report["regista"]["chain_state"] == "error"
+    assert report["regista"]["chain_state"] == "never_run"
 
 
 @pytest.fixture
@@ -1691,6 +1718,7 @@ def test_doctor_chain_integrity_verified_ok_and_exits_zero(
             pass
 
     monkeypatch.setattr("regista.Regista", _FakeRegista)
+    assert _record_integrity(monkeypatch, doctor_ready_cfg) == 0
     report = _doctor_report(monkeypatch, doctor_ready_cfg)
 
     chain = _find_check(report, "chain_integrity")
@@ -1733,6 +1761,7 @@ def test_doctor_chain_integrity_drift_fails_and_exits_nonzero(
             pass
 
     monkeypatch.setattr("regista.Regista", _FakeRegista)
+    assert _record_integrity(monkeypatch, doctor_ready_cfg) == 1
     report = _doctor_report(monkeypatch, doctor_ready_cfg)
 
     chain = _find_check(report, "chain_integrity")
@@ -1751,7 +1780,8 @@ def test_doctor_chain_integrity_drift_fails_and_exits_nonzero(
 def test_doctor_chain_integrity_error_fails_and_exits_nonzero(
     doctor_ready_cfg, monkeypatch, tmp_path
 ):
-    """Replay error: chain_integrity fails honestly, top-level ok false."""
+    """Replay error: integrity exits 1 without recording; doctor reports the
+    honest never_run skip (WI-030 m4 — an exception is not a verdict)."""
 
     class _FakeRegista:
         def __init__(self, **kwargs):
@@ -1767,18 +1797,18 @@ def test_doctor_chain_integrity_error_fails_and_exits_nonzero(
             pass
 
     monkeypatch.setattr("regista.Regista", _FakeRegista)
+    assert _record_integrity(monkeypatch, doctor_ready_cfg) == 1
     report = _doctor_report(monkeypatch, doctor_ready_cfg)
 
     chain = _find_check(report, "chain_integrity")
-    assert chain["status"] == "fail"
+    assert chain["status"] == "skip"
     assert report["regista"]["chain_ok"] is None
-    assert report["regista"]["chain_state"] == "error"
-    assert report["ok"] is False
+    assert report["regista"]["chain_state"] == "never_run"
+    assert report["ok"] is True
 
     result = _run_doctor_cli(monkeypatch, doctor_ready_cfg, _FakeRegista)
-    assert result.exit_code == 1
+    assert result.exit_code == 0
     payload = json.loads(result.output)
-    assert payload["ok"] is False
     assert payload["regista"]["chain_ok"] is None
 
 
@@ -1798,6 +1828,7 @@ def test_doctor_chain_integrity_unsupported_warns_and_does_not_claim_ok(
             pass
 
     monkeypatch.setattr("regista.Regista", _FakeRegista)
+    assert _record_integrity(monkeypatch, doctor_ready_cfg) == 1
     report = _doctor_report(monkeypatch, doctor_ready_cfg)
 
     chain = _find_check(report, "chain_integrity")
@@ -1812,6 +1843,41 @@ def test_doctor_chain_integrity_unsupported_warns_and_does_not_claim_ok(
     payload = json.loads(result.output)
     assert payload["ok"] is True
     assert payload["regista"]["chain_ok"] is None
+
+
+def test_integrity_cli_verified_exits_zero(doctor_ready_cfg, monkeypatch):
+    """`cairn integrity --json` exits 0 on a verified replay (WI-030)."""
+    from click.testing import CliRunner
+    from regista import ReplayReport
+
+    from cairn._cli import main
+
+    class _FakeRegista:
+        def __init__(self, **kwargs):
+            pass
+
+        def read_events(self, **kwargs):
+            return []
+
+        def replay(self, **kwargs):
+            return ReplayReport(
+                table_name="test",
+                replayed_ok=1,
+                replayed_drift=0,
+                halted=0,
+                warnings=0,
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("regista.Regista", _FakeRegista)
+    monkeypatch.setattr("cairn._doctor.resolve_config", lambda: doctor_ready_cfg)
+    result = CliRunner().invoke(main, ["integrity", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["chain_state"] == "verified"
 
 
 # ----------------------------------------------------------------------

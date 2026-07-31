@@ -48,6 +48,21 @@ _SUITE_ENV_PATHS = [
 ]
 
 
+def _default_integrity_dir() -> str:
+    """Durable location for the integrity verdict (WI-030 review M2).
+
+    The session ``state_dir`` defaults under the system tempdir, which may be
+    tmpfs — a recorded drift FAIL must not evaporate on reboot. Use the OS
+    state-directory convention instead: ``$XDG_STATE_HOME/cairn`` (default
+    ``~/.local/state/cairn``) on POSIX, ``%LOCALAPPDATA%\\cairn`` on Windows.
+    """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return str(Path(base) / "cairn")
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return str(Path(base) / "cairn")
+
+
 def _load_suite_env() -> dict[str, str]:
     for p in _SUITE_ENV_PATHS:
         if p.is_file():
@@ -101,6 +116,10 @@ class CairnEnvConfig:
     content_key_ref: str | None = None
     content_key_path: str | None = None
     content_encryption: str = "on"
+    integrity_max_age_hours: float = 168.0
+    # default_factory, not "": an empty default would make the verdict path
+    # CWD-relative for any direct construction that omits the field.
+    integrity_dir: str = dataclasses.field(default_factory=_default_integrity_dir)
 
     @property
     def is_configured(self) -> bool:
@@ -174,6 +193,25 @@ def resolve_config() -> CairnEnvConfig:
     if content_encryption not in ("on", "off", "external"):
         content_encryption = "on"
 
+    integrity_max_age_raw = (
+        os.environ.get("CAIRN_INTEGRITY_MAX_AGE_HOURS")
+        or suite_env.get("CAIRN_INTEGRITY_MAX_AGE_HOURS")
+        or "168"
+    )
+    try:
+        integrity_max_age_hours = float(integrity_max_age_raw)
+    except ValueError:
+        integrity_max_age_hours = 168.0
+    # Negative or NaN would silently disable staleness; only an explicit 0 may.
+    if integrity_max_age_hours < 0 or integrity_max_age_hours != integrity_max_age_hours:
+        integrity_max_age_hours = 168.0
+
+    integrity_dir = (
+        os.environ.get("CAIRN_INTEGRITY_DIR")
+        or suite_env.get("CAIRN_INTEGRITY_DIR")
+        or _default_integrity_dir()
+    )
+
     return CairnEnvConfig(
         dsn=dsn,
         key_path=key_path,
@@ -187,4 +225,6 @@ def resolve_config() -> CairnEnvConfig:
         content_key_ref=content_key_ref,
         content_key_path=content_key_path,
         content_encryption=content_encryption,
+        integrity_max_age_hours=integrity_max_age_hours,
+        integrity_dir=integrity_dir,
     )
