@@ -55,6 +55,14 @@ dev = [
 [project.scripts]
 cairn = "cairn._cli:cli_entry"
 cairn-bridge = "cairn._bridge:main"
+# Harness hook entry points (WI-033). Generated hook config and the shipped
+# Codex plugin both invoke these names rather than ``python3 -m cairn._*_hook``:
+# a console script's shebang pins cairn's own interpreter, so hook execution can
+# never resolve to a foreign python that cannot import cairn (which silently
+# disabled every hook on a real deployment), and the string is stable at
+# packaging time, so the shipped plugin and the generated entries are identical.
+cairn-claude-hook = "cairn._claude_hook:main"
+cairn-codex-hook = "cairn._codex_hook:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cairn"]

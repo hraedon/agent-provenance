@@ -4,7 +4,13 @@ Codex command hooks receive a JSON object on stdin and are dispatched by the
 ``hook_event_name``.  ``cairn install-harness codex`` registers this module as
 the command for the events cairn attests, invoking it as::
 
-    python3 -m cairn._codex_hook <action>
+    cairn-codex-hook <action>
+
+``cairn-codex-hook`` is a console script from the same distribution, so its
+shebang pins cairn's own interpreter and the string is stable at packaging
+time — which is what lets the shipped Codex plugin
+(``plugins/cairn/hooks/hooks.json``) and the directly generated hooks be
+byte-identical (WI-033).
 
 where ``<action>`` is one of ``session-start``, ``pre``, ``post``, ``stop``
 (see :data:`CODEX_HOOK_ACTIONS`).  The module reuses the Claude adapter's
@@ -61,6 +67,7 @@ from ._claude_hook import (
     _safe_session_id,
     _state_dir,
 )
+from ._hook_selftest import is_selftest, selftest_line
 
 # hook_event_name -> install action token (and back). Only events Cairn handles
 # are registered; SessionStart and tool events attest, while Stop performs
@@ -390,6 +397,13 @@ _DISPATCH = {
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
+    # Side-effect-free liveness probe (WI-033/WI-034): install and doctor run
+    # it to verify the command they wrote/found actually executes.  It must
+    # answer before dispatch so it never emits Codex hook JSON or touches the
+    # store; reaching it proves cairn imported under this interpreter.
+    if is_selftest(args):
+        print(selftest_line("codex"))
+        return 0
     action = args[0] if args else ""
     handler = _DISPATCH.get(action)
     if handler is None:

@@ -11,10 +11,19 @@ temp files under ${CAIRN_STATE_DIR:-/tmp/cairn-sessions}/{session_id}/.
 
 Usage (from .claude/settings.json)::
 
-    python3 -m cairn._claude_hook <action>
+    cairn-claude-hook <action>
 
     Actions: pre, post, post-failure, session-start, session-end,
     message-display, stop, subagent-start, subagent-stop, post-compact
+
+``cairn-claude-hook`` is a console script installed by the same distribution
+as this module, so its shebang pins cairn's own interpreter.  A bare
+``python3 -m cairn._claude_hook`` is still accepted (and still recognised as
+cairn-owned on upgrade) but must not be generated: module resolution then
+depends on whatever ``python3`` the harness's PATH finds, which is not cairn's
+interpreter under any isolated install — uv tool, pipx or venv (WI-033).
+``--selftest`` prints a marker and exits without side effects; install and
+doctor use it to verify the hook actually runs.
 
 Environment (resolved via cairn._config — REGISTA_* preferred, CAIRN_* fallback)::
 
@@ -81,6 +90,8 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, cast
+
+from ._hook_selftest import is_selftest, selftest_line
 
 _DEFAULT_STATE_DIR = str(Path(tempfile.gettempdir()) / "cairn-sessions")
 _FALLBACK_SESSION_ID = "unknown"
@@ -756,12 +767,21 @@ def _env_truthy(name: str) -> bool:
 
 
 def main() -> None:
+    # Liveness probe first: it must answer even when cairn is disabled, and it
+    # must not touch stdin, the state dir or the store, because install and
+    # doctor run it to verify the hook they wrote/found actually executes
+    # (WI-033/WI-034).  Reaching this line already proves the command resolved
+    # and this interpreter could import cairn.
+    if is_selftest(sys.argv[1:]):
+        print(selftest_line("claude"))
+        return
+
     if _env_truthy("CAIRN_DISABLE"):
         return
 
     if len(sys.argv) < 2:
         print(
-            "Usage: cairn_hook.py <pre|post|post-failure|session-start|session-end"
+            "Usage: cairn-claude-hook <pre|post|post-failure|session-start|session-end"
             "|message-display|stop|subagent-start|subagent-stop|post-compact>",
             file=sys.stderr,
         )

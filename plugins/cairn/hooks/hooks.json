@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -m cairn._codex_hook session-start",
-            "commandWindows": "python -m cairn._codex_hook session-start",
+            "command": "cairn-codex-hook session-start",
+            "commandWindows": "cairn-codex-hook session-start",
             "timeout": 10
           }
         ]
@@ -19,8 +19,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -m cairn._codex_hook pre",
-            "commandWindows": "python -m cairn._codex_hook pre",
+            "command": "cairn-codex-hook pre",
+            "commandWindows": "cairn-codex-hook pre",
             "timeout": 10
           }
         ]
@@ -32,8 +32,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -m cairn._codex_hook post",
-            "commandWindows": "python -m cairn._codex_hook post",
+            "command": "cairn-codex-hook post",
+            "commandWindows": "cairn-codex-hook post",
             "timeout": 10
           }
         ]
@@ -44,8 +44,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -m cairn._codex_hook stop",
-            "commandWindows": "python -m cairn._codex_hook stop",
+            "command": "cairn-codex-hook stop",
+            "commandWindows": "cairn-codex-hook stop",
             "timeout": 10
           }
         ]

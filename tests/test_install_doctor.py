@@ -11,6 +11,7 @@ import pytest
 from cairn._config import CairnEnvConfig, resolve_config
 from cairn._doctor import _check_opencode_harness_wired, run_doctor
 from cairn._install import (
+    CAIRN_CODEX_HOOK_COMMAND,
     ConfigLoadError,
     InstallResult,
     InstallStatus,
@@ -391,10 +392,10 @@ def test_install_codex_wires_hooks_only_no_env(cfg, tmp_path, monkeypatch):
     assert result.status is InstallStatus.INSTALLED
     assert result.no_op is False
     data = json.loads(_codex_hooks_file(tmp_path).read_text())
-    # All four attested events registered, pointing at the Codex hook module.
+    # All four attested events registered, pointing at cairn's hook entry point.
     assert set(data["hooks"]) == {"SessionStart", "PreToolUse", "PostToolUse", "Stop"}
     cmd = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-    assert "cairn._codex_hook pre" in cmd
+    assert cmd == f"{CAIRN_CODEX_HOOK_COMMAND} pre"
     # Tool events carry a matcher; SessionStart/Stop do not.
     assert data["hooks"]["PreToolUse"][0]["matcher"] == "*"
     assert "matcher" not in data["hooks"]["Stop"][0]
@@ -433,7 +434,7 @@ def test_install_codex_preserves_user_hooks(cfg, tmp_path):
     data = json.loads(hooks_file.read_text())
     cmds = [h["command"] for e in data["hooks"]["PostToolUse"] for h in e["hooks"]]
     assert "./scripts/mine.sh" in cmds  # user hook preserved
-    assert any("cairn._codex_hook post" in c for c in cmds)  # cairn added alongside
+    assert f"{CAIRN_CODEX_HOOK_COMMAND} post" in cmds  # cairn added alongside
 
 
 def test_uninstall_codex_removes_only_cairn(cfg, tmp_path):
@@ -1927,3 +1928,308 @@ def test_install_harness_opencode_dry_run_exits_zero(cfg, monkeypatch):
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload[0]["status"] == "installed"
+
+
+# ----------------------------------------------------------------------
+# WI-033 — the generated hook must be RUNNABLE, not merely well-formed
+# ----------------------------------------------------------------------
+
+
+def _hook_entry_point_dir() -> Path:
+    """Directory holding cairn's hook console scripts.
+
+    This is the directory a harness session finds on PATH for a uv-tool,
+    pipx or venv install (``~/.local/bin`` or ``<venv>/bin``).
+    """
+    import shutil as _shutil
+    import sys as _sys
+
+    candidate = Path(_sys.executable).parent
+    if (candidate / "cairn-claude-hook").exists():
+        return candidate
+    found = _shutil.which("cairn-claude-hook")
+    assert found, (
+        "cairn-claude-hook console script is not installed — generated hooks "
+        "would name an interpreter that may not be able to import cairn (WI-033)"
+    )
+    return Path(found).parent
+
+
+def test_generated_claude_hook_executes_under_a_stripped_path(tmp_path):
+    """Execute the generated command with PATH stripped to cairn's own bin dir.
+
+    PATH deliberately excludes ``/usr/bin``, so no ``python3`` is resolvable at
+    all.  A console script still runs there because its shebang names cairn's
+    interpreter absolutely; the old ``python3 -m cairn._claude_hook`` form
+    cannot even find an interpreter — which is how all ten hooks on a real host
+    failed on every invocation while ``harness_wired`` reported ok (WI-033).
+
+    Asserting the *string* appears in settings.json is exactly the check that
+    let this run undetected, so this test runs the command.
+    """
+    import subprocess
+
+    from cairn._install import _expected_hook_entry
+
+    entry = _expected_hook_entry("claude", "SessionStart")
+    assert entry is not None
+    command = entry["hooks"][0]["command"]
+    script_dir = _hook_entry_point_dir()
+
+    proc = subprocess.run(
+        command,
+        shell=True,
+        input="{}",
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            "PATH": str(script_dir),
+            "HOME": str(tmp_path),
+            # Keeps the probe side-effect free; the module still has to import
+            # before main() can honour it.
+            "CAIRN_DISABLE": "1",
+        },
+    )
+    assert proc.returncode == 0, (
+        f"generated hook command {command!r} is not runnable with PATH="
+        f"{script_dir}: exit {proc.returncode}\n{proc.stderr}"
+    )
+
+    # And the same command answers the liveness probe used by install/doctor.
+    probe = f"{command.rsplit(' ', 1)[0]} --selftest"
+    proc = subprocess.run(
+        probe,
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={"PATH": str(script_dir), "HOME": str(tmp_path)},
+    )
+    assert proc.returncode == 0, f"{probe!r} failed: {proc.stderr}"
+    assert "cairn-hook-selftest ok" in proc.stdout
+
+
+def test_generated_codex_hook_executes_under_a_stripped_path(tmp_path):
+    """Same guarantee for the Codex hook command (WI-033)."""
+    import subprocess
+
+    from cairn._install import _expected_hook_entry
+
+    entry = _expected_hook_entry("codex", "PostToolUse")
+    assert entry is not None
+    command = entry["hooks"][0]["command"]
+    script_dir = _hook_entry_point_dir()
+
+    probe = f"{command.rsplit(' ', 1)[0]} --selftest"
+    proc = subprocess.run(
+        probe,
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={"PATH": str(script_dir), "HOME": str(tmp_path)},
+    )
+    assert proc.returncode == 0, (
+        f"generated Codex hook command {command!r} is not runnable with PATH="
+        f"{script_dir}: exit {proc.returncode}\n{proc.stderr}"
+    )
+    assert "cairn-hook-selftest ok" in proc.stdout
+
+
+def test_generated_hook_commands_do_not_name_a_bare_interpreter():
+    """A bare ``python3``/``python`` resolves against the harness's PATH, which
+    is not cairn's interpreter under any isolated install (WI-033)."""
+    from cairn._install import (
+        CAIRN_CODEX_HOOK_COMMAND,
+        CAIRN_CODEX_HOOK_COMMAND_WINDOWS,
+        CAIRN_HOOK_COMMAND,
+    )
+
+    for cmd in (
+        CAIRN_HOOK_COMMAND,
+        CAIRN_CODEX_HOOK_COMMAND,
+        CAIRN_CODEX_HOOK_COMMAND_WINDOWS,
+    ):
+        assert not cmd.split()[0].startswith("python"), (
+            f"hook command {cmd!r} depends on PATH module resolution"
+        )
+
+
+def test_legacy_bare_python_hooks_are_still_recognised_as_ours():
+    """Upgrade path: hosts installed by an older version have bare-python
+    hooks, and hosts mitigated by hand have absolute-interpreter ones.  If
+    ownership detection stops recognising them, uninstall leaves them behind
+    and install appends the console-script form alongside the broken old
+    entry (WI-033)."""
+    import sys as _sys
+
+    legacy_claude = (
+        "python3 -m cairn._claude_hook session-start",
+        "python -m cairn._claude_hook session-start",
+        f"{_sys.executable} -m cairn._claude_hook session-start",
+    )
+    for legacy_cmd in legacy_claude:
+        entry = {
+            "matcher": "*",
+            "hooks": [{"type": "command", "command": legacy_cmd, "timeout": 10}],
+        }
+        assert _is_cairn_hook_entry(entry, harness="claude", event="SessionStart"), (
+            f"legacy hook form not recognised: {legacy_cmd}"
+        )
+
+    for legacy_cmd in (
+        "python3 -m cairn._codex_hook post",
+        f"{_sys.executable} -m cairn._codex_hook post",
+    ):
+        entry = {
+            "matcher": "*",
+            "hooks": [{"type": "command", "command": legacy_cmd, "timeout": 10}],
+        }
+        assert _is_cairn_hook_entry(entry, harness="codex", event="PostToolUse"), (
+            f"legacy Codex hook form not recognised: {legacy_cmd}"
+        )
+
+    # A user hook that merely mentions cairn is still not ours.
+    foreign = {
+        "matcher": "*",
+        "hooks": [{"type": "command", "command": "python3 -m mycairn._claude_hook pre"}],
+    }
+    assert not _is_cairn_hook_entry(foreign, harness="claude", event="PreToolUse")
+
+
+def test_upgrade_rewrites_legacy_hooks_in_place(cfg, claude_settings):
+    """An upgrade must REWRITE deployed legacy hooks, not just recognise them.
+
+    Found live on a uv-tool host: recognising the bare-python entries as
+    cairn-owned made install-harness report "already wired (no-op)" and leave
+    all ten broken hooks exactly as they were — so the fix never reached the
+    deployed host. Recognition without rewriting is worse than not recognising:
+    it is silence over a known-broken hook (WI-033).
+    """
+    from cairn._install import CAIRN_HOOK_COMMAND
+
+    claude_settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        # A user hook cairn does not own, first in the list.
+                        {
+                            "matcher": "*",
+                            "hooks": [{"type": "command", "command": "./mine.sh"}],
+                        },
+                        {
+                            "matcher": "*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python3 -m cairn._claude_hook session-start",
+                                    "timeout": 10,
+                                }
+                            ],
+                        },
+                    ]
+                }
+            }
+        )
+    )
+    result = _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    assert not result.no_op, "an upgrade over broken hooks is not a no-op"
+
+    entries = json.loads(claude_settings.read_text())["hooks"]["SessionStart"]
+    commands = [h["command"] for e in entries for h in e.get("hooks", [])]
+    assert "./mine.sh" in commands, "user hook was clobbered"
+    assert f"{CAIRN_HOOK_COMMAND} session-start" in commands, (
+        "legacy hook was recognised but never rewritten"
+    )
+    assert not any("python3 -m cairn._claude_hook" in c for c in commands), (
+        f"the broken legacy hook survived the upgrade: {commands}"
+    )
+    assert len(entries) == 2, f"install duplicated an entry: {entries}"
+
+    # And a second run is a genuine no-op.
+    again = _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    assert again.no_op, [a.detail for a in again.actions]
+
+    _uninstall_claude(
+        claude_settings,
+        json.loads(claude_settings.read_text()),
+        dry_run=False,
+        result=InstallResult(harness="claude"),
+        manifest={},
+    )
+
+
+def test_upgrade_collapses_duplicate_cairn_hooks(cfg, claude_settings):
+    """A host that already accumulated duplicates ends with exactly one."""
+    from cairn._install import CAIRN_HOOK_COMMAND
+
+    legacy = {
+        "matcher": "*",
+        "hooks": [
+            {
+                "type": "command",
+                "command": "python3 -m cairn._claude_hook pre",
+                "timeout": 10,
+            }
+        ],
+    }
+    claude_settings.write_text(
+        json.dumps({"hooks": {"PreToolUse": [legacy, dict(legacy)]}})
+    )
+    _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    entries = json.loads(claude_settings.read_text())["hooks"]["PreToolUse"]
+    assert len(entries) == 1, entries
+    assert entries[0]["hooks"][0]["command"] == f"{CAIRN_HOOK_COMMAND} pre"
+
+
+def test_install_harness_degrades_when_the_hook_command_cannot_run(
+    cfg, claude_settings, monkeypatch
+):
+    """install-harness must VERIFY the hook it writes, not merely record it.
+
+    The WI-034 lesson applied to the installer: a hook that was written but
+    never executed is not evidence of anything, and reporting ``installed`` on
+    an unrunnable hook is how a total loss of session attestation went
+    unnoticed (WI-033).
+    """
+    monkeypatch.setattr(
+        "cairn._install.CAIRN_HOOK_COMMAND", "cairn-claude-hook-not-installed"
+    )
+    result = _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+
+    assert result.status is InstallStatus.FAILED or result.status.value == "degraded", (
+        f"unrunnable hook reported as {result.status.value}"
+    )
+    assert any(
+        a.kind == "error" and "not runnable" in a.detail for a in result.actions
+    ), [a.detail for a in result.actions]
+
+    from cairn._install import results_succeeded
+
+    assert not results_succeeded([result])
+
+
+def test_install_harness_reports_verified_hook_command(cfg, claude_settings):
+    """The happy path records that the hook was executed, not just written."""
+    result = _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    assert result.status is InstallStatus.INSTALLED, [a.detail for a in result.actions]
+    assert any(a.kind in ("verify", "warn") for a in result.actions), [
+        a.detail for a in result.actions
+    ]
+
+
+def test_hook_verification_can_be_bypassed_explicitly(
+    cfg, claude_settings, monkeypatch
+):
+    """An operator whose harness PATH differs from the installer's can opt out
+    — loudly and on purpose, never by default."""
+    from cairn._install import SKIP_HOOK_VERIFICATION_ENV
+
+    monkeypatch.setattr(
+        "cairn._install.CAIRN_HOOK_COMMAND", "cairn-claude-hook-not-installed"
+    )
+    monkeypatch.setenv(SKIP_HOOK_VERIFICATION_ENV, "1")
+    result = _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    assert result.status is InstallStatus.INSTALLED
