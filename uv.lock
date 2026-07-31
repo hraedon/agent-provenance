@@ -81,7 +81,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
-    { name = "regista-hraedon" },
+    { name = "regista-hraedon", extra = ["encryption"] },
     { name = "rfc8785" },
     { name = "structlog" },
 ]
@@ -111,7 +111,7 @@ requires-dist = [
     { name = "pynacl", marker = "extra == 'dev'", specifier = ">=1.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
-    { name = "regista-hraedon", editable = "../regista" },
+    { name = "regista-hraedon", extras = ["encryption"], editable = "../regista" },
     { name = "regista-hraedon", extras = ["vault"], marker = "extra == 'vault'", editable = "../regista" },
     { name = "rfc8785", specifier = ">=0.1.4" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.16,<1" },
@@ -956,6 +956,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+encryption = [
+    { name = "cryptography" },
+]
 vault = [
     { name = "hvac" },
 ]

@@ -2655,6 +2655,32 @@ def test_content_encryption_ok_when_the_key_actually_resolves(tmp_path):
     result = _check_content_encryption(cfg)
     assert result["status"] == "ok", result
     assert "resolves" in result["detail"]
+    # WI-040: ok means the cipher round-tripped, not merely that the fetch
+    # worked — the detail says so.
+    assert "encrypts" in result["detail"]
+
+
+def test_content_encryption_fails_on_a_key_that_resolves_but_cannot_encrypt(tmp_path):
+    """WI-040: the doctor said ok over a key every capture rejected.
+
+    Wrong-size key material resolves fine; only exercising the cipher
+    catches it. The check must report the state capture will actually hit:
+    content withheld, not protected.
+    """
+    from cairn._doctor import _check_content_encryption
+
+    key = tmp_path / "content.key"
+    key.write_bytes(b"x" * 40)
+    cfg = CairnEnvConfig(
+        dsn="postgresql://x@h/db",
+        key_path=str(tmp_path / "keys.json"),
+        project="test",
+        content_key_path=str(key),
+    )
+    result = _check_content_encryption(cfg)
+    assert result["status"] == "fail", result
+    assert "cannot encrypt" in result["detail"]
+    assert "withheld" in result["detail"]
 
 
 def test_content_encryption_catches_the_vault_field_suffix_trap(tmp_path):

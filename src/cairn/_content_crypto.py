@@ -28,6 +28,16 @@ resolve is placed where the CLAIM is made and nowhere else:
   once per session — and by ``cairn doctor``.  Positive verdicts are memoised
   for the life of the process; negative ones are re-probed, so a transient
   outage self-heals and a stale verdict can never read greener than reality.
+
+  WI-040: resolving is not *using*.  Immediately after WI-037 shipped, this
+  host reported ``content_encryption ok — key resolves`` while every capture
+  raised: first because ``cryptography`` was absent from cairn's venv, then
+  because the resolved key was the wrong size for its declared algorithm
+  (regista WI-231).  The verdict therefore comes from
+  :func:`verify_content_key`, which encrypts a fixed test vector with the
+  resolved key through the same regista primitive capture uses — one probe
+  that catches a missing cipher, wrong key material, and any future scheme
+  mismatch, instead of a key fetch that proves only the fetch.
 * :func:`encrypt_content_fields` adds no probe at all.  The encryption itself
   resolves the key, so success *is* the proof; failure raises
   :class:`ContentEncryptionUnavailableError` rather than handing back plaintext.
@@ -149,6 +159,48 @@ def resolve_content_key_ref() -> str | None:
     return resolve_content_settings().configured_key_ref
 
 
+#: Fixed, non-sensitive plaintext for the cipher probe.  Constant on purpose:
+#: the probe must never touch session content, and a fixed vector makes the
+#: probe's cost and behaviour identical on every host.
+_CIPHER_PROBE_VECTOR = "cairn content-encryption probe"
+
+
+def verify_content_key(key_ref: str) -> tuple[bool, str]:
+    """Prove *key_ref* can actually encrypt content. Returns ``(ok, detail)``.
+
+    ``verify_secret_ref`` answers "does the ref resolve?" — necessary, and
+    proven insufficient the day it shipped (WI-040): a key can resolve and
+    still be unusable because the cipher is not importable or the material is
+    wrong for the algorithm.  So after the resolve check, encrypt the fixed
+    test vector through :func:`regista._encryption.encrypt_fields` — the same
+    call capture makes — and round-trip it back.  Success is the only state
+    this function calls usable.
+
+    Nothing here returns, logs or prints secret material: the probe plaintext
+    is a public constant and the ciphertext is discarded.
+    """
+    ok, detail = verify_secret_ref(key_ref)
+    if not ok:
+        return False, detail
+    try:
+        from regista._encryption import decrypt_fields, encrypt_fields
+    except Exception as exc:  # pragma: no cover - regista always present
+        return False, f"resolves, but regista's encryption primitive is unavailable: {exc}"
+    try:
+        encrypted = encrypt_fields(
+            {"probe": _CIPHER_PROBE_VECTOR},
+            field_paths=["probe"],
+            key_ref=key_ref,
+            key_id="cairn-cipher-probe",
+        )
+        decrypted = decrypt_fields(encrypted, key_source=key_ref)
+    except Exception as exc:
+        return False, f"resolves, but cannot encrypt with it: {exc}"
+    if decrypted.get("probe") != _CIPHER_PROBE_VECTOR:
+        return False, "resolves, but the cipher round-trip returned the wrong plaintext"
+    return True, "resolves and encrypts (cipher round-trip verified)"
+
+
 def content_encryption_status_for(settings: ContentSettings) -> ContentEncryptionStatus:
     """Resolve *settings* into a verdict. Pure with respect to caching.
 
@@ -186,7 +238,7 @@ def content_encryption_status_for(settings: ContentSettings) -> ContentEncryptio
                 "until a key is set"
             ),
         )
-    ok, detail = verify_secret_ref(key_ref)
+    ok, detail = verify_content_key(key_ref)
     return ContentEncryptionStatus(
         stance=stance, key_ref=key_ref, usable=ok, detail=detail
     )
