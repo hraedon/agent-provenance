@@ -6,6 +6,10 @@ and register the packaged integration, and that the CLI conformance cases pass
 against the installed wheel rather than silently skipping. Editable-source
 coverage is not sufficient: a packaging or force-include mistake can leave the
 wheel pluginless while local tests still pass.
+
+They also pin the WI-038 decision that the Codex plugin bundle (``plugins/cairn``)
+is deliberately *not* shipped, so its absence reads as a decision rather than an
+oversight.
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -30,21 +35,101 @@ _COUNT_RE = {
 }
 
 
+def _has_pip() -> bool:
+    return (
+        subprocess.run(
+            [sys.executable, "-m", "pip", "--version"],
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def _builder() -> str:
+    """Which tool can build/install here: ``pip``, ``uv``, or ``""``.
+
+    A uv-created venv has no ``pip`` module, which is how this whole file failed
+    with "No module named pip" — i.e. the wheel gate could not run at all, and a
+    gate that cannot run verifies nothing.  uv itself builds and installs the
+    same wheel, so prefer pip when present and fall back to uv.
+    """
+    if _has_pip():
+        return "pip"
+    if shutil.which("uv"):
+        return "uv"
+    return ""
+
+
+def _require_builder() -> str:
+    builder = _builder()
+    if not builder:
+        pytest.skip("neither pip nor uv is available to build/install a wheel")
+    return builder
+
+
 def _build_wheel(tmp_path: Path) -> Path:
     """Build a cairn wheel into *tmp_path*/wheels and return its path."""
     wheel_dir = tmp_path / "wheels"
     wheel_dir.mkdir()
-    subprocess.run(
-        [
+    if _require_builder() == "pip":
+        cmd = [
             sys.executable, "-m", "pip", "wheel",
             str(REPO_ROOT), "--no-deps", "-w", str(wheel_dir),
-        ],
-        check=True,
-        cwd=str(REPO_ROOT),
-    )
+        ]
+    else:
+        cmd = ["uv", "build", "--wheel", "--out-dir", str(wheel_dir), str(REPO_ROOT)]
+    subprocess.run(cmd, check=True, cwd=str(REPO_ROOT))
     wheels = list(wheel_dir.glob("cairn-*.whl"))
     assert wheels, "no cairn wheel built"
     return wheels[0]
+
+
+def _install_wheel(wheel: Path, target: Path, *, with_deps: bool) -> None:
+    """Install *wheel* into *target*, with or without its declared deps."""
+    if _require_builder() == "pip":
+        cmd = [sys.executable, "-m", "pip", "install", "--target", str(target), str(wheel)]
+        if not with_deps:
+            cmd.insert(4, "--no-deps")
+    else:
+        cmd = ["uv", "pip", "install", "--target", str(target), str(wheel)]
+        if not with_deps:
+            cmd.insert(3, "--no-deps")
+    subprocess.run(cmd, check=True)
+
+
+@pytest.mark.slow
+def test_wheel_ships_integrations_but_not_the_codex_plugin_bundle(tmp_path: Path) -> None:
+    """The packaging decision of WI-038, asserted against the artifact.
+
+    ``integrations/`` must be inside the wheel because installed cairn reads it
+    by path.  ``plugins/cairn/`` must NOT be: it is the Codex marketplace form,
+    built by ``agent-suite codex-plugins build-marketplace`` from the workspace
+    checkout, and no installed-cairn code path opens it.  Both halves are
+    asserted so neither can change by accident — see the comment on
+    ``[tool.hatch.build.targets.wheel.force-include]`` in pyproject.toml.
+    """
+    import zipfile
+
+    wheel = _build_wheel(tmp_path)
+    names = zipfile.ZipFile(wheel).namelist()
+
+    assert "cairn/integrations/opencode/index.js" in names
+    shipped_plugin_bundle = [
+        n for n in names if n.startswith("plugins/") or "/plugins/cairn/" in n
+    ]
+    assert not shipped_plugin_bundle, (
+        "the Codex plugin bundle is in the wheel; if that is now intended, update "
+        f"the force-include comment in pyproject.toml: {shipped_plugin_bundle}"
+    )
+
+    # And the reason it need not ship: Codex wiring is generated from code.
+    from cairn._install import CODEX_HOOK_EVENTS, _expected_hook_entry
+
+    assert CODEX_HOOK_EVENTS
+    for event in CODEX_HOOK_EVENTS:
+        entry = _expected_hook_entry("codex", event)
+        assert entry["hooks"][0]["command"].startswith("cairn-codex-hook")
 
 
 @pytest.mark.slow
@@ -52,13 +137,7 @@ def test_wheel_install_opencode_finds_plugin(tmp_path: Path, monkeypatch) -> Non
     """A released-wheel install must register the packaged OpenCode plugin."""
     wheel = _build_wheel(tmp_path)
     target = tmp_path / "installed"
-    subprocess.run(
-        [
-            sys.executable, "-m", "pip", "install",
-            "--no-deps", "--target", str(target), str(wheel),
-        ],
-        check=True,
-    )
+    _install_wheel(wheel, target, with_deps=False)
 
     # Verify the plugin file is inside the installed wheel layout.
     plugin = target / "cairn" / "integrations" / "opencode" / "index.js"
@@ -106,13 +185,7 @@ def test_wheel_install_conformance_cases_pass(tmp_path: Path) -> None:
     # Install the wheel and its declared runtime dependencies into a clean target
     # directory. This proves the wheel metadata is sufficient for resolution and
     # that the conformance gate does not depend on the editable source layout.
-    subprocess.run(
-        [
-            sys.executable, "-m", "pip", "install",
-            "--target", str(target), str(wheel),
-        ],
-        check=True,
-    )
+    _install_wheel(wheel, target, with_deps=True)
 
     # cairn + its runtime dependencies landed in the target directory.
     assert (target / "cairn" / "__init__.py").is_file()

@@ -788,6 +788,12 @@ def _configured_cfg() -> CairnEnvConfig:
     )
 
 
+def _doctor_module():
+    import cairn._doctor as mod
+
+    return mod
+
+
 def _make_transcript(base, session_id: str, age_secs: float) -> None:
     """Write a fake session transcript with a given age."""
     import time
@@ -972,15 +978,85 @@ def test_freshness_warns_for_a_harness_with_no_local_signal(monkeypatch, tmp_pat
 
 
 def test_freshness_ok_without_local_claude_transcripts(monkeypatch, tmp_path):
-    """No transcripts at all is what an unused Claude looks like."""
+    """An existing but empty transcript store is what an unused Claude looks like."""
     from cairn._doctor import _check_attestation_freshness
 
-    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path / "empty"))
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(empty))
     result = _check_attestation_freshness(
         _configured_cfg(), _probe(), regista_ok=True, harnesses=["claude"]
     )
     assert result["status"] == "ok"
     assert "no sessions ran" in result["detail"]
+
+
+def test_freshness_will_not_read_an_unreadable_store_as_disuse(monkeypatch, tmp_path):
+    """WI-039: a RELOCATED transcript directory is a check that cannot look.
+
+    Pre-fix, a ``~/.claude/projects`` that was not where cairn looked returned
+    "no sessions ran" and the check reported ``ok`` — a verdict about input it
+    never saw.  It must say it has no signal instead.
+    """
+    from cairn._doctor import _check_attestation_freshness
+
+    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path / "moved-away"))
+    result = _check_attestation_freshness(
+        _configured_cfg(), _probe(), regista_ok=True, harnesses=["claude"]
+    )
+    assert result["status"] == "warn", result
+    assert "could not read" in result["detail"]
+    assert "has not established disuse" in result["detail"]
+    assert "no sessions ran" not in result["detail"]
+
+
+def test_freshness_names_the_blind_spot_for_harnesses_without_a_signal(monkeypatch, tmp_path):
+    """The honest answer for OpenCode/Codex: say what cannot be distinguished.
+
+    WI-039 accepts "the check admits its blind spot" as the fix.  What it must
+    not do is imply it looked: the detail names the two cases it cannot tell
+    apart, and how to give the check a signal.
+    """
+    from cairn._doctor import _check_attestation_freshness
+
+    for harness, env_name in (("opencode", "CAIRN_OPENCODE_SESSIONS"),
+                              ("codex", "CAIRN_CODEX_SESSIONS")):
+        result = _check_attestation_freshness(
+            _configured_cfg(), _probe(), regista_ok=True, harnesses=[harness]
+        )
+        assert result["status"] == "warn", result
+        assert "no local signal" in result["detail"]
+        assert "'ran and did not attest' from 'did not run'" in result["detail"]
+        assert env_name in result["detail"]
+
+
+def test_freshness_uses_an_operator_declared_signal_for_opencode(monkeypatch, tmp_path):
+    """An operator who knows the layout can give the check eyes.
+
+    With ``CAIRN_OPENCODE_SESSIONS`` pointing at OpenCode's own session store, a
+    session that provably ran and did not attest becomes a FAIL rather than the
+    warning cairn has to settle for when it cannot see anything.
+    """
+    from cairn._doctor import _check_attestation_freshness
+
+    store = tmp_path / "opencode-sessions"
+    _make_transcript(store, "recent-opencode-session", age_secs=60)
+    monkeypatch.setenv("CAIRN_OPENCODE_SESSIONS", str(store))
+
+    result = _check_attestation_freshness(
+        _configured_cfg(), _probe(), regista_ok=True, harnesses=["opencode"]
+    )
+    assert result["status"] == "fail", result
+    assert "configured and silent" in result["detail"]
+
+    # And an old session in that same store demands nothing.
+    store2 = tmp_path / "opencode-old"
+    _make_transcript(store2, "old-session", age_secs=3 * 24 * 3600)
+    monkeypatch.setenv("CAIRN_OPENCODE_SESSIONS", str(store2))
+    result = _check_attestation_freshness(
+        _configured_cfg(), _probe(), regista_ok=True, harnesses=["opencode"]
+    )
+    assert result["status"] == "ok", result
 
 
 def test_freshness_stale_session_attestation_is_not_fresh(monkeypatch, tmp_path):
@@ -1828,7 +1904,15 @@ def doctor_ready_cfg(cfg, monkeypatch, tmp_path):
     monkeypatch.setenv(
         "PATH", f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}"
     )
-    monkeypatch.setattr("cairn._doctor._newest_local_session_activity", lambda: None)
+    # No local session activity for any harness, deterministically: without this
+    # the freshness check reads the OPERATOR's real ~/.claude/projects and these
+    # chain-focused tests fail on whatever the host happened to be doing.
+    monkeypatch.setattr(
+        "cairn._doctor._harness_local_activity",
+        lambda harness, window_secs: _doctor_module()._LocalActivity(
+            False, f"{harness} test stub: no local sessions"
+        ),
+    )
     monkeypatch.setattr(
         "cairn._doctor._check_content_encryption",
         lambda cfg: {"name": "content_encryption", "status": "ok", "detail": "test"},

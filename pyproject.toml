@@ -77,7 +77,25 @@ cairn-codex-hook = "cairn._codex_hook:main"
 packages = ["src/cairn"]
 
 [tool.hatch.build.targets.wheel.force-include]
+# ``integrations/`` ships because installed cairn READS it: ``install-harness
+# opencode`` registers ``cairn/integrations/opencode/index.js`` by path, so a
+# wheel without it wires a plugin that is not there (hence the wheel test).
 "integrations" = "cairn/integrations"
+
+# ``plugins/cairn/`` is deliberately NOT shipped (WI-038).  It is the Codex
+# *marketplace* form of this component, and its only consumer —
+# ``agent-suite codex-plugins build-marketplace`` — resolves it from the
+# workspace checkout and symlinks that directory into the generated marketplace.
+# Nothing in installed cairn reads it: ``install-harness --target codex`` writes
+# ``~/.codex/hooks.json`` from ``_install._expected_hook_entry`` in code, so an
+# installed cairn can already wire Codex without the bundle.  Shipping it would
+# add a second copy of a manifest that must stay byte-identical to the entries
+# the installer generates (``test_plugin_hooks_match_direct_installer_canonical_entries``)
+# while being loaded from a path Codex never looks at — a drift surface with no
+# consumer.  If an installed cairn ever needs to materialise its own Codex
+# plugin, force-include it HERE and extend
+# ``test_wheel_ships_integrations_but_not_the_codex_plugin_bundle``; do not
+# assume from the repo layout that it already ships.
 
 [tool.hatch.metadata]
 allow-direct-references = true

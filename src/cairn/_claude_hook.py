@@ -369,6 +369,22 @@ def _mark_degraded(session_id: str, action: str, detail: str) -> None:
         f.write(entry + "\n")
 
 
+def _note_withheld_content(
+    session_id: str, action: str, reply: dict[str, Any] | None
+) -> None:
+    """Record locally that the bridge withheld content it could not encrypt.
+
+    The event itself already carries the reason (signed, WI-037); this puts the
+    same fact where an operator looks first, so "encryption broke and content
+    stopped being captured" is attributable without querying the store.
+    """
+    if not reply:
+        return
+    note = reply.get("content_encryption_error")
+    if isinstance(note, str) and note:
+        _mark_degraded(session_id, action, note)
+
+
 def _extract_files(tool_name: str, tool_input: dict[str, Any]) -> list[str]:
     files: list[str] = []
     for key in ("filePath", "file_path", "path", "file"):
@@ -647,6 +663,7 @@ def handle_message_display() -> None:
     )
     if not reply or reply.get("status") != "ok":
         _mark_degraded(session_id, "message_display", "assistant message bridge call failed")
+    _note_withheld_content(session_id, "message_display", reply)
 
 
 def handle_stop() -> None:
@@ -670,6 +687,7 @@ def handle_stop() -> None:
     )
     if not reply or reply.get("status") != "ok":
         _mark_degraded(session_id, "stop", "transcript attestation bridge call failed")
+    _note_withheld_content(session_id, "stop", reply)
 
 
 def handle_subagent_start() -> None:
@@ -757,6 +775,7 @@ def handle_post_compact() -> None:
     )
     if not reply or reply.get("status") != "ok":
         _mark_degraded(session_id, "post_compact", "compaction bridge call failed")
+    _note_withheld_content(session_id, "post_compact", reply)
 
 
 def _env_truthy(name: str) -> bool:

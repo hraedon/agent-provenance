@@ -33,6 +33,8 @@ _CONFIG_ENV_VARS = [
     "CAIRN_OPENCODE_CONFIG",
     "CAIRN_HERMES_HOME",
     "CAIRN_CLAUDE_PROJECTS",
+    "CAIRN_OPENCODE_SESSIONS",
+    "CAIRN_CODEX_SESSIONS",
     "CAIRN_MAX_ATTESTATION_AGE_HOURS",
     "CLAUDE_PROJECT_DIR",
 ]
@@ -52,6 +54,12 @@ def _isolate_config_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr("cairn._config._load_suite_env", lambda: {})
     monkeypatch.setattr("cairn._config._SUITE_ENV_PATHS", [])
+    # The content-encryption verdict memoises resolvable keys for the life of
+    # the process (WI-037); a verdict from a previous test must never leak into
+    # the next one, or a test could pass on a stale "key resolves".
+    from cairn._content_crypto import reset_content_encryption_status_cache
+
+    reset_content_encryption_status_cache()
 
 
 @pytest.fixture

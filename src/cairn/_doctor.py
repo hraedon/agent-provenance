@@ -37,7 +37,8 @@ except ImportError:
     pass
 
 from . import __version__ as _cairn_version  # noqa: E402
-from ._config import resolve_config  # noqa: E402
+from ._config import ContentSettings, resolve_config  # noqa: E402
+from ._content_crypto import content_encryption_status_for  # noqa: E402
 from ._install import (  # noqa: E402
     CODEX_HOOK_EVENTS,
     HOOK_EVENTS,
@@ -52,6 +53,12 @@ from ._install import (  # noqa: E402
     _opencode_config_path,
     verify_hook_command,
 )
+from ._secretrefs import (  # noqa: E402
+    KNOWN_SECRET_SCHEMES,
+    VAULT_MIN_SEGMENTS,
+    secret_ref_static_problem,
+    verify_secret_ref,
+)
 
 # ---------------------------------------------------------------------------
 # Secret references: resolve them, do not merely observe that they are set
@@ -60,89 +67,17 @@ from ._install import (  # noqa: E402
 # presence?".  A configured-but-unresolvable ref reads green under every
 # presence check, which is how a host whose only ``vault:`` ref was provably
 # 403 kept reporting a reachable secret backend (agent-suite WI-041).
+#
+# The judgement itself lives in ``_secretrefs`` (WI-037) because the RUNTIME
+# needs the same verdict this module publishes, and cannot import this one.
 # ---------------------------------------------------------------------------
 
-#: regista's canonical provider names (``regista._secrets``). Note ``azure``
-#: and ``windows`` — not ``akv``/``wincred``, which several docs print and no
-#: resolver accepts.
-_KNOWN_SECRET_SCHEMES = frozenset({"file", "env", "literal", "vault", "azure", "windows"})
-
-#: ``vault:mount/path…/field`` — regista's provider requires at least four
-#: segments and takes the field from the LAST one.
-_VAULT_MIN_SEGMENTS = 4
-
-
-def _secret_ref_static_problem(ref: str) -> str | None:
-    """Why *ref* can never resolve, judged without touching any backend.
-
-    Three ref-shape traps this estate actually hit (agent-suite WI-041):
-
-    1. The mount is ``kv/``, not the ``secret/`` the install docs print.  A
-       wrong mount is a runtime 403 rather than a parse error, so only
-       resolution catches it — which is why this is paired with a real resolve.
-    2. **The field is the LAST PATH SEGMENT.**  The documented ``#field``
-       suffix has never resolved, and it fails worse than cleanly:
-       ``vault:kv/a/b/regista#hmac_key`` parses to field
-       ``regista#hmac_key`` — a *different, neighbouring* secret.
-    3. ``vault:`` refs resolve only where ``hvac`` is importable in the
-       resolving component's OWN environment.  Each suite CLI is its own uv
-       tool venv, so ``vault`` in regista's provider list says nothing about
-       cairn's; without ``hvac`` the ref fails with "Unknown secret provider".
-    """
-    if not ref:
-        return "empty secret reference"
-    scheme, sep, rest = ref.partition(":")
-    if not sep or scheme not in _KNOWN_SECRET_SCHEMES:
-        return (
-            f"{ref!r} names no known backend scheme, so it resolves as a literal "
-            f"secret value rather than a reference "
-            f"(known: {', '.join(sorted(_KNOWN_SECRET_SCHEMES))})"
-        )
-    if scheme == "vault":
-        if "#" in ref:
-            return (
-                f"vault ref {ref!r} uses '#field'; the field is the LAST PATH "
-                "SEGMENT (vault:mount/path/field). This form does not error "
-                "cleanly — it addresses a different, neighbouring secret"
-            )
-        segments = rest.split("/")
-        if len(segments) < _VAULT_MIN_SEGMENTS:
-            return (
-                f"vault ref {ref!r} has {len(segments)} segment(s); regista "
-                f"requires mount/path…/field (at least {_VAULT_MIN_SEGMENTS})"
-            )
-        import importlib.util
-
-        if importlib.util.find_spec("hvac") is None:
-            return (
-                f"vault ref {ref!r} cannot resolve in cairn's environment: "
-                "hvac is not importable here, so regista registers no vault "
-                "provider and the ref fails with 'Unknown secret provider'. "
-                "Reinstall cairn with the vault extra (uv tool install "
-                "'cairn[vault]', pipx install 'cairn[vault]')"
-            )
-    return None
-
-
-def _verify_secret_ref(ref: str) -> tuple[bool, str]:
-    """Actually resolve *ref*. Returns ``(ok, detail)``.
-
-    The resolved value is discarded immediately and never returned, logged or
-    printed — only whether resolution succeeded, and on failure the resolver's
-    reason.
-    """
-    static = _secret_ref_static_problem(ref)
-    if static is not None:
-        return False, static
-    try:
-        from regista._secrets import resolve as resolve_secret
-    except Exception as exc:  # pragma: no cover - regista always present
-        return False, f"regista secret resolver unavailable: {exc}"
-    try:
-        resolve_secret(ref)
-    except Exception as exc:
-        return False, f"does not resolve: {exc}"
-    return True, "resolves"
+#: Kept as module-private aliases: these names are the doctor's vocabulary and
+#: are referenced by name in its tests.
+_KNOWN_SECRET_SCHEMES = KNOWN_SECRET_SCHEMES
+_VAULT_MIN_SEGMENTS = VAULT_MIN_SEGMENTS
+_secret_ref_static_problem = secret_ref_static_problem
+_verify_secret_ref = verify_secret_ref
 
 
 def _check_config(cfg: Any) -> dict[str, Any]:
@@ -1407,11 +1342,24 @@ def _check_bridge() -> dict[str, Any]:
 def _check_content_encryption(cfg: Any) -> dict[str, Any]:
     """Check content-encryption stance (Plan 010 WI-3.1).
 
+    Rendered from the RUNTIME's own verdict (``_content_crypto``), not from a
+    second implementation of the same question.  Resolve the ref, do not merely
+    note that it is set: a configured-but-unresolvable key means content
+    encryption is reported ON while the key it names cannot be fetched
+    (agent-suite WI-041; cairn WI-034).  Since WI-037 the runtime refuses to
+    store plaintext in that state and records the refusal per event, so this
+    check and what capture actually does cannot disagree.
+
     When content encryption is off, emit a WARNING — the log now holds
     every secret/PII that passed through the session.
     """
-    stance = getattr(cfg, "content_encryption", "on")
-    if stance == "off":
+    settings = ContentSettings(
+        encryption=str(getattr(cfg, "content_encryption", "on")),
+        key_ref=getattr(cfg, "content_key_ref", None),
+        key_path=getattr(cfg, "content_key_path", None),
+    )
+    status = content_encryption_status_for(settings)
+    if status.stance == "off":
         return {
             "name": "content_encryption",
             "status": "warn",
@@ -1420,41 +1368,35 @@ def _check_content_encryption(cfg: Any) -> dict[str, Any]:
                 "plaintext. The log itself is now a sensitive artifact."
             ),
         }
-    if stance == "external":
+    if status.stance == "external":
         return {
             "name": "content_encryption",
             "status": "ok",
             "detail": "Content encryption delegated to lower layer (external)",
         }
-    configured_ref = getattr(cfg, "content_key_ref", None)
-    configured_path = getattr(cfg, "content_key_path", None)
-    if not configured_ref and not configured_path:
+    if not status.configured:
         return {
             "name": "content_encryption",
             "status": "warn",
             "detail": (
                 "Content encryption is ON but no content key configured "
                 "(CAIRN_CONTENT_KEY_REF / CAIRN_CONTENT_KEY_PATH). "
-                "Content capture will store plaintext until a key is set."
+                "Content capture will store plaintext until a key is set, and "
+                "attestations will record content_encryption=off accordingly."
             ),
         }
-    # Resolve the ref, do not merely note that it is set. A configured but
-    # unresolvable key means content encryption is reported ON while the key it
-    # names cannot be fetched — plaintext capture with a green check over it
-    # (agent-suite WI-041; cairn WI-034). ``resolve_content_key_ref`` builds the
-    # same ``file:`` form the runtime uses, so this probes the real ref.
-    key_ref = configured_ref or f"file:{configured_path}"
-    ok, detail = _verify_secret_ref(key_ref)
-    if not ok:
+    key_ref = status.key_ref or ""
+    if not status.usable:
         # ``detail`` already names the ref when the problem is its shape; only
         # add the ref when the resolver's reason does not carry it.
-        subject = "its key" if key_ref in detail else f"its key {key_ref!r}"
+        subject = "its key" if key_ref in status.detail else f"its key {key_ref!r}"
         return {
             "name": "content_encryption",
             "status": "fail",
             "detail": (
-                f"Content encryption is ON but {subject} {detail} — content "
-                "would be captured in plaintext, or capture would fail"
+                f"Content encryption is ON but {subject} {status.detail} — "
+                "session content will be withheld from capture (digest only) "
+                "rather than stored in plaintext"
             ),
         }
     return {
@@ -1464,61 +1406,139 @@ def _check_content_encryption(cfg: Any) -> dict[str, Any]:
     }
 
 
-def _newest_local_session_activity() -> float | None:
-    """Newest mtime among local Claude Code session transcripts.
+#: Where cairn may look for local evidence that a harness ran a session.
+#:
+#: Claude Code has a layout cairn knows (one ``<session-uuid>.jsonl`` per session
+#: under ``~/.claude/projects/<encoded-cwd>/``).  OpenCode and Codex do not have
+#: one cairn can claim to know, and a GUESSED default would be worse than none:
+#: a wrong path holds no files, which reads as "the harness did not run" — the
+#: fail-open answer, dressed as evidence (WI-039).  So there is no default for
+#: them; an operator who knows their layout can point the check at it, and until
+#: they do the check says plainly that it cannot tell.
+_HARNESS_ACTIVITY_DIR_ENV: dict[str, str] = {
+    "claude": "CAIRN_CLAUDE_PROJECTS",
+    "opencode": "CAIRN_OPENCODE_SESSIONS",
+    "codex": "CAIRN_CODEX_SESSIONS",
+}
 
-    Claude Code writes one ``<session-uuid>.jsonl`` per session under
-    ``~/.claude/projects/<encoded-cwd>/``.  The newest mtime is evidence
-    that sessions ran, independent of whether anything attested.
-    ``CAIRN_CLAUDE_PROJECTS`` overrides the base directory (tests, or a
-    non-default harness home).
+#: Bounds on the activity scan — this runs inside ``cairn doctor``, not a batch job.
+_ACTIVITY_SCAN_MAX_DEPTH = 3
+_ACTIVITY_SCAN_MAX_FILES = 5000
+
+
+@dataclass(frozen=True)
+class _LocalActivity:
+    """Whether a harness provably ran locally, and what cairn consulted.
+
+    ``ran`` is deliberately tri-state.  ``None`` means *cairn has no evidence*,
+    which is a different statement from ``False`` ("it did not run") and must
+    never be reported as the latter: that is the difference between a check that
+    verifies and one that merely looks like it did.
     """
-    base = os.environ.get("CAIRN_CLAUDE_PROJECTS") or os.path.join(
-        os.path.expanduser("~"), ".claude", "projects"
-    )
+
+    ran: bool | None
+    detail: str
+
+
+def _harness_activity_dir(harness: str) -> tuple[str | None, str]:
+    """``(directory, how it was chosen)`` for *harness*'s local session store."""
+    env_name = _HARNESS_ACTIVITY_DIR_ENV.get(harness)
+    if env_name:
+        declared = os.environ.get(env_name)
+        if declared and declared.strip():
+            return declared.strip(), env_name
+    if harness == "claude":
+        return os.path.join(os.path.expanduser("~"), ".claude", "projects"), "default"
+    return None, ""
+
+
+def _newest_activity_mtime(base: str) -> tuple[bool, float | None]:
+    """``(readable, newest mtime)`` for a local session store.
+
+    ``readable`` is False when the directory is absent or cannot be scanned —
+    the case a caller must NOT read as disuse.
+    """
+    if not os.path.isdir(base):
+        return False, None
     newest: float | None = None
+    seen = 0
     try:
-        with os.scandir(base) as projects:
-            for proj in projects:
-                if not proj.is_dir():
+        for root, dirs, files in os.walk(base):
+            if root[len(base) :].count(os.sep) >= _ACTIVITY_SCAN_MAX_DEPTH:
+                dirs[:] = []
+            for name in files:
+                if name.startswith("."):
                     continue
                 try:
-                    with os.scandir(proj.path) as files:
-                        for f in files:
-                            if not f.name.endswith(".jsonl"):
-                                continue
-                            mtime = f.stat().st_mtime
-                            if newest is None or mtime > newest:
-                                newest = mtime
+                    mtime = os.stat(os.path.join(root, name)).st_mtime
                 except OSError:
                     continue
+                seen += 1
+                if newest is None or mtime > newest:
+                    newest = mtime
+                if seen >= _ACTIVITY_SCAN_MAX_FILES:
+                    return True, newest
     except OSError:
+        return newest is not None, newest
+    return True, newest
+
+
+def _newest_local_session_activity() -> float | None:
+    """Newest mtime among local Claude Code session transcripts, or None."""
+    base, _source = _harness_activity_dir("claude")
+    if base is None:  # pragma: no cover - claude always has a default
         return None
+    _readable, newest = _newest_activity_mtime(base)
     return newest
 
 
-def _harness_sessions_ran_locally(harness: str, window_secs: float) -> bool | None:
-    """Whether *harness* provably ran a session inside the window, locally.
+def _harness_local_activity(harness: str, window_secs: float) -> _LocalActivity:
+    """What cairn can locally establish about *harness* running a session.
 
-    ``True``/``False`` when there is local evidence either way, ``None`` when
-    cairn has no local signal for that harness at all — in which case silence
-    cannot be distinguished from disuse, and the honest verdict is a warning
-    rather than ok.
+    Three outcomes, and the check must report which one it got:
 
-    Only Claude Code leaves a signal cairn can read (one transcript per session
-    under ``~/.claude/projects``).  No transcripts at all is read as "no
-    session ran": that is what an unused harness looks like, and it is the
-    pre-existing behaviour.  It does mean a *relocated* transcript directory
-    would read as disuse — the executability check on ``harness_wired`` is what
-    covers the broken-hook case that motivated WI-034, not this correlation.
+    * ``True``  — files in the harness's own session store were written inside
+      the window, so a session provably ran.
+    * ``False`` — the store was readable and holds nothing that recent.  Genuine
+      evidence of disuse.
+    * ``None``  — cairn has no signal: either the harness has no session store
+      cairn knows (OpenCode, Codex), or the one it knows is not where it looked
+      (a *relocated* ``~/.claude/projects``).  Before WI-039 a missing directory
+      returned ``False`` and was reported as "no sessions ran" — a check that
+      could not see its input, publishing a verdict about the input.
     """
-    if harness != "claude":
-        return None
-    newest_local = _newest_local_session_activity()
-    if newest_local is None:
-        return False
+    base, source = _harness_activity_dir(harness)
+    if base is None:
+        env_name = _HARNESS_ACTIVITY_DIR_ENV.get(harness, "")
+        hint = (
+            f"; set {env_name} to a directory whose file mtimes track its "
+            "sessions to give this check a signal"
+            if env_name
+            else ""
+        )
+        return _LocalActivity(
+            None,
+            f"cairn has no local signal for {harness}, so it cannot distinguish "
+            f"'ran and did not attest' from 'did not run'{hint}",
+        )
+    readable, newest = _newest_activity_mtime(base)
+    if not readable:
+        where = f"{base} ({source})" if source != "default" else base
+        return _LocalActivity(
+            None,
+            f"cairn could not read {harness}'s local session store at {where}, so "
+            "it has no signal here — a check that cannot see its input has not "
+            "established disuse",
+        )
+    if newest is None:
+        return _LocalActivity(False, f"{harness}'s local session store {base} is empty")
     now = datetime.datetime.now(datetime.UTC).timestamp()
-    return newest_local >= now - window_secs
+    age_hours = (now - newest) / 3600
+    if newest >= now - window_secs:
+        return _LocalActivity(True, f"{harness} wrote a session file {age_hours:.1f}h ago")
+    return _LocalActivity(
+        False, f"{harness}'s newest local session file is {age_hours:.1f}h old"
+    )
 
 
 def _check_attestation_freshness(
@@ -1547,6 +1567,17 @@ def _check_attestation_freshness(
     (silence and disuse are indistinguishable, and claiming ok would be the
     same fail-open move); and a store we could not scope the query against is
     an honest skip, never a pass.
+
+    WI-039 — what this check does NOT verify, stated in its own output.  The
+    local signal exists only where cairn can read the harness's own session
+    store: Claude Code's ``~/.claude/projects``, or a directory the operator
+    names for OpenCode/Codex (``CAIRN_OPENCODE_SESSIONS`` /
+    ``CAIRN_CODEX_SESSIONS``).  Without one, "attested nothing" cannot be told
+    from "ran nothing", and the warning says exactly that instead of implying a
+    look was taken.  The same applies when the directory cairn knows about is
+    not there: that is a check that could not see its input, reported as such,
+    where it used to be reported as disuse.  Whether the hooks would fire at all
+    is covered by the executability check on ``harness_wired``, not here.
     """
     name = "attestation_freshness"
     if not cfg.is_configured:
@@ -1591,21 +1622,24 @@ def _check_attestation_freshness(
         if newest is not None:
             oks.append(f"{harness} attested a session at {newest.isoformat()}")
             continue
-        ran = _harness_sessions_ran_locally(harness, window_secs)
-        if ran is False:
+        activity = _harness_local_activity(harness, window_secs)
+        if activity.ran is False:
             oks.append(
-                f"{harness}: no sessions ran within the last {window_hours:g}h"
+                f"{harness}: no sessions ran within the last {window_hours:g}h "
+                f"({activity.detail})"
             )
-        elif ran is True:
+        elif activity.ran is True:
             fails.append(
                 f"{harness} ran a session within the last {window_hours:g}h but "
-                "attested none — the harness is configured and silent"
+                f"attested none — the harness is configured and silent "
+                f"({activity.detail})"
             )
         else:
+            # Name the blind spot rather than implying the absence of an
+            # attestation was checked against anything (WI-039).
             warns.append(
                 f"{harness} is wired but attested no session in the last "
-                f"{window_hours:g}h, and cairn has no local signal for whether "
-                "one ran"
+                f"{window_hours:g}h, and {activity.detail}"
             )
 
     unattributed = ""
