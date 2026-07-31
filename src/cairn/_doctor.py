@@ -1406,61 +1406,139 @@ def _check_content_encryption(cfg: Any) -> dict[str, Any]:
     }
 
 
-def _newest_local_session_activity() -> float | None:
-    """Newest mtime among local Claude Code session transcripts.
+#: Where cairn may look for local evidence that a harness ran a session.
+#:
+#: Claude Code has a layout cairn knows (one ``<session-uuid>.jsonl`` per session
+#: under ``~/.claude/projects/<encoded-cwd>/``).  OpenCode and Codex do not have
+#: one cairn can claim to know, and a GUESSED default would be worse than none:
+#: a wrong path holds no files, which reads as "the harness did not run" — the
+#: fail-open answer, dressed as evidence (WI-039).  So there is no default for
+#: them; an operator who knows their layout can point the check at it, and until
+#: they do the check says plainly that it cannot tell.
+_HARNESS_ACTIVITY_DIR_ENV: dict[str, str] = {
+    "claude": "CAIRN_CLAUDE_PROJECTS",
+    "opencode": "CAIRN_OPENCODE_SESSIONS",
+    "codex": "CAIRN_CODEX_SESSIONS",
+}
 
-    Claude Code writes one ``<session-uuid>.jsonl`` per session under
-    ``~/.claude/projects/<encoded-cwd>/``.  The newest mtime is evidence
-    that sessions ran, independent of whether anything attested.
-    ``CAIRN_CLAUDE_PROJECTS`` overrides the base directory (tests, or a
-    non-default harness home).
+#: Bounds on the activity scan — this runs inside ``cairn doctor``, not a batch job.
+_ACTIVITY_SCAN_MAX_DEPTH = 3
+_ACTIVITY_SCAN_MAX_FILES = 5000
+
+
+@dataclass(frozen=True)
+class _LocalActivity:
+    """Whether a harness provably ran locally, and what cairn consulted.
+
+    ``ran`` is deliberately tri-state.  ``None`` means *cairn has no evidence*,
+    which is a different statement from ``False`` ("it did not run") and must
+    never be reported as the latter: that is the difference between a check that
+    verifies and one that merely looks like it did.
     """
-    base = os.environ.get("CAIRN_CLAUDE_PROJECTS") or os.path.join(
-        os.path.expanduser("~"), ".claude", "projects"
-    )
+
+    ran: bool | None
+    detail: str
+
+
+def _harness_activity_dir(harness: str) -> tuple[str | None, str]:
+    """``(directory, how it was chosen)`` for *harness*'s local session store."""
+    env_name = _HARNESS_ACTIVITY_DIR_ENV.get(harness)
+    if env_name:
+        declared = os.environ.get(env_name)
+        if declared and declared.strip():
+            return declared.strip(), env_name
+    if harness == "claude":
+        return os.path.join(os.path.expanduser("~"), ".claude", "projects"), "default"
+    return None, ""
+
+
+def _newest_activity_mtime(base: str) -> tuple[bool, float | None]:
+    """``(readable, newest mtime)`` for a local session store.
+
+    ``readable`` is False when the directory is absent or cannot be scanned —
+    the case a caller must NOT read as disuse.
+    """
+    if not os.path.isdir(base):
+        return False, None
     newest: float | None = None
+    seen = 0
     try:
-        with os.scandir(base) as projects:
-            for proj in projects:
-                if not proj.is_dir():
+        for root, dirs, files in os.walk(base):
+            if root[len(base) :].count(os.sep) >= _ACTIVITY_SCAN_MAX_DEPTH:
+                dirs[:] = []
+            for name in files:
+                if name.startswith("."):
                     continue
                 try:
-                    with os.scandir(proj.path) as files:
-                        for f in files:
-                            if not f.name.endswith(".jsonl"):
-                                continue
-                            mtime = f.stat().st_mtime
-                            if newest is None or mtime > newest:
-                                newest = mtime
+                    mtime = os.stat(os.path.join(root, name)).st_mtime
                 except OSError:
                     continue
+                seen += 1
+                if newest is None or mtime > newest:
+                    newest = mtime
+                if seen >= _ACTIVITY_SCAN_MAX_FILES:
+                    return True, newest
     except OSError:
+        return newest is not None, newest
+    return True, newest
+
+
+def _newest_local_session_activity() -> float | None:
+    """Newest mtime among local Claude Code session transcripts, or None."""
+    base, _source = _harness_activity_dir("claude")
+    if base is None:  # pragma: no cover - claude always has a default
         return None
+    _readable, newest = _newest_activity_mtime(base)
     return newest
 
 
-def _harness_sessions_ran_locally(harness: str, window_secs: float) -> bool | None:
-    """Whether *harness* provably ran a session inside the window, locally.
+def _harness_local_activity(harness: str, window_secs: float) -> _LocalActivity:
+    """What cairn can locally establish about *harness* running a session.
 
-    ``True``/``False`` when there is local evidence either way, ``None`` when
-    cairn has no local signal for that harness at all — in which case silence
-    cannot be distinguished from disuse, and the honest verdict is a warning
-    rather than ok.
+    Three outcomes, and the check must report which one it got:
 
-    Only Claude Code leaves a signal cairn can read (one transcript per session
-    under ``~/.claude/projects``).  No transcripts at all is read as "no
-    session ran": that is what an unused harness looks like, and it is the
-    pre-existing behaviour.  It does mean a *relocated* transcript directory
-    would read as disuse — the executability check on ``harness_wired`` is what
-    covers the broken-hook case that motivated WI-034, not this correlation.
+    * ``True``  — files in the harness's own session store were written inside
+      the window, so a session provably ran.
+    * ``False`` — the store was readable and holds nothing that recent.  Genuine
+      evidence of disuse.
+    * ``None``  — cairn has no signal: either the harness has no session store
+      cairn knows (OpenCode, Codex), or the one it knows is not where it looked
+      (a *relocated* ``~/.claude/projects``).  Before WI-039 a missing directory
+      returned ``False`` and was reported as "no sessions ran" — a check that
+      could not see its input, publishing a verdict about the input.
     """
-    if harness != "claude":
-        return None
-    newest_local = _newest_local_session_activity()
-    if newest_local is None:
-        return False
+    base, source = _harness_activity_dir(harness)
+    if base is None:
+        env_name = _HARNESS_ACTIVITY_DIR_ENV.get(harness, "")
+        hint = (
+            f"; set {env_name} to a directory whose file mtimes track its "
+            "sessions to give this check a signal"
+            if env_name
+            else ""
+        )
+        return _LocalActivity(
+            None,
+            f"cairn has no local signal for {harness}, so it cannot distinguish "
+            f"'ran and did not attest' from 'did not run'{hint}",
+        )
+    readable, newest = _newest_activity_mtime(base)
+    if not readable:
+        where = f"{base} ({source})" if source != "default" else base
+        return _LocalActivity(
+            None,
+            f"cairn could not read {harness}'s local session store at {where}, so "
+            "it has no signal here — a check that cannot see its input has not "
+            "established disuse",
+        )
+    if newest is None:
+        return _LocalActivity(False, f"{harness}'s local session store {base} is empty")
     now = datetime.datetime.now(datetime.UTC).timestamp()
-    return newest_local >= now - window_secs
+    age_hours = (now - newest) / 3600
+    if newest >= now - window_secs:
+        return _LocalActivity(True, f"{harness} wrote a session file {age_hours:.1f}h ago")
+    return _LocalActivity(
+        False, f"{harness}'s newest local session file is {age_hours:.1f}h old"
+    )
 
 
 def _check_attestation_freshness(
@@ -1489,6 +1567,17 @@ def _check_attestation_freshness(
     (silence and disuse are indistinguishable, and claiming ok would be the
     same fail-open move); and a store we could not scope the query against is
     an honest skip, never a pass.
+
+    WI-039 — what this check does NOT verify, stated in its own output.  The
+    local signal exists only where cairn can read the harness's own session
+    store: Claude Code's ``~/.claude/projects``, or a directory the operator
+    names for OpenCode/Codex (``CAIRN_OPENCODE_SESSIONS`` /
+    ``CAIRN_CODEX_SESSIONS``).  Without one, "attested nothing" cannot be told
+    from "ran nothing", and the warning says exactly that instead of implying a
+    look was taken.  The same applies when the directory cairn knows about is
+    not there: that is a check that could not see its input, reported as such,
+    where it used to be reported as disuse.  Whether the hooks would fire at all
+    is covered by the executability check on ``harness_wired``, not here.
     """
     name = "attestation_freshness"
     if not cfg.is_configured:
@@ -1533,21 +1622,24 @@ def _check_attestation_freshness(
         if newest is not None:
             oks.append(f"{harness} attested a session at {newest.isoformat()}")
             continue
-        ran = _harness_sessions_ran_locally(harness, window_secs)
-        if ran is False:
+        activity = _harness_local_activity(harness, window_secs)
+        if activity.ran is False:
             oks.append(
-                f"{harness}: no sessions ran within the last {window_hours:g}h"
+                f"{harness}: no sessions ran within the last {window_hours:g}h "
+                f"({activity.detail})"
             )
-        elif ran is True:
+        elif activity.ran is True:
             fails.append(
                 f"{harness} ran a session within the last {window_hours:g}h but "
-                "attested none — the harness is configured and silent"
+                f"attested none — the harness is configured and silent "
+                f"({activity.detail})"
             )
         else:
+            # Name the blind spot rather than implying the absence of an
+            # attestation was checked against anything (WI-039).
             warns.append(
                 f"{harness} is wired but attested no session in the last "
-                f"{window_hours:g}h, and cairn has no local signal for whether "
-                "one ran"
+                f"{window_hours:g}h, and {activity.detail}"
             )
 
     unattributed = ""
