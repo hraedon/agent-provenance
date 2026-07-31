@@ -17,13 +17,14 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-from regista._types import ReplayReport
+from regista import ReplayReport
 
 import cairn._doctor as doctor_mod
-from cairn._config import CairnEnvConfig
+from cairn._config import CairnEnvConfig, resolve_config
 from cairn._doctor import (
     _check_chain_integrity,
     _integrity_verdict_path,
+    _store_binding,
     run_doctor,
     run_integrity,
 )
@@ -49,6 +50,7 @@ def cfg(tmp_path: Path) -> CairnEnvConfig:
         key_ref=None,
         project="test_project",
         state_dir=str(tmp_path / "state"),
+        integrity_dir=str(tmp_path / "integrity"),
     )
 
 
@@ -194,23 +196,50 @@ def test_integrity_drift_fails_and_doctor_goes_red(monkeypatch, cfg, capsys):
     assert report["regista"]["chain_ok"] is False
 
 
-def test_integrity_replay_error_fails_and_doctor_goes_red(monkeypatch, cfg, capsys):
+def test_integrity_replay_error_exits_nonzero_and_preserves_verdict(
+    monkeypatch, cfg, capsys
+):
+    """A replay exception is the absence of a verdict, not a verdict: the
+    command exits 1 but the last real verdict stays on disk (review m4)."""
+    _patch_regista(monkeypatch, cfg, _StubRegista())
+    assert run_integrity(json_output=True) == 0
+    capsys.readouterr()
+
     stub = _StubRegista(replay_exc=RuntimeError("boom"))
     _patch_regista(monkeypatch, cfg, stub)
-
     rc = run_integrity(json_output=True)
     assert rc == 1
     out = json.loads(capsys.readouterr().out)
     assert out["chain_state"] == "error"
 
+    verdict = json.loads(_integrity_verdict_path(cfg).read_text())
+    assert verdict["chain_state"] == "verified"
+
     rc = run_doctor(json_output=True)
-    assert rc == 1
     report = _doctor_report(capsys)
-    assert _find_check(report, "chain_integrity")["status"] == "fail"
+    assert _find_check(report, "chain_integrity")["status"] == "ok"
+
+
+def test_integrity_replay_error_with_no_prior_verdict_leaves_never_run(
+    monkeypatch, cfg, capsys
+):
+    stub = _StubRegista(replay_exc=RuntimeError("boom"))
+    _patch_regista(monkeypatch, cfg, stub)
+    assert run_integrity(json_output=True) == 1
+    capsys.readouterr()
+    assert not _integrity_verdict_path(cfg).exists()
+
+    run_doctor(json_output=True)
+    report = _doctor_report(capsys)
+    assert _find_check(report, "chain_integrity")["status"] == "skip"
+    assert report["regista"]["chain_state"] == "never_run"
 
 
 def test_integrity_unconfigured_fails_without_marker(monkeypatch, tmp_path, capsys):
-    cfg = CairnEnvConfig(state_dir=str(tmp_path / "state"))
+    cfg = CairnEnvConfig(
+        state_dir=str(tmp_path / "state"),
+        integrity_dir=str(tmp_path / "integrity"),
+    )
     monkeypatch.setattr(doctor_mod, "resolve_config", lambda: cfg)
 
     rc = run_integrity(json_output=True)
@@ -247,7 +276,13 @@ def test_integrity_unreachable_preserves_previous_verdict(monkeypatch, cfg, caps
 # ---------------------------------------------------------------------------
 
 
-def _write_verdict(cfg: CairnEnvConfig, *, age_hours: float, state: str = "verified"):
+def _write_verdict(
+    cfg: CairnEnvConfig,
+    *,
+    age_hours: float,
+    state: str = "verified",
+    binding: str | None = None,
+):
     path = _integrity_verdict_path(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
     checked = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=age_hours)
@@ -257,6 +292,7 @@ def _write_verdict(cfg: CairnEnvConfig, *, age_hours: float, state: str = "verif
                 "checked_at": checked.isoformat(),
                 "chain_state": state,
                 "chain_ok": state == "verified",
+                "store_binding": binding if binding is not None else _store_binding(cfg),
             }
         )
     )
@@ -302,12 +338,66 @@ def test_staleness_window_disabled_with_zero(tmp_path):
         key_path=str(key_path),
         project="test_project",
         state_dir=str(tmp_path / "state"),
+        integrity_dir=str(tmp_path / "integrity"),
         integrity_max_age_hours=0.0,
     )
     _write_verdict(cfg, age_hours=10_000.0)
     check, _, chain_ok = _check_chain_integrity(cfg)
     assert check["status"] == "ok"
     assert chain_ok is True
+
+
+def test_verdict_from_other_store_or_project_is_not_reported(cfg, tmp_path):
+    """A verdict certifies one store+project; doctor must not reuse it for
+    another configuration sharing the integrity dir (review M1)."""
+    other = CairnEnvConfig(
+        dsn=cfg.dsn,
+        key_path=cfg.key_path,
+        project="other_project",
+        state_dir=cfg.state_dir,
+        integrity_dir=cfg.integrity_dir,
+    )
+    _write_verdict(other, age_hours=1.0)  # verified, bound to other_project
+
+    check, chain_state, chain_ok = _check_chain_integrity(cfg)
+    assert check["status"] == "skip"
+    assert chain_state == "unbound"
+    assert chain_ok is None
+    assert "different store or project" in check["detail"]
+
+
+def test_unbound_legacy_verdict_is_not_reported(cfg):
+    """Markers written before store binding existed must be re-recorded."""
+    _write_verdict(cfg, age_hours=1.0, binding="")
+    check, chain_state, chain_ok = _check_chain_integrity(cfg)
+    assert check["status"] == "skip"
+    assert chain_state == "unbound"
+    assert chain_ok is None
+
+
+def test_future_timestamp_verdict_warns(cfg):
+    _write_verdict(cfg, age_hours=-6.0)
+    check, _chain_state, chain_ok = _check_chain_integrity(cfg)
+    assert check["status"] == "warn"
+    assert "future" in check["detail"]
+    assert chain_ok is None
+
+
+def test_never_run_is_skip_and_doctor_can_stay_green(monkeypatch, cfg, capsys):
+    """Documented behavior: a fresh install with no recorded verdict is an
+    honest skip — it does not red or degrade the umbrella by itself."""
+    _patch_regista(monkeypatch, cfg, _StubRegista())
+    run_doctor(json_output=True)
+    report = _doctor_report(capsys)
+    check = _find_check(report, "chain_integrity")
+    assert check["status"] == "skip"
+    assert report["regista"]["chain_state"] == "never_run"
+
+
+def test_max_age_env_parsing_rejects_invalid(monkeypatch, tmp_path):
+    for raw, expected in (("nope", 168.0), ("-5", 168.0), ("nan", 168.0), ("0", 0.0)):
+        monkeypatch.setenv("CAIRN_INTEGRITY_MAX_AGE_HOURS", raw)
+        assert resolve_config().integrity_max_age_hours == expected, raw
 
 
 # ---------------------------------------------------------------------------

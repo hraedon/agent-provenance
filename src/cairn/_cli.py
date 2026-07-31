@@ -883,9 +883,11 @@ def integrity(json_output: bool) -> None:
     """Full canonical chain replay against the configured store (WI-030).
 
     Runtime grows with production history — run on demand or on a schedule,
-    never as part of routine health. Records its verdict in the state dir
-    for ``cairn doctor`` to report. Exits 0 when the replay verifies, 1 on
-    drift, replay error, or an unreachable/unconfigured store.
+    never as part of routine health. Records its verdict (bound to the
+    configured store+project) in the durable integrity dir for ``cairn
+    doctor`` to report. Exits 0 when the replay verifies, 1 otherwise
+    (drift, replay error, unsupported replay API, unreachable or
+    unconfigured store) — schedulers should alert on this exit code.
     """
     from ._doctor import run_integrity
 

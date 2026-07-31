@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -18,7 +19,6 @@ import subprocess
 import tempfile
 import time
 import tomllib
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -119,7 +119,7 @@ def _verify_chain(sub: Any) -> tuple[str, bool | None]:
     return "verified", True
 
 
-@contextmanager
+@contextlib.contextmanager
 def _open_regista(cfg: Any) -> Any:
     """Open a regista client for the configured store, handling key-ref keys.
 
@@ -628,7 +628,21 @@ _INTEGRITY_VERDICT_FILENAME = "integrity-verdict.json"
 
 
 def _integrity_verdict_path(cfg: Any) -> Path:
-    return Path(cfg.state_dir) / _INTEGRITY_VERDICT_FILENAME
+    # Durable state dir, not the tmp-backed session state_dir — a recorded
+    # drift FAIL must survive reboot (WI-030 review M2).
+    return Path(cfg.integrity_dir) / _INTEGRITY_VERDICT_FILENAME
+
+
+def _store_binding(cfg: Any) -> str:
+    """Digest binding a verdict to the store it certified (WI-030 review M1).
+
+    A verdict recorded against one DSN/project must never be reported for
+    another. The digest avoids persisting the raw DSN (it may embed
+    credentials); collision resistance beyond accidental mismatch is not the
+    goal — the marker is operator-trusted state, not an attestation.
+    """
+    material = f"{cfg.dsn or ''}\n{cfg.project or ''}".encode()
+    return hashlib.sha256(material).hexdigest()[:16]
 
 
 def _load_integrity_verdict(cfg: Any) -> dict[str, Any] | None:
@@ -680,6 +694,26 @@ def _check_chain_integrity(cfg: Any) -> tuple[dict[str, Any], str | None, bool |
     chain_state = verdict.get("chain_state")
     checked_at = verdict.get("checked_at")
 
+    # A verdict certifies exactly one store+project; never report it for
+    # another (WI-030 review M1). Markers predating the binding field are
+    # treated as unbound and must be re-recorded.
+    if chain_state in ("verified", "drift", "error") and verdict.get(
+        "store_binding"
+    ) != _store_binding(cfg):
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "skip",
+                "detail": (
+                    "recorded verdict is for a different store or project "
+                    "(or predates store binding); run `cairn integrity` "
+                    "against this configuration"
+                ),
+            },
+            "unbound",
+            None,
+        )
+
     if chain_state == "verified":
         age_hours: float | None = None
         if isinstance(checked_at, str):
@@ -705,6 +739,20 @@ def _check_chain_integrity(cfg: Any) -> tuple[dict[str, Any], str | None, bool |
                 },
                 "verified",
                 True,
+            )
+        if age_hours < 0:
+            return (
+                {
+                    "name": "chain_integrity",
+                    "status": "warn",
+                    "detail": (
+                        f"recorded integrity verdict is timestamped in the future "
+                        f"({checked_at}) — clock skew or a hand-edited marker; "
+                        "re-run `cairn integrity`"
+                    ),
+                },
+                "verified",
+                None,
             )
         if max_age > 0 and age_hours > max_age:
             return (
@@ -1008,13 +1056,17 @@ def run_integrity(*, json_output: bool = False) -> int:
     """Full canonical chain replay, separated from routine health (WI-030).
 
     Replays the complete chain via regista's canonical ``replay`` API and
-    records the verdict in the state dir, where ``cairn doctor`` reports it
-    without re-replaying. Intended for scheduled runs (e.g. alongside
-    backups) or on demand — its runtime grows with production history, so
-    it must never sit on the routine health path.
+    records the verdict (bound to the configured store+project) in the
+    durable integrity dir, where ``cairn doctor`` reports it without
+    re-replaying. Intended for scheduled runs (e.g. alongside backups) or
+    on demand — its runtime grows with production history, so it must never
+    sit on the routine health path.
 
     Exit codes: 0 verified, 1 otherwise (drift, replay error, unsupported
-    replay API, store unreachable, not configured).
+    replay API, store unreachable, not configured). Only verified/drift/
+    unsupported are recorded; a replay exception or unreachable store exits
+    nonzero without overwriting the last real verdict, so schedulers must
+    alert on this command's exit code rather than relying on doctor alone.
     """
     cfg = resolve_config()
 
@@ -1063,18 +1115,27 @@ def run_integrity(*, json_output: bool = False) -> int:
         "duration_seconds": round(duration, 3),
         "cairn_version": _cairn_version,
         "project": cfg.project,
+        "store_binding": _store_binding(cfg),
     }
 
-    # Record the verdict for doctor — atomically, so a concurrent doctor
-    # never reads a half-written file. Unreachable/unconfigured record
-    # nothing, preserving the last real verdict.
-    if chain_state in ("verified", "drift", "error", "unsupported"):
+    # Record the verdict for doctor — atomically (and fsynced, so a crash
+    # cannot leave an empty marker), so a concurrent doctor never reads a
+    # half-written file. Only real chain verdicts are recorded:
+    # verified/drift are verdicts, unsupported is a durable capability fact,
+    # but a replay *exception* is the absence of a verdict — like an
+    # unreachable store, it exits nonzero without clobbering the last real
+    # verdict (WI-030 review m4). The marker is not secret; leave it
+    # world-readable so a doctor running as a different user can report it.
+    if chain_state in ("verified", "drift", "unsupported"):
         path = _integrity_verdict_path(cfg)
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".integrity-")
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(verdict, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o644)
             os.replace(tmp, path)
         except Exception:
             with contextlib.suppress(FileNotFoundError):
@@ -1101,6 +1162,12 @@ def run_integrity(*, json_output: bool = False) -> int:
         }.get(chain_state, chain_state)
         status = "OK" if ok else "FAIL"
         print(f"  [{status:4s}] chain_integrity   {detail}")
-        print(f"  replayed in {duration:.1f}s; verdict recorded for doctor")
+        if chain_state in ("verified", "drift", "unsupported"):
+            print(f"  replayed in {duration:.1f}s; verdict recorded for doctor")
+        else:
+            print(
+                f"  replay attempt took {duration:.1f}s; no verdict recorded — "
+                "the last real verdict is preserved"
+            )
 
     return 0 if ok else 1

@@ -42,6 +42,7 @@ def cfg(tmp_path: Path) -> CairnEnvConfig:
         harness_version="1.0.0",
         principal_id="human:test",
         state_dir=str(tmp_path / "state"),
+        integrity_dir=str(tmp_path / "integrity"),
         disabled=False,
     )
 
@@ -1540,6 +1541,7 @@ def test_doctor_chain_ok_verified_when_integrity_recorded_clean(monkeypatch, tmp
         key_path="/nonexistent.json",
         project="test",
         state_dir=str(tmp_path / "state"),
+        integrity_dir=str(tmp_path / "integrity"),
     )
     assert _record_integrity(monkeypatch, cfg) == 0
     report = _doctor_report(monkeypatch, cfg)
@@ -1577,6 +1579,7 @@ def test_doctor_chain_ok_false_when_integrity_recorded_drift(monkeypatch, tmp_pa
         key_path="/nonexistent.json",
         project="test",
         state_dir=str(tmp_path / "state"),
+        integrity_dir=str(tmp_path / "integrity"),
     )
     assert _record_integrity(monkeypatch, cfg) == 1
     report = _doctor_report(monkeypatch, cfg)
@@ -1602,6 +1605,7 @@ def test_doctor_chain_state_unsupported_when_replay_missing(monkeypatch, tmp_pat
         key_path="/nonexistent.json",
         project="test",
         state_dir=str(tmp_path / "state"),
+        integrity_dir=str(tmp_path / "integrity"),
     )
     assert _record_integrity(monkeypatch, cfg) == 1
     report = _doctor_report(monkeypatch, cfg)
@@ -1610,7 +1614,8 @@ def test_doctor_chain_state_unsupported_when_replay_missing(monkeypatch, tmp_pat
 
 
 def test_doctor_chain_state_error_when_replay_raises(monkeypatch, tmp_path):
-    """If the recorded replay raised, chain state is error (unknown verdict)."""
+    """A replay exception records no verdict: integrity exits 1 and doctor
+    honestly reports never_run rather than a chain verdict (WI-030 m4)."""
     class _FakeRegista:
         def __init__(self, **kwargs):
             pass
@@ -1630,11 +1635,12 @@ def test_doctor_chain_state_error_when_replay_raises(monkeypatch, tmp_path):
         key_path="/nonexistent.json",
         project="test",
         state_dir=str(tmp_path / "state"),
+        integrity_dir=str(tmp_path / "integrity"),
     )
     assert _record_integrity(monkeypatch, cfg) == 1
     report = _doctor_report(monkeypatch, cfg)
     assert report["regista"]["chain_ok"] is None
-    assert report["regista"]["chain_state"] == "error"
+    assert report["regista"]["chain_state"] == "never_run"
 
 
 @pytest.fixture
@@ -1774,7 +1780,8 @@ def test_doctor_chain_integrity_drift_fails_and_exits_nonzero(
 def test_doctor_chain_integrity_error_fails_and_exits_nonzero(
     doctor_ready_cfg, monkeypatch, tmp_path
 ):
-    """Replay error: chain_integrity fails honestly, top-level ok false."""
+    """Replay error: integrity exits 1 without recording; doctor reports the
+    honest never_run skip (WI-030 m4 — an exception is not a verdict)."""
 
     class _FakeRegista:
         def __init__(self, **kwargs):
@@ -1794,15 +1801,14 @@ def test_doctor_chain_integrity_error_fails_and_exits_nonzero(
     report = _doctor_report(monkeypatch, doctor_ready_cfg)
 
     chain = _find_check(report, "chain_integrity")
-    assert chain["status"] == "fail"
+    assert chain["status"] == "skip"
     assert report["regista"]["chain_ok"] is None
-    assert report["regista"]["chain_state"] == "error"
-    assert report["ok"] is False
+    assert report["regista"]["chain_state"] == "never_run"
+    assert report["ok"] is True
 
     result = _run_doctor_cli(monkeypatch, doctor_ready_cfg, _FakeRegista)
-    assert result.exit_code == 1
+    assert result.exit_code == 0
     payload = json.loads(result.output)
-    assert payload["ok"] is False
     assert payload["regista"]["chain_ok"] is None
 
 
