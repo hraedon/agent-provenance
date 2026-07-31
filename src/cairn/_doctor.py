@@ -159,6 +159,37 @@ def _check_config(cfg: Any) -> dict[str, Any]:
     }
 
 
+def _signing_key_id(keys: list[dict[str, Any]]) -> str | None:
+    """The key the SIGNER would actually pick, per regista's own rule.
+
+    This check used to name ``keys[0]`` as "active", which is not the signer's
+    selection rule at all — the signer takes the last active *asymmetric* entry
+    (falling back to the last active entry).  On a real key file that named the
+    bootstrap HMAC key while every event was signed by something else (WI-036).
+    regista exports the rule as a pure function precisely so consumers cannot
+    re-derive it and drift (WI-223); use it rather than guessing.
+
+    Entry defaults mirror regista's key-file parsing: absent ``status`` is
+    ``active``, absent ``scheme`` is ``hmac-sha256``.
+    """
+    try:
+        from regista._keys import select_signing_key_id
+    except ImportError:
+        first = keys[0].get("key_id") if keys else None
+        return str(first) if first is not None else None
+    candidates = [
+        (
+            str(entry.get("key_id", "?")),
+            str(entry.get("scheme", "hmac-sha256")),
+            str(entry.get("status", "active")),
+        )
+        for entry in keys
+        if isinstance(entry, dict)
+    ]
+    chosen: str | None = select_signing_key_id(candidates)
+    return chosen
+
+
 def _check_key_file(cfg: Any) -> dict[str, Any]:
     if cfg.key_ref:
         ok, detail = _verify_secret_ref(cfg.key_ref)
@@ -183,34 +214,106 @@ def _check_key_file(cfg: Any) -> dict[str, Any]:
         keys = data.get("keys", [])
         if not keys:
             return {"name": "key_file", "status": "fail", "detail": "key file has no keys"}
+        signing = _signing_key_id(keys)
+        if signing is None:
+            return {
+                "name": "key_file",
+                "status": "fail",
+                "detail": (
+                    f"{len(keys)} key(s), none active — the signer has no key to "
+                    "select for this principal"
+                ),
+            }
         return {
             "name": "key_file",
             "status": "ok",
-            "detail": f"{len(keys)} key(s), active={keys[0].get('key_id', '?')}",
+            "detail": f"{len(keys)} key(s), signing={signing}",
         }
     except Exception as exc:
         return {"name": "key_file", "status": "fail", "detail": f"cannot read key file: {exc}"}
 
 
-def _verify_chain(sub: Any) -> tuple[str, bool | None]:
+def _replay_accepts_binding_check(sub: Any) -> bool:
+    """Whether this regista's ``replay`` accepts ``verify_principal_binding``.
+
+    A ``**kwargs`` signature accepts it, and so does anything not introspectable
+    (C implementation, proxy, mock) — in both cases the honest move is to try
+    the kwarg and let the ``TypeError`` fallback in :func:`_verify_chain` decide.
+    Only an explicit signature that lacks the parameter is a definite "no".
+    """
+    try:
+        import inspect
+
+        params = inspect.signature(sub.replay).parameters
+    except (TypeError, ValueError):
+        return True
+    if "verify_principal_binding" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _verify_chain(sub: Any) -> tuple[str, bool | None, dict[str, Any]]:
     """Use regista's canonical replay API to determine chain integrity.
 
-    Returns ``(chain_state, chain_ok)``. ``chain_ok`` is ``True`` when the
-    replay reports no drift and no halted events, ``False`` when drift or
-    a halt is detected, and ``None`` when the verification API is unavailable
-    or an error prevented a verdict. ``chain_state`` is an honest string label
-    (``verified``, ``drift``, ``unsupported``, ``error``) for callers and
-    reports.
+    Returns ``(chain_state, chain_ok, binding)``, where ``chain_ok`` is ``True`` only
+    when the replay established every property this verdict claims, ``False``
+    when it found a violation, and ``None`` when no verdict could be reached.
+
+    Principal binding is requested EXPLICITLY. regista's ``replay()`` Python
+    API keeps ``verify_principal_binding=False`` for backward compatibility
+    (only the CLI defaults it on), and this function used to read
+    ``replayed_drift``/``halted`` alone — so ``chain_integrity`` reported
+    "canonical replay verified no drift or halted events" for a chain signed by
+    a key the project never registered, which the offline verifier
+    (``regista bundle verify``) rejected outright. The wording was narrowly
+    true and the surface was read as "the chain is sound" (WI-036).
+
+    Two honest states beyond verified/drift follow from WI-223:
+
+    * ``unattributable`` — the binding check RAN and found failures. The chain
+      is cryptographically unattributable: a failure, never a warning.
+    * ``unverified_binding`` — the check did not run (older regista, or a
+      client that would not accept the kwarg). ``principal_binding_failures``
+      is then 0 because nothing looked, and publishing that zero as an
+      affirmative claim is precisely the defect WI-223 named. The honest
+      verdict is "not verified", which is not "verified".
     """
+    no_binding: dict[str, Any] = {
+        "principal_binding_verified": False,
+        "principal_binding_failures": None,
+    }
     if not hasattr(sub, "replay"):
-        return "unsupported", None
+        return "unsupported", None, no_binding
+    supported = _replay_accepts_binding_check(sub)
     try:
-        report = sub.replay()
+        report = sub.replay(verify_principal_binding=True) if supported else sub.replay()
+    except TypeError:
+        # The kwarg was rejected after all: fall back, but never claim the
+        # binding was verified.
+        try:
+            report = sub.replay()
+        except Exception:
+            return "error", None, no_binding
+        supported = False
     except Exception:
-        return "error", None
+        return "error", None, no_binding
+
+    failures = int(getattr(report, "principal_binding_failures", 0) or 0)
+    verified = supported and bool(getattr(report, "principal_binding_verified", False))
+    # Mirror ``ReplayReport.to_dict``: the failure count is only meaningful when
+    # the check ran, so it is omitted (None) rather than recorded as zero.
+    binding: dict[str, Any] = {
+        "principal_binding_verified": verified,
+        "principal_binding_failures": failures if (verified or failures) else None,
+    }
+
     if report.replayed_drift > 0 or report.halted > 0:
-        return "drift", False
-    return "verified", True
+        return "drift", False, binding
+    if failures > 0:
+        return "unattributable", False, binding
+    if not verified:
+        return "unverified_binding", None, binding
+    return "verified", True, binding
 
 
 @contextlib.contextmanager
@@ -904,6 +1007,40 @@ def _check_codex_activity(*, wired: bool) -> dict[str, Any]:
 
 _INTEGRITY_VERDICT_FILENAME = "integrity-verdict.json"
 
+#: Chain states that are real verdicts and therefore recorded for doctor.
+#: ``verified``/``drift``/``unattributable`` are findings about the chain,
+#: ``unverified_binding`` is a finding about what was NOT established, and
+#: ``unsupported`` is a durable capability fact.  A replay *exception* is the
+#: absence of a verdict and is never recorded (WI-030 review m4).
+_RECORDED_CHAIN_STATES = (
+    "verified",
+    "drift",
+    "unattributable",
+    "unverified_binding",
+    "unsupported",
+)
+
+#: One-line operator-facing meaning per chain state. Also used as the ``detail``
+#: on ``cairn integrity``'s JSON body so an ``ok: false`` result always names
+#: its reason.
+_CHAIN_STATE_DETAIL = {
+    "verified": (
+        "canonical replay verified no drift or halted events, and every event's "
+        "signature binds to a key this project registered"
+    ),
+    "drift": "canonical replay detected chain drift or halted events",
+    "unattributable": (
+        "canonical replay found event(s) whose signature does not bind to a key "
+        "this project registered — the chain is cryptographically unattributable"
+    ),
+    "unverified_binding": (
+        "canonical replay found no drift, but principal binding was NOT "
+        "verified — nothing here claims the chain is attributable"
+    ),
+    "error": "chain replay failed; integrity verdict is unknown",
+    "unsupported": "regista version does not expose the canonical replay API",
+}
+
 
 def _record_failed_attempt(cfg: Any, state: str) -> None:
     """Note a failed replay attempt on the existing verdict without touching it.
@@ -1041,7 +1178,7 @@ def _check_chain_integrity(cfg: Any) -> tuple[dict[str, Any], str | None, bool |
     # another (WI-030 review M1) — including "unsupported", which is a claim
     # about a specific store's regista. Markers predating the binding field
     # are treated as unbound and must be re-recorded.
-    if chain_state in ("verified", "drift", "error", "unsupported") and verdict.get(
+    if chain_state in _RECORDED_CHAIN_STATES and verdict.get(
         "store_binding"
     ) != _store_binding(cfg):
         return (
@@ -1055,6 +1192,60 @@ def _check_chain_integrity(cfg: Any) -> tuple[dict[str, Any], str | None, bool |
                 ),
             },
             "unbound",
+            None,
+        )
+
+    # Forward/backward compatibility, same reasoning as the store_binding guard
+    # above: a "verified" marker written before cairn consumed regista's binding
+    # fields carries no evidence that the chain is attributable, so it must not
+    # be replayed as a pass (WI-036). Absence of the field is not a zero.
+    if chain_state == "verified" and verdict.get("principal_binding_verified") is not True:
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "warn",
+                "detail": (
+                    f"recorded verdict from {checked_at or 'unknown time'} predates "
+                    "principal-binding verification, so the chain's "
+                    "attributability was never checked; re-run `cairn integrity`"
+                ),
+            },
+            "unverified_binding",
+            None,
+        )
+
+    if chain_state == "unattributable":
+        failures = verdict.get("principal_binding_failures")
+        count = f"{failures} " if isinstance(failures, int) else ""
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "fail",
+                "detail": (
+                    f"canonical replay found {count}event(s) whose signature does "
+                    f"not bind to a key this project registered, at "
+                    f"{checked_at or 'unknown time'} — the chain is "
+                    "cryptographically unattributable and the offline verifier "
+                    "rejects it (cairn integrity)"
+                ),
+            },
+            "unattributable",
+            False,
+        )
+
+    if chain_state == "unverified_binding":
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "warn",
+                "detail": (
+                    f"canonical replay at {checked_at or 'unknown time'} found no "
+                    "drift, but principal binding was NOT verified — this regista "
+                    "did not run the check, so nothing here claims the chain is "
+                    "attributable"
+                ),
+            },
+            "unverified_binding",
             None,
         )
 
@@ -1541,10 +1732,16 @@ def run_integrity(*, json_output: bool = False) -> int:
     sit on the routine health path.
 
     Exit codes: 0 verified, 1 otherwise (drift, replay error, unsupported
-    replay API, store unreachable, not configured). Only verified/drift/
-    unsupported are recorded; a replay exception or unreachable store exits
-    nonzero without overwriting the last real verdict, so schedulers must
+    replay API, store unreachable, not configured, principal binding failed or
+    unverified). Only real verdicts are recorded (see
+    :data:`_RECORDED_CHAIN_STATES`); a replay exception or unreachable store
+    exits nonzero without overwriting the last real verdict, so schedulers must
     alert on this command's exit code rather than relying on doctor alone.
+
+    Every nonzero exit carries a ``detail`` string alongside ``ok: false``, so
+    the suite umbrella's envelope reader (which treats ``ok: false`` as failure
+    regardless of exit code) always has a reason to report and never has to
+    read fields off a failed result.
     """
     cfg = resolve_config()
 
@@ -1567,7 +1764,7 @@ def run_integrity(*, json_output: bool = False) -> int:
     started = time.monotonic()
     try:
         with _open_regista(cfg) as sub:
-            chain_state, chain_ok = _verify_chain(sub)
+            chain_state, chain_ok, binding = _verify_chain(sub)
     except Exception as exc:
         _record_failed_attempt(cfg, "unreachable")
         report = {
@@ -1587,7 +1784,7 @@ def run_integrity(*, json_output: bool = False) -> int:
     duration = time.monotonic() - started
 
     checked_at = datetime.datetime.now(datetime.UTC).isoformat()
-    verdict = {
+    verdict: dict[str, Any] = {
         "checked_at": checked_at,
         "chain_state": chain_state,
         "chain_ok": chain_ok,
@@ -1595,7 +1792,14 @@ def run_integrity(*, json_output: bool = False) -> int:
         "cairn_version": _cairn_version,
         "project": cfg.project,
         "store_binding": _store_binding(cfg),
+        # Recorded so doctor can tell "checked and clean" from "never checked".
+        # Mirrors ``ReplayReport.to_dict``: the failure count is omitted when
+        # the check did not run, so a reader cannot mistake an unexamined chain
+        # for a clean one (WI-223/WI-036).
+        "principal_binding_verified": binding["principal_binding_verified"],
     }
+    if binding["principal_binding_failures"] is not None:
+        verdict["principal_binding_failures"] = binding["principal_binding_failures"]
 
     # Record the verdict for doctor — atomically (and fsynced, so a crash
     # cannot leave an empty marker), so a concurrent doctor never reads a
@@ -1605,7 +1809,7 @@ def run_integrity(*, json_output: bool = False) -> int:
     # unreachable store, it exits nonzero without clobbering the last real
     # verdict (WI-030 review m4). The marker is not secret; leave it
     # world-readable so a doctor running as a different user can report it.
-    if chain_state in ("verified", "drift", "unsupported"):
+    if chain_state in _RECORDED_CHAIN_STATES:
         path = _integrity_verdict_path(cfg)
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".integrity-")
@@ -1630,6 +1834,7 @@ def run_integrity(*, json_output: bool = False) -> int:
         "component": "cairn",
         "version": _cairn_version,
         "ok": ok,
+        "detail": _CHAIN_STATE_DETAIL.get(chain_state, chain_state),
         **verdict,
     }
 
@@ -1637,15 +1842,10 @@ def run_integrity(*, json_output: bool = False) -> int:
         print(json.dumps(report, indent=2))
     else:
         print(f"cairn integrity — v{_cairn_version}")
-        detail = {
-            "verified": "canonical replay verified no drift or halted events",
-            "drift": "canonical replay detected chain drift or halted events",
-            "error": "chain replay failed; integrity verdict is unknown",
-            "unsupported": "regista version does not expose the canonical replay API",
-        }.get(chain_state, chain_state)
+        detail = _CHAIN_STATE_DETAIL.get(chain_state, chain_state)
         status = "OK" if ok else "FAIL"
         print(f"  [{status:4s}] chain_integrity   {detail}")
-        if chain_state in ("verified", "drift", "unsupported"):
+        if chain_state in _RECORDED_CHAIN_STATES:
             print(f"  replayed in {duration:.1f}s; verdict recorded for doctor")
         else:
             print(

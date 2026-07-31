@@ -1691,12 +1691,16 @@ def test_doctor_chain_ok_verified_when_integrity_recorded_clean(monkeypatch, tmp
             return []
 
         def replay(self, **kwargs):
+            # A clean replay that also VERIFIED principal binding: post-WI-036
+            # cairn only records "verified" when the binding check actually ran.
+            assert kwargs.get("verify_principal_binding") is True
             return ReplayReport(
                 table_name="test",
                 replayed_ok=1,
                 replayed_drift=0,
                 halted=0,
                 warnings=0,
+                principal_binding_verified=True,
             )
 
         def close(self):
@@ -1881,12 +1885,16 @@ def test_doctor_chain_integrity_verified_ok_and_exits_zero(
             return []
 
         def replay(self, **kwargs):
+            # A clean replay that also VERIFIED principal binding: post-WI-036
+            # cairn only records "verified" when the binding check actually ran.
+            assert kwargs.get("verify_principal_binding") is True
             return ReplayReport(
                 table_name="test",
                 replayed_ok=1,
                 replayed_drift=0,
                 halted=0,
                 warnings=0,
+                principal_binding_verified=True,
             )
 
         def close(self):
@@ -2037,12 +2045,16 @@ def test_integrity_cli_verified_exits_zero(doctor_ready_cfg, monkeypatch):
             return []
 
         def replay(self, **kwargs):
+            # A clean replay that also VERIFIED principal binding: post-WI-036
+            # cairn only records "verified" when the binding check actually ran.
+            assert kwargs.get("verify_principal_binding") is True
             return ReplayReport(
                 table_name="test",
                 replayed_ok=1,
                 replayed_drift=0,
                 halted=0,
                 warnings=0,
+                principal_binding_verified=True,
             )
 
         def close(self):
