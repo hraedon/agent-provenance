@@ -8,13 +8,17 @@ follows regista's canonical vocabulary: ``ok``/``warn``/``fail``/``skip``.
 
 from __future__ import annotations
 
+import contextlib
+import datetime
 import json
 import logging
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 import tomllib
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -115,61 +119,68 @@ def _verify_chain(sub: Any) -> tuple[str, bool | None]:
     return "verified", True
 
 
-def _check_regista(cfg: Any) -> tuple[dict[str, Any], Any, str | None, bool | None]:
-    """Probe the regista store and verify the chain.
+@contextmanager
+def _open_regista(cfg: Any) -> Any:
+    """Open a regista client for the configured store, handling key-ref keys.
 
-    Returns ``(check, newest_event_ts, chain_state, chain_ok)``.  The chain
-    verdict is obtained from regista's canonical ``replay`` API, not inferred
-    from mere connectivity (Plan 018 / WI-026 follow-up).  When replay is
-    unavailable or fails, ``chain_ok`` is ``None`` and ``chain_state`` names
-    the reason honestly.
+    Yields the client; closes it (and removes any temp key file) on exit.
+    """
+    from regista import Regista
+
+    key_path = cfg.key_path
+    temp_key: str | None = None
+    if not key_path and cfg.key_ref:
+        fd, key_path = tempfile.mkstemp(suffix=".json", prefix="cairn-doctor-")
+        temp_key = key_path
+        os.chmod(key_path, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({
+                "keys": [{
+                    "key_id": "cairn-doctor",
+                    "scheme": "hmac-sha256",
+                    "secret_ref": cfg.key_ref,
+                }]
+            }, f)
+    try:
+        sub = Regista(dsn=cfg.dsn, project=cfg.project, hmac_key_path=key_path)
+        try:
+            yield sub
+        finally:
+            sub.close()
+    finally:
+        if temp_key is not None:
+            os.unlink(temp_key)
+
+
+def _check_regista(cfg: Any) -> tuple[dict[str, Any], Any]:
+    """Probe the regista store for availability.
+
+    Returns ``(check, newest_event_ts)``. This is a bounded, read-only
+    reachability probe — it must complete within the suite umbrella's
+    per-probe timeout, so it never replays the chain (WI-030). The chain
+    verdict comes from the last recorded ``cairn integrity`` run instead
+    (see ``_check_chain_integrity``).
     """
     if not cfg.is_configured:
         return (
             {"name": "regista", "status": "skip", "detail": "not configured"},
             None,
-            "unconfigured",
-            None,
         )
     try:
-        from regista import Regista
-
-        key_path = cfg.key_path
-        temp_key: str | None = None
-        if not key_path and cfg.key_ref:
-            fd, key_path = tempfile.mkstemp(suffix=".json", prefix="cairn-doctor-")
-            temp_key = key_path
-            os.chmod(key_path, 0o600)
-            with os.fdopen(fd, "w") as f:
-                json.dump({
-                    "keys": [{
-                        "key_id": "cairn-doctor",
-                        "scheme": "hmac-sha256",
-                        "secret_ref": cfg.key_ref,
-                    }]
-                }, f)
-        try:
-            sub = Regista(dsn=cfg.dsn, project=cfg.project, hmac_key_path=key_path)
-            try:
-                events = sub.read_events(limit=1)
-                newest_ts = events[0].timestamp if events else None
-                regista_check = {
+        with _open_regista(cfg) as sub:
+            events = sub.read_events(limit=1)
+            newest_ts = events[0].timestamp if events else None
+            return (
+                {
                     "name": "regista",
                     "status": "ok",
                     "detail": f"reachable, {len(events)} event(s) in project '{cfg.project}'",
-                }
-                chain_state, chain_ok = _verify_chain(sub)
-                return regista_check, newest_ts, chain_state, chain_ok
-            finally:
-                sub.close()
-        finally:
-            if temp_key is not None:
-                os.unlink(temp_key)
+                },
+                newest_ts,
+            )
     except Exception as exc:
         return (
             {"name": "regista", "status": "fail", "detail": f"unreachable: {exc}"},
-            None,
-            "unreachable",
             None,
         )
 
@@ -613,45 +624,158 @@ def _check_codex_activity(*, wired: bool) -> dict[str, Any]:
     }
 
 
-def _check_chain_integrity(
-    chain_state: str | None, chain_ok: bool | None
-) -> dict[str, Any]:
-    """Honest health for the canonical replay chain verdict.
+_INTEGRITY_VERDICT_FILENAME = "integrity-verdict.json"
 
-    Drift or replay error is a fail (top-level ``ok`` false, CLI exits nonzero).
-    An unsupported replay API is reported as a warning so we never claim
-    ``chain_ok`` is true.  Reachability is handled by the separate ``regista``
-    check.
+
+def _integrity_verdict_path(cfg: Any) -> Path:
+    return Path(cfg.state_dir) / _INTEGRITY_VERDICT_FILENAME
+
+
+def _load_integrity_verdict(cfg: Any) -> dict[str, Any] | None:
+    """Read the verdict recorded by the last ``cairn integrity`` run.
+
+    Returns ``None`` when no verdict has been recorded. A malformed file
+    returns ``{"chain_state": "unreadable"}`` so doctor can surface it.
     """
-    if chain_state == "verified" and chain_ok is True:
-        return {
-            "name": "chain_integrity",
-            "status": "ok",
-            "detail": "canonical replay verified no drift or halted events",
-        }
+    path = _integrity_verdict_path(cfg)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict) or "chain_state" not in data:
+            return {"chain_state": "unreadable"}
+        return data
+    except Exception:
+        return {"chain_state": "unreadable"}
+
+
+def _check_chain_integrity(cfg: Any) -> tuple[dict[str, Any], str | None, bool | None]:
+    """Honest health for the canonical replay chain verdict — without replaying.
+
+    Doctor is a bounded availability probe; the full-chain replay is owned by
+    ``cairn integrity`` (WI-030), which records its verdict in the state dir.
+    This check reports that recorded verdict: drift or replay error is a fail
+    (top-level ``ok`` false, CLI exits nonzero), a verdict older than
+    ``integrity_max_age_hours`` is a warning, and a never-run replay is an
+    honest skip — never a claimed pass.
+
+    Returns ``(check, chain_state, chain_ok)`` where the latter two feed the
+    report's ``regista`` block.
+    """
+    verdict = _load_integrity_verdict(cfg)
+    if verdict is None:
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "skip",
+                "detail": (
+                    "full chain replay is not part of routine health (WI-030); "
+                    "no verdict recorded yet — run `cairn integrity` or schedule it"
+                ),
+            },
+            "never_run",
+            None,
+        )
+
+    chain_state = verdict.get("chain_state")
+    checked_at = verdict.get("checked_at")
+
+    if chain_state == "verified":
+        age_hours: float | None = None
+        if isinstance(checked_at, str):
+            try:
+                checked_dt = datetime.datetime.fromisoformat(checked_at)
+                if checked_dt.tzinfo is None:
+                    checked_dt = checked_dt.replace(tzinfo=datetime.UTC)
+                age_hours = (
+                    datetime.datetime.now(datetime.UTC) - checked_dt
+                ).total_seconds() / 3600.0
+            except ValueError:
+                age_hours = None
+        max_age = cfg.integrity_max_age_hours
+        if age_hours is None:
+            return (
+                {
+                    "name": "chain_integrity",
+                    "status": "warn",
+                    "detail": (
+                        "recorded integrity verdict has no readable timestamp; "
+                        "re-run `cairn integrity`"
+                    ),
+                },
+                "verified",
+                True,
+            )
+        if max_age > 0 and age_hours > max_age:
+            return (
+                {
+                    "name": "chain_integrity",
+                    "status": "warn",
+                    "detail": (
+                        f"last full replay verified at {checked_at} — older than "
+                        f"{max_age:g}h; re-run `cairn integrity` or schedule it"
+                    ),
+                },
+                "verified",
+                True,
+            )
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "ok",
+                "detail": (
+                    f"canonical replay verified no drift or halted events "
+                    f"at {checked_at} (cairn integrity)"
+                ),
+            },
+            "verified",
+            True,
+        )
     if chain_state == "drift":
-        return {
-            "name": "chain_integrity",
-            "status": "fail",
-            "detail": "canonical replay detected chain drift or halted events",
-        }
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "fail",
+                "detail": (
+                    f"canonical replay detected chain drift or halted events "
+                    f"at {checked_at or 'unknown time'} (cairn integrity)"
+                ),
+            },
+            "drift",
+            False,
+        )
     if chain_state == "error":
-        return {
-            "name": "chain_integrity",
-            "status": "fail",
-            "detail": "chain replay failed; integrity verdict is unknown",
-        }
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "fail",
+                "detail": (
+                    f"chain replay failed at {checked_at or 'unknown time'}; "
+                    "integrity verdict is unknown (cairn integrity)"
+                ),
+            },
+            "error",
+            None,
+        )
     if chain_state == "unsupported":
-        return {
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "warn",
+                "detail": "regista version does not expose the canonical replay API",
+            },
+            "unsupported",
+            None,
+        )
+    return (
+        {
             "name": "chain_integrity",
             "status": "warn",
-            "detail": "regista version does not expose the canonical replay API",
-        }
-    return {
-        "name": "chain_integrity",
-        "status": "skip",
-        "detail": f"not checked ({chain_state or 'unavailable'})",
-    }
+            "detail": "recorded integrity verdict is unreadable; re-run `cairn integrity`",
+        },
+        "unreadable",
+        None,
+    )
 
 
 def _check_bridge() -> dict[str, Any]:
@@ -749,8 +873,6 @@ def _check_attestation_freshness(
     store within the window → fail.  The umbrella already reds out on
     unconfigured cairn; this makes "configured but silent" equally loud.
     """
-    import datetime
-
     name = "attestation_freshness"
     if not cfg.is_configured:
         return {"name": name, "status": "skip", "detail": "not configured"}
@@ -818,14 +940,15 @@ def _check_attestation_freshness(
 def run_doctor(*, json_output: bool = False) -> int:
     cfg = resolve_config()
 
-    regista_check, newest_event_ts, chain_state, chain_ok = _check_regista(cfg)
+    regista_check, newest_event_ts = _check_regista(cfg)
+    chain_check, chain_state, chain_ok = _check_chain_integrity(cfg)
     codex_wired = _check_codex_harness_wired(cfg)
     codex_active = codex_wired["status"] in {"ok", "warn"}
     checks = [
         _check_config(cfg),
         _check_key_file(cfg),
         regista_check,
-        _check_chain_integrity(chain_state, chain_ok),
+        chain_check,
         _check_harness_wired(cfg, required=not codex_active),
         _check_opencode_harness_wired(cfg),
         codex_wired,
@@ -877,5 +1000,107 @@ def run_doctor(*, json_output: bool = False) -> int:
             print("  Healthy, with warnings — see above.")
         else:
             print("  Some checks failed — see above.")
+
+    return 0 if ok else 1
+
+
+def run_integrity(*, json_output: bool = False) -> int:
+    """Full canonical chain replay, separated from routine health (WI-030).
+
+    Replays the complete chain via regista's canonical ``replay`` API and
+    records the verdict in the state dir, where ``cairn doctor`` reports it
+    without re-replaying. Intended for scheduled runs (e.g. alongside
+    backups) or on demand — its runtime grows with production history, so
+    it must never sit on the routine health path.
+
+    Exit codes: 0 verified, 1 otherwise (drift, replay error, unsupported
+    replay API, store unreachable, not configured).
+    """
+    cfg = resolve_config()
+
+    if not cfg.is_configured:
+        report = {
+            "component": "cairn",
+            "version": _cairn_version,
+            "ok": False,
+            "chain_state": "unconfigured",
+            "chain_ok": None,
+            "detail": f"not configured (missing: {', '.join(cfg.missing())})",
+        }
+        if json_output:
+            print(json.dumps(report, indent=2))
+        else:
+            print(f"cairn integrity — v{_cairn_version}")
+            print(f"  [FAIL] {report['detail']}")
+        return 1
+
+    started = time.monotonic()
+    try:
+        with _open_regista(cfg) as sub:
+            chain_state, chain_ok = _verify_chain(sub)
+    except Exception as exc:
+        report = {
+            "component": "cairn",
+            "version": _cairn_version,
+            "ok": False,
+            "chain_state": "unreachable",
+            "chain_ok": None,
+            "detail": f"unreachable: {exc}",
+        }
+        if json_output:
+            print(json.dumps(report, indent=2))
+        else:
+            print(f"cairn integrity — v{_cairn_version}")
+            print(f"  [FAIL] {report['detail']}")
+        return 1
+    duration = time.monotonic() - started
+
+    checked_at = datetime.datetime.now(datetime.UTC).isoformat()
+    verdict = {
+        "checked_at": checked_at,
+        "chain_state": chain_state,
+        "chain_ok": chain_ok,
+        "duration_seconds": round(duration, 3),
+        "cairn_version": _cairn_version,
+        "project": cfg.project,
+    }
+
+    # Record the verdict for doctor — atomically, so a concurrent doctor
+    # never reads a half-written file. Unreachable/unconfigured record
+    # nothing, preserving the last real verdict.
+    if chain_state in ("verified", "drift", "error", "unsupported"):
+        path = _integrity_verdict_path(cfg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".integrity-")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(verdict, f, indent=2)
+            os.replace(tmp, path)
+        except Exception:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
+            raise
+
+    ok = chain_state == "verified" and chain_ok is True
+    report = {
+        "component": "cairn",
+        "version": _cairn_version,
+        "ok": ok,
+        **verdict,
+    }
+
+    if json_output:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"cairn integrity — v{_cairn_version}")
+        detail = {
+            "verified": "canonical replay verified no drift or halted events",
+            "drift": "canonical replay detected chain drift or halted events",
+            "error": "chain replay failed; integrity verdict is unknown",
+            "unsupported": "regista version does not expose the canonical replay API",
+        }.get(chain_state, chain_state)
+        status = "OK" if ok else "FAIL"
+        print(f"  [{status:4s}] chain_integrity   {detail}")
+        print(f"  replayed in {duration:.1f}s; verdict recorded for doctor")
 
     return 0 if ok else 1

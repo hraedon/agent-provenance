@@ -867,10 +867,29 @@ def uninstall_harness(harness: str, dry_run: bool, json_output: bool) -> None:
 @main.command()
 @click.option("--json", "json_output", is_flag=True, help="Emit suite-shape JSON")
 def doctor(json_output: bool) -> None:
-    """Health check — validates config, regista connectivity, harness wiring."""
+    """Health check — validates config, regista connectivity, harness wiring.
+
+    Bounded and read-only: the full chain replay is owned by ``cairn
+    integrity`` (WI-030); doctor reports that command's recorded verdict.
+    """
     from ._doctor import run_doctor
 
     sys.exit(run_doctor(json_output=json_output))
+
+
+@main.command()
+@click.option("--json", "json_output", is_flag=True, help="Emit suite-shape JSON")
+def integrity(json_output: bool) -> None:
+    """Full canonical chain replay against the configured store (WI-030).
+
+    Runtime grows with production history — run on demand or on a schedule,
+    never as part of routine health. Records its verdict in the state dir
+    for ``cairn doctor`` to report. Exits 0 when the replay verifies, 1 on
+    drift, replay error, or an unreachable/unconfigured store.
+    """
+    from ._doctor import run_integrity
+
+    sys.exit(run_integrity(json_output=json_output))
 
 
 @main.command()

@@ -101,6 +101,7 @@ class CairnEnvConfig:
     content_key_ref: str | None = None
     content_key_path: str | None = None
     content_encryption: str = "on"
+    integrity_max_age_hours: float = 168.0
 
     @property
     def is_configured(self) -> bool:
@@ -174,6 +175,16 @@ def resolve_config() -> CairnEnvConfig:
     if content_encryption not in ("on", "off", "external"):
         content_encryption = "on"
 
+    integrity_max_age_raw = (
+        os.environ.get("CAIRN_INTEGRITY_MAX_AGE_HOURS")
+        or suite_env.get("CAIRN_INTEGRITY_MAX_AGE_HOURS")
+        or "168"
+    )
+    try:
+        integrity_max_age_hours = float(integrity_max_age_raw)
+    except ValueError:
+        integrity_max_age_hours = 168.0
+
     return CairnEnvConfig(
         dsn=dsn,
         key_path=key_path,
@@ -187,4 +198,5 @@ def resolve_config() -> CairnEnvConfig:
         content_key_ref=content_key_ref,
         content_key_path=content_key_path,
         content_encryption=content_encryption,
+        integrity_max_age_hours=integrity_max_age_hours,
     )
