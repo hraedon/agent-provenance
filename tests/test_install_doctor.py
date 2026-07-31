@@ -11,6 +11,7 @@ import pytest
 from cairn._config import CairnEnvConfig, resolve_config
 from cairn._doctor import _check_opencode_harness_wired, run_doctor
 from cairn._install import (
+    CAIRN_CODEX_HOOK_COMMAND,
     ConfigLoadError,
     InstallResult,
     InstallStatus,
@@ -391,10 +392,10 @@ def test_install_codex_wires_hooks_only_no_env(cfg, tmp_path, monkeypatch):
     assert result.status is InstallStatus.INSTALLED
     assert result.no_op is False
     data = json.loads(_codex_hooks_file(tmp_path).read_text())
-    # All four attested events registered, pointing at the Codex hook module.
+    # All four attested events registered, pointing at cairn's hook entry point.
     assert set(data["hooks"]) == {"SessionStart", "PreToolUse", "PostToolUse", "Stop"}
     cmd = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-    assert "cairn._codex_hook pre" in cmd
+    assert cmd == f"{CAIRN_CODEX_HOOK_COMMAND} pre"
     # Tool events carry a matcher; SessionStart/Stop do not.
     assert data["hooks"]["PreToolUse"][0]["matcher"] == "*"
     assert "matcher" not in data["hooks"]["Stop"][0]
@@ -433,7 +434,7 @@ def test_install_codex_preserves_user_hooks(cfg, tmp_path):
     data = json.loads(hooks_file.read_text())
     cmds = [h["command"] for e in data["hooks"]["PostToolUse"] for h in e["hooks"]]
     assert "./scripts/mine.sh" in cmds  # user hook preserved
-    assert any("cairn._codex_hook post" in c for c in cmds)  # cairn added alongside
+    assert f"{CAIRN_CODEX_HOOK_COMMAND} post" in cmds  # cairn added alongside
 
 
 def test_uninstall_codex_removes_only_cairn(cfg, tmp_path):
@@ -799,11 +800,37 @@ def _make_transcript(base, session_id: str, age_secs: float) -> None:
     os.utime(f, (ts, ts))
 
 
+def _probe(
+    *,
+    session_attested: dict[str, object] | None = None,
+    scoped: bool = True,
+    newest_event_ts: object = None,
+    unattributed_at: object = None,
+):
+    """Build a store probe the way ``_check_regista`` would."""
+    from cairn._doctor import _StoreProbe
+
+    return _StoreProbe(
+        newest_event_ts=newest_event_ts,
+        session_attested=dict(session_attested or {}),
+        unattributed_at=unattributed_at,
+        session_scoped=scoped,
+    )
+
+
+def _ago(**kwargs):
+    import datetime
+
+    return datetime.datetime.now(datetime.UTC) - datetime.timedelta(**kwargs)
+
+
 def test_freshness_skips_when_not_configured(monkeypatch, tmp_path):
     from cairn._doctor import _check_attestation_freshness
 
     cfg = CairnEnvConfig(dsn=None, key_path=None, project=None)
-    result = _check_attestation_freshness(cfg, None, regista_ok=False)
+    result = _check_attestation_freshness(
+        cfg, _probe(), regista_ok=False, harnesses=["claude"]
+    )
     assert result["status"] == "skip"
 
 
@@ -812,18 +839,35 @@ def test_freshness_skips_when_regista_unreachable(monkeypatch, tmp_path):
     pile a misleading 'silent' failure on top."""
     from cairn._doctor import _check_attestation_freshness
 
-    result = _check_attestation_freshness(_configured_cfg(), None, regista_ok=False)
+    result = _check_attestation_freshness(
+        _configured_cfg(), _probe(), regista_ok=False, harnesses=["claude"]
+    )
     assert result["status"] == "skip"
     assert "unreachable" in result["detail"]
 
 
-def test_freshness_skips_without_local_transcripts(monkeypatch, tmp_path):
+def test_freshness_skips_when_no_harness_is_wired(monkeypatch, tmp_path):
+    """Nothing is expected to attest, so there is nothing to be silent about."""
     from cairn._doctor import _check_attestation_freshness
 
-    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path / "empty"))
-    result = _check_attestation_freshness(_configured_cfg(), None, regista_ok=True)
+    result = _check_attestation_freshness(
+        _configured_cfg(), _probe(), regista_ok=True, harnesses=[]
+    )
     assert result["status"] == "skip"
-    assert "no local session transcripts" in result["detail"]
+    assert "no harness is wired" in result["detail"]
+
+
+def test_freshness_skips_when_the_session_query_did_not_run(monkeypatch, tmp_path):
+    """An unexamined store is not a fresh one (the WI-223 lesson)."""
+    from cairn._doctor import _check_attestation_freshness
+
+    _make_transcript(tmp_path, "recent-session", age_secs=60)
+    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path))
+    result = _check_attestation_freshness(
+        _configured_cfg(), _probe(scoped=False), regista_ok=True, harnesses=["claude"]
+    )
+    assert result["status"] == "skip"
+    assert "unknown" in result["detail"]
 
 
 def test_freshness_ok_when_no_recent_sessions(monkeypatch, tmp_path):
@@ -833,76 +877,199 @@ def test_freshness_ok_when_no_recent_sessions(monkeypatch, tmp_path):
 
     _make_transcript(tmp_path, "old-session", age_secs=3 * 24 * 3600)
     monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path))
-    result = _check_attestation_freshness(_configured_cfg(), None, regista_ok=True)
+    result = _check_attestation_freshness(
+        _configured_cfg(), _probe(), regista_ok=True, harnesses=["claude"]
+    )
     assert result["status"] == "ok"
     assert "no sessions ran" in result["detail"]
 
 
-def test_freshness_ok_with_recent_attestation(monkeypatch, tmp_path):
-    import datetime
-
+def test_freshness_ok_with_recent_session_attestation(monkeypatch, tmp_path):
     from cairn._doctor import _check_attestation_freshness
 
     _make_transcript(tmp_path, "recent-session", age_secs=60)
     monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path))
-    recent = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
-    result = _check_attestation_freshness(_configured_cfg(), recent, regista_ok=True)
+    result = _check_attestation_freshness(
+        _configured_cfg(),
+        _probe(session_attested={"claude-code": _ago(minutes=5)}),
+        regista_ok=True,
+        harnesses=["claude"],
+    )
     assert result["status"] == "ok"
 
 
-def test_freshness_fails_when_configured_but_silent(monkeypatch, tmp_path):
-    """The WI-4.1 acceptance criterion: sessions ran within the window but
-    the newest attestation predates it (or none exists) — doctor reds out."""
-    import datetime
+def test_freshness_ignores_non_session_attestation(monkeypatch, tmp_path):
+    """THE WI-034 REGRESSION.
 
+    On the real estate the 400 most recent events were all
+    ``entity_kind=work_item`` — ``tool_call_begin``/``end`` written in-process
+    by agent-notes attesting its own operations — and ZERO were session events.
+    That satisfied the old check, which asked only whether ANY attestation had
+    landed, so "every Claude Code session on this host is unattested" read as
+    ``ok``. A store full of work-item events must not satisfy freshness.
+    """
     from cairn._doctor import _check_attestation_freshness
 
     _make_transcript(tmp_path, "recent-session", age_secs=60)
     monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path))
 
-    # No attestation at all.
-    result = _check_attestation_freshness(_configured_cfg(), None, regista_ok=True)
-    assert result["status"] == "fail"
-    assert "configured but silent" in result["detail"]
-    assert "never" in result["detail"]
+    # Plenty of very recent activity in the store — none of it session-scoped.
+    probe = _probe(newest_event_ts=_ago(seconds=30), session_attested={})
 
-    # Stale attestation (outside the window).
-    stale = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=3)
-    result = _check_attestation_freshness(_configured_cfg(), stale, regista_ok=True)
-    assert result["status"] == "fail"
+    result = _check_attestation_freshness(
+        _configured_cfg(), probe, regista_ok=True, harnesses=["claude"]
+    )
+    assert result["status"] == "fail", result
     assert "configured but silent" in result["detail"]
+
+
+def test_freshness_is_scoped_per_harness(monkeypatch, tmp_path):
+    """An unhooked Claude behind a working OpenCode must not read green.
+
+    The old check aggregated across harnesses, so one harness's attestation
+    covered for another's total silence (WI-034).
+    """
+    from cairn._doctor import _check_attestation_freshness
+
+    _make_transcript(tmp_path, "recent-session", age_secs=60)
+    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path))
+
+    probe = _probe(session_attested={"opencode": _ago(minutes=2)})
+    result = _check_attestation_freshness(
+        _configured_cfg(), probe, regista_ok=True, harnesses=["claude", "opencode"]
+    )
+    assert result["status"] == "fail", result
+    assert "claude" in result["detail"]
+
+
+def test_freshness_does_not_credit_an_unattributed_attestation(monkeypatch, tmp_path):
+    """A session attestation naming no harness cannot cover for one."""
+    from cairn._doctor import _check_attestation_freshness
+
+    _make_transcript(tmp_path, "recent-session", age_secs=60)
+    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path))
+
+    probe = _probe(unattributed_at=_ago(minutes=1))
+    result = _check_attestation_freshness(
+        _configured_cfg(), probe, regista_ok=True, harnesses=["claude"]
+    )
+    assert result["status"] == "fail", result
+    assert "names no harness" in result["detail"]
+
+
+def test_freshness_warns_for_a_harness_with_no_local_signal(monkeypatch, tmp_path):
+    """cairn cannot see whether OpenCode ran, so silence is a warning — not ok,
+    which would be the same fail-open move, and not fail, which would cry wolf
+    on a harness nobody used."""
+    from cairn._doctor import _check_attestation_freshness
+
+    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path / "empty"))
+    result = _check_attestation_freshness(
+        _configured_cfg(), _probe(), regista_ok=True, harnesses=["opencode"]
+    )
+    assert result["status"] == "warn"
+    assert "no local signal" in result["detail"]
+
+
+def test_freshness_ok_without_local_claude_transcripts(monkeypatch, tmp_path):
+    """No transcripts at all is what an unused Claude looks like."""
+    from cairn._doctor import _check_attestation_freshness
+
+    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path / "empty"))
+    result = _check_attestation_freshness(
+        _configured_cfg(), _probe(), regista_ok=True, harnesses=["claude"]
+    )
+    assert result["status"] == "ok"
+    assert "no sessions ran" in result["detail"]
+
+
+def test_freshness_stale_session_attestation_is_not_fresh(monkeypatch, tmp_path):
+    """An attestation older than the window is outside the probe's query, so
+    the harness reads as silent."""
+    from cairn._doctor import _check_attestation_freshness
+
+    _make_transcript(tmp_path, "recent-session", age_secs=60)
+    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path))
+    # _probe_session_attestation only ever records events inside the window;
+    # an empty map with a scoped query therefore means "nothing recent".
+    result = _check_attestation_freshness(
+        _configured_cfg(), _probe(), regista_ok=True, harnesses=["claude"]
+    )
+    assert result["status"] == "fail"
 
 
 def test_freshness_window_configurable(monkeypatch, tmp_path):
     """CAIRN_MAX_ATTESTATION_AGE_HOURS narrows or widens the window."""
-    import datetime
-
     from cairn._doctor import _check_attestation_freshness
 
     _make_transcript(tmp_path, "recent-session", age_secs=2 * 3600)
     monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path))
-    stale = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=2, minutes=30)
 
-    # Default 24h window: the 2.5h-old attestation is fresh enough.
-    result = _check_attestation_freshness(_configured_cfg(), stale, regista_ok=True)
-    assert result["status"] == "ok"
-
-    # 1h window: session ran 2h ago (outside window) — nothing to demand.
-    monkeypatch.setenv("CAIRN_MAX_ATTESTATION_AGE_HOURS", "1")
-    result = _check_attestation_freshness(_configured_cfg(), stale, regista_ok=True)
-    assert result["status"] == "ok"
-
-    # 3h window: session ran inside, attestation 2.5h old is also inside.
-    monkeypatch.setenv("CAIRN_MAX_ATTESTATION_AGE_HOURS", "3")
-    result = _check_attestation_freshness(_configured_cfg(), stale, regista_ok=True)
-    assert result["status"] == "ok"
-
-    # 2h window (as hours float): session 2h ago is borderline-outside;
-    # use a fresher transcript to force the demand, stale attestation fails.
-    _make_transcript(tmp_path, "fresher-session", age_secs=60)
-    monkeypatch.setenv("CAIRN_MAX_ATTESTATION_AGE_HOURS", "2")
-    result = _check_attestation_freshness(_configured_cfg(), stale, regista_ok=True)
+    # Default 24h window: the session ran inside it and nothing attested.
+    result = _check_attestation_freshness(
+        _configured_cfg(), _probe(), regista_ok=True, harnesses=["claude"]
+    )
     assert result["status"] == "fail"
+
+    # 1h window: the session ran 2h ago, outside it — nothing to demand.
+    monkeypatch.setenv("CAIRN_MAX_ATTESTATION_AGE_HOURS", "1")
+    result = _check_attestation_freshness(
+        _configured_cfg(), _probe(), regista_ok=True, harnesses=["claude"]
+    )
+    assert result["status"] == "ok"
+
+    # An unparseable value falls back to the 24h default rather than 0.
+    monkeypatch.setenv("CAIRN_MAX_ATTESTATION_AGE_HOURS", "not-a-number")
+    result = _check_attestation_freshness(
+        _configured_cfg(), _probe(), regista_ok=True, harnesses=["claude"]
+    )
+    assert result["status"] == "fail"
+
+
+def test_session_probe_only_counts_session_entity_events():
+    """``_probe_session_attestation`` must reject work-item events outright."""
+    import datetime
+    import uuid
+
+    from cairn._doctor import _probe_session_attestation, _StoreProbe
+
+    now = datetime.datetime.now(datetime.UTC)
+
+    class _Ev:
+        def __init__(self, entity_kind, payload):
+            self.entity_kind = entity_kind
+            self.payload = payload
+            self.timestamp = now
+            self.event_id = uuid.uuid4()
+
+    class _Sub:
+        def read_events(self, **kwargs):
+            assert kwargs["transition"] == "session_attestation"
+            assert kwargs["start"] is not None and kwargs["end"] is not None
+            return [
+                # A work-item event that happens to share the transition name.
+                _Ev("work_item", {"harnesses": [{"name": "claude-code"}]}),
+                _Ev("session", {"harnesses": [{"name": "OpenCode", "version": "1"}]}),
+            ]
+
+    probe = _StoreProbe()
+    _probe_session_attestation(_Sub(), probe)
+    assert probe.session_scoped is True
+    assert set(probe.session_attested) == {"opencode"}
+
+
+def test_session_probe_leaves_scope_false_when_the_query_fails():
+    """A store that cannot answer the scoped query must not look attested."""
+    from cairn._doctor import _probe_session_attestation, _StoreProbe
+
+    class _Sub:
+        def read_events(self, **kwargs):
+            raise RuntimeError("filter not supported")
+
+    probe = _StoreProbe()
+    _probe_session_attestation(_Sub(), probe)
+    assert probe.session_scoped is False
+    assert probe.session_attested == {}
 
 
 def test_doctor_includes_freshness_check(monkeypatch, tmp_path):
@@ -1524,12 +1691,16 @@ def test_doctor_chain_ok_verified_when_integrity_recorded_clean(monkeypatch, tmp
             return []
 
         def replay(self, **kwargs):
+            # A clean replay that also VERIFIED principal binding: post-WI-036
+            # cairn only records "verified" when the binding check actually ran.
+            assert kwargs.get("verify_principal_binding") is True
             return ReplayReport(
                 table_name="test",
                 replayed_ok=1,
                 replayed_drift=0,
                 halted=0,
                 warnings=0,
+                principal_binding_verified=True,
             )
 
         def close(self):
@@ -1646,9 +1817,17 @@ def test_doctor_chain_state_error_when_replay_raises(monkeypatch, tmp_path):
 @pytest.fixture
 def doctor_ready_cfg(cfg, monkeypatch, tmp_path):
     """A config whose other doctor checks pass so chain behavior is isolated."""
+    import sys
+
     key_path = Path(cfg.key_path)
     key_path.write_text(json.dumps({"keys": [{"key_id": "doctor-test"}]}))
     _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    # Put cairn's console scripts on PATH: doctor now warns when the hook it
+    # found is runnable only via cairn's own entry-point directory, and a
+    # real harness session has that directory on PATH (WI-033/WI-034).
+    monkeypatch.setenv(
+        "PATH", f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}"
+    )
     monkeypatch.setattr("cairn._doctor._newest_local_session_activity", lambda: None)
     monkeypatch.setattr(
         "cairn._doctor._check_content_encryption",
@@ -1706,12 +1885,16 @@ def test_doctor_chain_integrity_verified_ok_and_exits_zero(
             return []
 
         def replay(self, **kwargs):
+            # A clean replay that also VERIFIED principal binding: post-WI-036
+            # cairn only records "verified" when the binding check actually ran.
+            assert kwargs.get("verify_principal_binding") is True
             return ReplayReport(
                 table_name="test",
                 replayed_ok=1,
                 replayed_drift=0,
                 halted=0,
                 warnings=0,
+                principal_binding_verified=True,
             )
 
         def close(self):
@@ -1726,7 +1909,9 @@ def test_doctor_chain_integrity_verified_ok_and_exits_zero(
     assert report["regista"]["chain_ok"] is True
     assert report["regista"]["chain_state"] == "verified"
     assert report["ok"] is True
-    assert report["degraded"] is False
+    assert report["degraded"] is False, [
+        c for c in report["checks"] if c["status"] == "warn"
+    ]
 
     result = _run_doctor_cli(monkeypatch, doctor_ready_cfg, _FakeRegista)
     assert result.exit_code == 0
@@ -1860,12 +2045,16 @@ def test_integrity_cli_verified_exits_zero(doctor_ready_cfg, monkeypatch):
             return []
 
         def replay(self, **kwargs):
+            # A clean replay that also VERIFIED principal binding: post-WI-036
+            # cairn only records "verified" when the binding check actually ran.
+            assert kwargs.get("verify_principal_binding") is True
             return ReplayReport(
                 table_name="test",
                 replayed_ok=1,
                 replayed_drift=0,
                 halted=0,
                 warnings=0,
+                principal_binding_verified=True,
             )
 
         def close(self):
@@ -1927,3 +2116,546 @@ def test_install_harness_opencode_dry_run_exits_zero(cfg, monkeypatch):
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload[0]["status"] == "installed"
+
+
+# ----------------------------------------------------------------------
+# WI-033 — the generated hook must be RUNNABLE, not merely well-formed
+# ----------------------------------------------------------------------
+
+
+def _hook_entry_point_dir() -> Path:
+    """Directory holding cairn's hook console scripts.
+
+    This is the directory a harness session finds on PATH for a uv-tool,
+    pipx or venv install (``~/.local/bin`` or ``<venv>/bin``).
+    """
+    import shutil as _shutil
+    import sys as _sys
+
+    candidate = Path(_sys.executable).parent
+    if (candidate / "cairn-claude-hook").exists():
+        return candidate
+    found = _shutil.which("cairn-claude-hook")
+    assert found, (
+        "cairn-claude-hook console script is not installed — generated hooks "
+        "would name an interpreter that may not be able to import cairn (WI-033)"
+    )
+    return Path(found).parent
+
+
+def test_generated_claude_hook_executes_under_a_stripped_path(tmp_path):
+    """Execute the generated command with PATH stripped to cairn's own bin dir.
+
+    PATH deliberately excludes ``/usr/bin``, so no ``python3`` is resolvable at
+    all.  A console script still runs there because its shebang names cairn's
+    interpreter absolutely; the old ``python3 -m cairn._claude_hook`` form
+    cannot even find an interpreter — which is how all ten hooks on a real host
+    failed on every invocation while ``harness_wired`` reported ok (WI-033).
+
+    Asserting the *string* appears in settings.json is exactly the check that
+    let this run undetected, so this test runs the command.
+    """
+    import subprocess
+
+    from cairn._install import _expected_hook_entry
+
+    entry = _expected_hook_entry("claude", "SessionStart")
+    assert entry is not None
+    command = entry["hooks"][0]["command"]
+    script_dir = _hook_entry_point_dir()
+
+    proc = subprocess.run(
+        command,
+        shell=True,
+        input="{}",
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            "PATH": str(script_dir),
+            "HOME": str(tmp_path),
+            # Keeps the probe side-effect free; the module still has to import
+            # before main() can honour it.
+            "CAIRN_DISABLE": "1",
+        },
+    )
+    assert proc.returncode == 0, (
+        f"generated hook command {command!r} is not runnable with PATH="
+        f"{script_dir}: exit {proc.returncode}\n{proc.stderr}"
+    )
+
+    # And the same command answers the liveness probe used by install/doctor.
+    probe = f"{command.rsplit(' ', 1)[0]} --selftest"
+    proc = subprocess.run(
+        probe,
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={"PATH": str(script_dir), "HOME": str(tmp_path)},
+    )
+    assert proc.returncode == 0, f"{probe!r} failed: {proc.stderr}"
+    assert "cairn-hook-selftest ok" in proc.stdout
+
+
+def test_generated_codex_hook_executes_under_a_stripped_path(tmp_path):
+    """Same guarantee for the Codex hook command (WI-033)."""
+    import subprocess
+
+    from cairn._install import _expected_hook_entry
+
+    entry = _expected_hook_entry("codex", "PostToolUse")
+    assert entry is not None
+    command = entry["hooks"][0]["command"]
+    script_dir = _hook_entry_point_dir()
+
+    probe = f"{command.rsplit(' ', 1)[0]} --selftest"
+    proc = subprocess.run(
+        probe,
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={"PATH": str(script_dir), "HOME": str(tmp_path)},
+    )
+    assert proc.returncode == 0, (
+        f"generated Codex hook command {command!r} is not runnable with PATH="
+        f"{script_dir}: exit {proc.returncode}\n{proc.stderr}"
+    )
+    assert "cairn-hook-selftest ok" in proc.stdout
+
+
+def test_generated_hook_commands_do_not_name_a_bare_interpreter():
+    """A bare ``python3``/``python`` resolves against the harness's PATH, which
+    is not cairn's interpreter under any isolated install (WI-033)."""
+    from cairn._install import (
+        CAIRN_CODEX_HOOK_COMMAND,
+        CAIRN_CODEX_HOOK_COMMAND_WINDOWS,
+        CAIRN_HOOK_COMMAND,
+    )
+
+    for cmd in (
+        CAIRN_HOOK_COMMAND,
+        CAIRN_CODEX_HOOK_COMMAND,
+        CAIRN_CODEX_HOOK_COMMAND_WINDOWS,
+    ):
+        assert not cmd.split()[0].startswith("python"), (
+            f"hook command {cmd!r} depends on PATH module resolution"
+        )
+
+
+def test_legacy_bare_python_hooks_are_still_recognised_as_ours():
+    """Upgrade path: hosts installed by an older version have bare-python
+    hooks, and hosts mitigated by hand have absolute-interpreter ones.  If
+    ownership detection stops recognising them, uninstall leaves them behind
+    and install appends the console-script form alongside the broken old
+    entry (WI-033)."""
+    import sys as _sys
+
+    legacy_claude = (
+        "python3 -m cairn._claude_hook session-start",
+        "python -m cairn._claude_hook session-start",
+        f"{_sys.executable} -m cairn._claude_hook session-start",
+    )
+    for legacy_cmd in legacy_claude:
+        entry = {
+            "matcher": "*",
+            "hooks": [{"type": "command", "command": legacy_cmd, "timeout": 10}],
+        }
+        assert _is_cairn_hook_entry(entry, harness="claude", event="SessionStart"), (
+            f"legacy hook form not recognised: {legacy_cmd}"
+        )
+
+    for legacy_cmd in (
+        "python3 -m cairn._codex_hook post",
+        f"{_sys.executable} -m cairn._codex_hook post",
+    ):
+        entry = {
+            "matcher": "*",
+            "hooks": [{"type": "command", "command": legacy_cmd, "timeout": 10}],
+        }
+        assert _is_cairn_hook_entry(entry, harness="codex", event="PostToolUse"), (
+            f"legacy Codex hook form not recognised: {legacy_cmd}"
+        )
+
+    # A user hook that merely mentions cairn is still not ours.
+    foreign = {
+        "matcher": "*",
+        "hooks": [{"type": "command", "command": "python3 -m mycairn._claude_hook pre"}],
+    }
+    assert not _is_cairn_hook_entry(foreign, harness="claude", event="PreToolUse")
+
+
+def test_upgrade_rewrites_legacy_hooks_in_place(cfg, claude_settings):
+    """An upgrade must REWRITE deployed legacy hooks, not just recognise them.
+
+    Found live on a uv-tool host: recognising the bare-python entries as
+    cairn-owned made install-harness report "already wired (no-op)" and leave
+    all ten broken hooks exactly as they were — so the fix never reached the
+    deployed host. Recognition without rewriting is worse than not recognising:
+    it is silence over a known-broken hook (WI-033).
+    """
+    from cairn._install import CAIRN_HOOK_COMMAND
+
+    claude_settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        # A user hook cairn does not own, first in the list.
+                        {
+                            "matcher": "*",
+                            "hooks": [{"type": "command", "command": "./mine.sh"}],
+                        },
+                        {
+                            "matcher": "*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python3 -m cairn._claude_hook session-start",
+                                    "timeout": 10,
+                                }
+                            ],
+                        },
+                    ]
+                }
+            }
+        )
+    )
+    result = _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    assert not result.no_op, "an upgrade over broken hooks is not a no-op"
+
+    entries = json.loads(claude_settings.read_text())["hooks"]["SessionStart"]
+    commands = [h["command"] for e in entries for h in e.get("hooks", [])]
+    assert "./mine.sh" in commands, "user hook was clobbered"
+    assert f"{CAIRN_HOOK_COMMAND} session-start" in commands, (
+        "legacy hook was recognised but never rewritten"
+    )
+    assert not any("python3 -m cairn._claude_hook" in c for c in commands), (
+        f"the broken legacy hook survived the upgrade: {commands}"
+    )
+    assert len(entries) == 2, f"install duplicated an entry: {entries}"
+
+    # And a second run is a genuine no-op.
+    again = _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    assert again.no_op, [a.detail for a in again.actions]
+
+    _uninstall_claude(
+        claude_settings,
+        json.loads(claude_settings.read_text()),
+        dry_run=False,
+        result=InstallResult(harness="claude"),
+        manifest={},
+    )
+
+
+def test_upgrade_collapses_duplicate_cairn_hooks(cfg, claude_settings):
+    """A host that already accumulated duplicates ends with exactly one."""
+    from cairn._install import CAIRN_HOOK_COMMAND
+
+    legacy = {
+        "matcher": "*",
+        "hooks": [
+            {
+                "type": "command",
+                "command": "python3 -m cairn._claude_hook pre",
+                "timeout": 10,
+            }
+        ],
+    }
+    claude_settings.write_text(
+        json.dumps({"hooks": {"PreToolUse": [legacy, dict(legacy)]}})
+    )
+    _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    entries = json.loads(claude_settings.read_text())["hooks"]["PreToolUse"]
+    assert len(entries) == 1, entries
+    assert entries[0]["hooks"][0]["command"] == f"{CAIRN_HOOK_COMMAND} pre"
+
+
+def test_install_harness_degrades_when_the_hook_command_cannot_run(
+    cfg, claude_settings, monkeypatch
+):
+    """install-harness must VERIFY the hook it writes, not merely record it.
+
+    The WI-034 lesson applied to the installer: a hook that was written but
+    never executed is not evidence of anything, and reporting ``installed`` on
+    an unrunnable hook is how a total loss of session attestation went
+    unnoticed (WI-033).
+    """
+    monkeypatch.setattr(
+        "cairn._install.CAIRN_HOOK_COMMAND", "cairn-claude-hook-not-installed"
+    )
+    result = _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+
+    assert result.status is InstallStatus.FAILED or result.status.value == "degraded", (
+        f"unrunnable hook reported as {result.status.value}"
+    )
+    assert any(
+        a.kind == "error" and "not runnable" in a.detail for a in result.actions
+    ), [a.detail for a in result.actions]
+
+    from cairn._install import results_succeeded
+
+    assert not results_succeeded([result])
+
+
+def test_install_harness_reports_verified_hook_command(cfg, claude_settings):
+    """The happy path records that the hook was executed, not just written."""
+    result = _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    assert result.status is InstallStatus.INSTALLED, [a.detail for a in result.actions]
+    assert any(a.kind in ("verify", "warn") for a in result.actions), [
+        a.detail for a in result.actions
+    ]
+
+
+def test_hook_verification_can_be_bypassed_explicitly(
+    cfg, claude_settings, monkeypatch
+):
+    """An operator whose harness PATH differs from the installer's can opt out
+    — loudly and on purpose, never by default."""
+    from cairn._install import SKIP_HOOK_VERIFICATION_ENV
+
+    monkeypatch.setattr(
+        "cairn._install.CAIRN_HOOK_COMMAND", "cairn-claude-hook-not-installed"
+    )
+    monkeypatch.setenv(SKIP_HOOK_VERIFICATION_ENV, "1")
+    result = _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    assert result.status is InstallStatus.INSTALLED
+
+
+# ----------------------------------------------------------------------
+# WI-034 — doctor checks must verify, not merely observe presence
+# ----------------------------------------------------------------------
+
+
+def test_harness_wired_fails_when_the_hook_is_present_but_not_executable(
+    cfg, claude_settings, monkeypatch
+):
+    """THE WI-034 REGRESSION.
+
+    ``harness_wired`` verified that hook entries were PRESENT and that env vars
+    were SET.  It never checked that the command was executable or that the
+    module it named was importable, so a hook failing on every invocation read
+    ``ok`` — which is why a total loss of session attestation went unnoticed on
+    a real host for as long as it did.
+    """
+    from cairn._doctor import _check_harness_wired
+    from cairn._install import HOOK_EVENTS
+
+    # Wire a complete, well-formed set of hooks whose command cannot run.
+    broken = "cairn-claude-hook-not-installed"
+    monkeypatch.setattr("cairn._install.CAIRN_HOOK_COMMAND", broken)
+    claude_settings.write_text(
+        json.dumps(
+            {
+                "env": {"REGISTA_DSN": cfg.dsn, "CAIRN_PROJECT": cfg.project},
+                "hooks": {
+                    event: [
+                        {
+                            "matcher": "*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": f"{broken} {action}",
+                                    "timeout": 10,
+                                }
+                            ],
+                        }
+                    ]
+                    for event, action in HOOK_EVENTS.items()
+                },
+            }
+        )
+    )
+
+    result = _check_harness_wired(cfg)
+    assert result["status"] == "fail", result
+    assert "not runnable" in result["detail"]
+
+
+def test_harness_wired_fails_when_the_named_module_is_not_importable(
+    cfg, claude_settings, monkeypatch
+):
+    """The exact estate failure: hooks name a python that cannot import cairn.
+
+    The command RESOLVES and EXECUTES — presence checks and even a naive
+    ``which`` are satisfied — but the module it names is not importable under
+    that interpreter, so every invocation fails (WI-033/WI-034).
+    """
+    import sys
+
+    from cairn._doctor import _check_harness_wired
+    from cairn._install import HOOK_EVENTS
+
+    foreign = "/usr/bin/python3"
+    if foreign == sys.executable:
+        pytest.skip("system python is cairn's interpreter here")
+    import subprocess
+
+    probe = subprocess.run(
+        [foreign, "-c", "import cairn"], capture_output=True, text=True
+    )
+    if probe.returncode == 0:
+        pytest.skip(f"{foreign} can import cairn; no foreign interpreter available")
+
+    command = f"{foreign} -m cairn._claude_hook"
+    claude_settings.write_text(
+        json.dumps(
+            {
+                "env": {"REGISTA_DSN": cfg.dsn, "CAIRN_PROJECT": cfg.project},
+                "hooks": {
+                    event: [
+                        {
+                            "matcher": "*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": f"{command} {action}",
+                                    "timeout": 10,
+                                }
+                            ],
+                        }
+                    ]
+                    for event, action in HOOK_EVENTS.items()
+                },
+            }
+        )
+    )
+
+    result = _check_harness_wired(cfg)
+    assert result["status"] == "fail", result
+    assert "not runnable" in result["detail"]
+
+
+def test_harness_wired_ok_for_the_hooks_install_harness_writes(cfg, claude_settings):
+    """The installer's own output must pass its own executability check."""
+    from cairn._doctor import _check_harness_wired
+
+    _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    result = _check_harness_wired(cfg)
+    assert result["status"] in {"ok", "warn"}, result
+    assert "not runnable" not in result["detail"]
+
+
+def test_content_encryption_fails_on_a_configured_but_unresolvable_key(tmp_path):
+    """A configured key ref is not a resolvable one (agent-suite WI-041).
+
+    The check reported ``ok`` because ``CAIRN_CONTENT_KEY_REF`` was SET, never
+    resolving it — so content encryption could be reported ON while the key it
+    names could not be fetched.
+    """
+    from cairn._doctor import _check_content_encryption
+
+    cfg = CairnEnvConfig(
+        dsn="postgresql://x@h/db",
+        key_path=str(tmp_path / "keys.json"),
+        project="test",
+        content_key_path=str(tmp_path / "absent-content.key"),
+    )
+    result = _check_content_encryption(cfg)
+    assert result["status"] == "fail", result
+    assert "does not resolve" in result["detail"]
+
+
+def test_content_encryption_ok_when_the_key_actually_resolves(tmp_path):
+    from cairn._doctor import _check_content_encryption
+
+    key = tmp_path / "content.key"
+    key.write_bytes(b"0" * 32)
+    cfg = CairnEnvConfig(
+        dsn="postgresql://x@h/db",
+        key_path=str(tmp_path / "keys.json"),
+        project="test",
+        content_key_path=str(key),
+    )
+    result = _check_content_encryption(cfg)
+    assert result["status"] == "ok", result
+    assert "resolves" in result["detail"]
+
+
+def test_content_encryption_catches_the_vault_field_suffix_trap(tmp_path):
+    """``vault:kv/a/b/regista#hmac_key`` parses to a DIFFERENT, neighbouring
+    secret rather than erroring — the field is the last path segment."""
+    from cairn._doctor import _check_content_encryption
+
+    cfg = CairnEnvConfig(
+        dsn="postgresql://x@h/db",
+        key_path=str(tmp_path / "keys.json"),
+        project="test",
+        content_key_ref="vault:kv/agent-suite/cairn#content_key",
+    )
+    result = _check_content_encryption(cfg)
+    assert result["status"] == "fail", result
+    assert "LAST PATH SEGMENT" in result["detail"]
+
+
+def test_secret_ref_static_problem_names_the_estate_traps():
+    from cairn._doctor import _secret_ref_static_problem
+
+    # Too few segments for regista's vault provider.
+    assert "segment" in (_secret_ref_static_problem("vault:kv/only") or "")
+    # A bare value silently resolves as a literal secret, not a reference.
+    assert "literal" in (_secret_ref_static_problem("just-a-value") or "")
+    # A well-shaped file ref has no static problem.
+    assert _secret_ref_static_problem("file:/tmp/x.key") is None
+
+
+def test_doctor_freshness_is_not_satisfied_by_work_item_events(monkeypatch, tmp_path):
+    """End-to-end through run_doctor: a store whose only recent events are
+    work-item attestations, with a wired Claude that ran, must exit nonzero."""
+    import io
+    from contextlib import redirect_stdout
+
+    from cairn._install import HOOK_EVENTS
+
+    settings = tmp_path / "claude.json"
+    monkeypatch.setenv("CAIRN_CLAUDE_SETTINGS", str(settings))
+    monkeypatch.setenv("CAIRN_CLAUDE_PROJECTS", str(tmp_path / "projects"))
+    _make_transcript(tmp_path / "projects", "recent", age_secs=60)
+
+    key_path = tmp_path / "keys.json"
+    key_path.write_text(json.dumps({"keys": [{"key_id": "k", "scheme": "hmac-sha256"}]}))
+    cfg = CairnEnvConfig(
+        dsn="postgresql://x@h/db",
+        key_path=str(key_path),
+        project="test",
+        state_dir=str(tmp_path / "state"),
+        integrity_dir=str(tmp_path / "integrity"),
+    )
+    monkeypatch.setattr("cairn._doctor.resolve_config", lambda: cfg)
+    monkeypatch.setattr("cairn._install.resolve_config", lambda: cfg)
+    _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    assert set(json.loads(settings.read_text())["hooks"]) == set(HOOK_EVENTS)
+
+    import datetime
+    from contextlib import contextmanager
+
+    class _Ev:
+        entity_kind = "work_item"
+        timestamp = datetime.datetime.now(datetime.UTC)
+
+    class _Sub:
+        def read_events(self, **kwargs):
+            # 400/400 recent events are work items; zero session events.
+            if kwargs.get("transition") == "session_attestation":
+                return []
+            return [_Ev()]
+
+        def close(self):
+            pass
+
+    @contextmanager
+    def _fake_open(_cfg):
+        yield _Sub()
+
+    monkeypatch.setattr("cairn._doctor._open_regista", _fake_open)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = run_doctor(json_output=True)
+    report = json.loads(buf.getvalue())
+    freshness = next(
+        c for c in report["checks"] if c["name"] == "attestation_freshness"
+    )
+    assert freshness["status"] == "fail", report
+    assert rc == 1

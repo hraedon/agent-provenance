@@ -3,7 +3,9 @@
 
 This file exists for backward compatibility with projects that reference
 ``integrations/claude-code/cairn_hook.py`` directly.  New installs should use
-``python3 -m cairn._claude_hook`` instead (what ``cairn install-harness`` wires).
+the ``cairn-claude-hook`` console script instead (what ``cairn install-harness``
+wires): its shebang pins cairn's own interpreter, so the hook cannot resolve to
+a python that has no cairn on its import path (WI-033).
 """
 
 from cairn._claude_hook import main

@@ -68,11 +68,20 @@ claude -p "echo test" --allowedTools Bash --max-turns 2
 cat /tmp/cairn-sessions/*/degradation.log
 ```
 
-### Hooks not wired
+### Hooks not wired, or wired but not runnable
 
 If the hooks are missing from `settings.json`, `cairn doctor` reports
 `harness_wired: fail`. No events will be attested. Run
 `cairn install-harness claude` to wire them.
+
+`harness_wired` also **executes** the hook command it finds (WI-034), so a
+hook that is present but cannot run — the classic case being a bare
+`python3 -m cairn._claude_hook` under an isolated install, where `python3`
+resolves to an interpreter with no cairn on its import path — reports
+`fail` naming the reason, instead of the `ok` it used to report while every
+invocation failed. `cairn install-harness` runs the same check on the hooks
+it writes and reports `degraded` (nonzero exit) rather than claiming success
+for a hook nobody executed.
 
 ### Wrong field name (pre-Plan-009)
 

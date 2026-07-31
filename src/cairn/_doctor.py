@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import time
 import tomllib
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -40,13 +41,108 @@ from ._config import resolve_config  # noqa: E402
 from ._install import (  # noqa: E402
     CODEX_HOOK_EVENTS,
     HOOK_EVENTS,
+    HOOK_VERIFY_FAIL,
+    HOOK_VERIFY_OFF_PATH,
+    HOOK_VERIFY_OK,
     _claude_settings_path,
     _codex_hooks_path,
     _find_opencode_plugin,
     _is_cairn_hook_entry,
     _load_manifest,
     _opencode_config_path,
+    verify_hook_command,
 )
+
+# ---------------------------------------------------------------------------
+# Secret references: resolve them, do not merely observe that they are set
+#
+# The standing Plan 020 question is "does this check verify, or merely observe
+# presence?".  A configured-but-unresolvable ref reads green under every
+# presence check, which is how a host whose only ``vault:`` ref was provably
+# 403 kept reporting a reachable secret backend (agent-suite WI-041).
+# ---------------------------------------------------------------------------
+
+#: regista's canonical provider names (``regista._secrets``). Note ``azure``
+#: and ``windows`` — not ``akv``/``wincred``, which several docs print and no
+#: resolver accepts.
+_KNOWN_SECRET_SCHEMES = frozenset({"file", "env", "literal", "vault", "azure", "windows"})
+
+#: ``vault:mount/path…/field`` — regista's provider requires at least four
+#: segments and takes the field from the LAST one.
+_VAULT_MIN_SEGMENTS = 4
+
+
+def _secret_ref_static_problem(ref: str) -> str | None:
+    """Why *ref* can never resolve, judged without touching any backend.
+
+    Three ref-shape traps this estate actually hit (agent-suite WI-041):
+
+    1. The mount is ``kv/``, not the ``secret/`` the install docs print.  A
+       wrong mount is a runtime 403 rather than a parse error, so only
+       resolution catches it — which is why this is paired with a real resolve.
+    2. **The field is the LAST PATH SEGMENT.**  The documented ``#field``
+       suffix has never resolved, and it fails worse than cleanly:
+       ``vault:kv/a/b/regista#hmac_key`` parses to field
+       ``regista#hmac_key`` — a *different, neighbouring* secret.
+    3. ``vault:`` refs resolve only where ``hvac`` is importable in the
+       resolving component's OWN environment.  Each suite CLI is its own uv
+       tool venv, so ``vault`` in regista's provider list says nothing about
+       cairn's; without ``hvac`` the ref fails with "Unknown secret provider".
+    """
+    if not ref:
+        return "empty secret reference"
+    scheme, sep, rest = ref.partition(":")
+    if not sep or scheme not in _KNOWN_SECRET_SCHEMES:
+        return (
+            f"{ref!r} names no known backend scheme, so it resolves as a literal "
+            f"secret value rather than a reference "
+            f"(known: {', '.join(sorted(_KNOWN_SECRET_SCHEMES))})"
+        )
+    if scheme == "vault":
+        if "#" in ref:
+            return (
+                f"vault ref {ref!r} uses '#field'; the field is the LAST PATH "
+                "SEGMENT (vault:mount/path/field). This form does not error "
+                "cleanly — it addresses a different, neighbouring secret"
+            )
+        segments = rest.split("/")
+        if len(segments) < _VAULT_MIN_SEGMENTS:
+            return (
+                f"vault ref {ref!r} has {len(segments)} segment(s); regista "
+                f"requires mount/path…/field (at least {_VAULT_MIN_SEGMENTS})"
+            )
+        import importlib.util
+
+        if importlib.util.find_spec("hvac") is None:
+            return (
+                f"vault ref {ref!r} cannot resolve in cairn's environment: "
+                "hvac is not importable here, so regista registers no vault "
+                "provider and the ref fails with 'Unknown secret provider'. "
+                "Reinstall cairn with the vault extra (uv tool install "
+                "'cairn[vault]', pipx install 'cairn[vault]')"
+            )
+    return None
+
+
+def _verify_secret_ref(ref: str) -> tuple[bool, str]:
+    """Actually resolve *ref*. Returns ``(ok, detail)``.
+
+    The resolved value is discarded immediately and never returned, logged or
+    printed — only whether resolution succeeded, and on failure the resolver's
+    reason.
+    """
+    static = _secret_ref_static_problem(ref)
+    if static is not None:
+        return False, static
+    try:
+        from regista._secrets import resolve as resolve_secret
+    except Exception as exc:  # pragma: no cover - regista always present
+        return False, f"regista secret resolver unavailable: {exc}"
+    try:
+        resolve_secret(ref)
+    except Exception as exc:
+        return False, f"does not resolve: {exc}"
+    return True, "resolves"
 
 
 def _check_config(cfg: Any) -> dict[str, Any]:
@@ -63,22 +159,51 @@ def _check_config(cfg: Any) -> dict[str, Any]:
     }
 
 
+def _signing_key_id(keys: list[dict[str, Any]]) -> str | None:
+    """The key the SIGNER would actually pick, per regista's own rule.
+
+    This check used to name ``keys[0]`` as "active", which is not the signer's
+    selection rule at all — the signer takes the last active *asymmetric* entry
+    (falling back to the last active entry).  On a real key file that named the
+    bootstrap HMAC key while every event was signed by something else (WI-036).
+    regista exports the rule as a pure function precisely so consumers cannot
+    re-derive it and drift (WI-223); use it rather than guessing.
+
+    Entry defaults mirror regista's key-file parsing: absent ``status`` is
+    ``active``, absent ``scheme`` is ``hmac-sha256``.
+    """
+    try:
+        from regista._keys import select_signing_key_id
+    except ImportError:
+        first = keys[0].get("key_id") if keys else None
+        return str(first) if first is not None else None
+    candidates = [
+        (
+            str(entry.get("key_id", "?")),
+            str(entry.get("scheme", "hmac-sha256")),
+            str(entry.get("status", "active")),
+        )
+        for entry in keys
+        if isinstance(entry, dict)
+    ]
+    chosen: str | None = select_signing_key_id(candidates)
+    return chosen
+
+
 def _check_key_file(cfg: Any) -> dict[str, Any]:
     if cfg.key_ref:
-        try:
-            from regista._secrets import resolve as resolve_secret
-            resolve_secret(cfg.key_ref)
+        ok, detail = _verify_secret_ref(cfg.key_ref)
+        if ok:
             return {
                 "name": "key_file",
                 "status": "ok",
                 "detail": f"key_ref: {cfg.key_ref} (resolvable)",
             }
-        except Exception as exc:
-            return {
-                "name": "key_file",
-                "status": "fail",
-                "detail": f"key_ref {cfg.key_ref!r} not resolvable: {exc}",
-            }
+        return {
+            "name": "key_file",
+            "status": "fail",
+            "detail": f"key_ref {cfg.key_ref!r} {detail}",
+        }
     if not cfg.key_path:
         return {"name": "key_file", "status": "fail", "detail": "no key path configured"}
     path = cfg.key_path
@@ -89,34 +214,106 @@ def _check_key_file(cfg: Any) -> dict[str, Any]:
         keys = data.get("keys", [])
         if not keys:
             return {"name": "key_file", "status": "fail", "detail": "key file has no keys"}
+        signing = _signing_key_id(keys)
+        if signing is None:
+            return {
+                "name": "key_file",
+                "status": "fail",
+                "detail": (
+                    f"{len(keys)} key(s), none active — the signer has no key to "
+                    "select for this principal"
+                ),
+            }
         return {
             "name": "key_file",
             "status": "ok",
-            "detail": f"{len(keys)} key(s), active={keys[0].get('key_id', '?')}",
+            "detail": f"{len(keys)} key(s), signing={signing}",
         }
     except Exception as exc:
         return {"name": "key_file", "status": "fail", "detail": f"cannot read key file: {exc}"}
 
 
-def _verify_chain(sub: Any) -> tuple[str, bool | None]:
+def _replay_accepts_binding_check(sub: Any) -> bool:
+    """Whether this regista's ``replay`` accepts ``verify_principal_binding``.
+
+    A ``**kwargs`` signature accepts it, and so does anything not introspectable
+    (C implementation, proxy, mock) — in both cases the honest move is to try
+    the kwarg and let the ``TypeError`` fallback in :func:`_verify_chain` decide.
+    Only an explicit signature that lacks the parameter is a definite "no".
+    """
+    try:
+        import inspect
+
+        params = inspect.signature(sub.replay).parameters
+    except (TypeError, ValueError):
+        return True
+    if "verify_principal_binding" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _verify_chain(sub: Any) -> tuple[str, bool | None, dict[str, Any]]:
     """Use regista's canonical replay API to determine chain integrity.
 
-    Returns ``(chain_state, chain_ok)``. ``chain_ok`` is ``True`` when the
-    replay reports no drift and no halted events, ``False`` when drift or
-    a halt is detected, and ``None`` when the verification API is unavailable
-    or an error prevented a verdict. ``chain_state`` is an honest string label
-    (``verified``, ``drift``, ``unsupported``, ``error``) for callers and
-    reports.
+    Returns ``(chain_state, chain_ok, binding)``, where ``chain_ok`` is ``True`` only
+    when the replay established every property this verdict claims, ``False``
+    when it found a violation, and ``None`` when no verdict could be reached.
+
+    Principal binding is requested EXPLICITLY. regista's ``replay()`` Python
+    API keeps ``verify_principal_binding=False`` for backward compatibility
+    (only the CLI defaults it on), and this function used to read
+    ``replayed_drift``/``halted`` alone — so ``chain_integrity`` reported
+    "canonical replay verified no drift or halted events" for a chain signed by
+    a key the project never registered, which the offline verifier
+    (``regista bundle verify``) rejected outright. The wording was narrowly
+    true and the surface was read as "the chain is sound" (WI-036).
+
+    Two honest states beyond verified/drift follow from WI-223:
+
+    * ``unattributable`` — the binding check RAN and found failures. The chain
+      is cryptographically unattributable: a failure, never a warning.
+    * ``unverified_binding`` — the check did not run (older regista, or a
+      client that would not accept the kwarg). ``principal_binding_failures``
+      is then 0 because nothing looked, and publishing that zero as an
+      affirmative claim is precisely the defect WI-223 named. The honest
+      verdict is "not verified", which is not "verified".
     """
+    no_binding: dict[str, Any] = {
+        "principal_binding_verified": False,
+        "principal_binding_failures": None,
+    }
     if not hasattr(sub, "replay"):
-        return "unsupported", None
+        return "unsupported", None, no_binding
+    supported = _replay_accepts_binding_check(sub)
     try:
-        report = sub.replay()
+        report = sub.replay(verify_principal_binding=True) if supported else sub.replay()
+    except TypeError:
+        # The kwarg was rejected after all: fall back, but never claim the
+        # binding was verified.
+        try:
+            report = sub.replay()
+        except Exception:
+            return "error", None, no_binding
+        supported = False
     except Exception:
-        return "error", None
+        return "error", None, no_binding
+
+    failures = int(getattr(report, "principal_binding_failures", 0) or 0)
+    verified = supported and bool(getattr(report, "principal_binding_verified", False))
+    # Mirror ``ReplayReport.to_dict``: the failure count is only meaningful when
+    # the check ran, so it is omitted (None) rather than recorded as zero.
+    binding: dict[str, Any] = {
+        "principal_binding_verified": verified,
+        "principal_binding_failures": failures if (verified or failures) else None,
+    }
+
     if report.replayed_drift > 0 or report.halted > 0:
-        return "drift", False
-    return "verified", True
+        return "drift", False, binding
+    if failures > 0:
+        return "unattributable", False, binding
+    if not verified:
+        return "unverified_binding", None, binding
+    return "verified", True, binding
 
 
 @contextlib.contextmanager
@@ -152,37 +349,183 @@ def _open_regista(cfg: Any) -> Any:
             os.unlink(temp_key)
 
 
-def _check_regista(cfg: Any) -> tuple[dict[str, Any], Any]:
+#: Transition that carries a session's harness identity. Session-entity events
+#: also include ``user_message``/``assistant_message``/``transcript_attestation``
+#: /``subagent_start``/``subagent_stop``/``compaction``, but only the
+#: attestation names the harness, and every harness adapter emits it at
+#: SessionStart — so it is the one event that answers "did THIS harness attest".
+_SESSION_ATTESTATION_TRANSITION = "session_attestation"
+
+#: Harness names as recorded in a session attestation payload, per harness the
+#: doctor knows how to wire. The adapters default to these
+#: (``cairn._claude_hook`` → ``claude-code``, ``cairn._codex_hook`` → ``codex``,
+#: the OpenCode plugin → ``opencode``); ``CAIRN_HARNESS_NAME`` may override
+#: them, so the configured value is accepted as well.
+_HARNESS_ATTESTATION_NAMES: dict[str, frozenset[str]] = {
+    "claude": frozenset({"claude", "claude-code", "claudecode"}),
+    "opencode": frozenset({"opencode", "open-code"}),
+    "codex": frozenset({"codex"}),
+    "hermes": frozenset({"hermes"}),
+}
+
+
+@dataclass
+class _StoreProbe:
+    """What the bounded regista probe learned, for the freshness check.
+
+    ``session_scoped`` records whether the session-entity query actually ran.
+    A empty ``session_attested`` is only meaningful when it did — the same
+    reasoning as regista's ``principal_binding_verified`` (WI-223): an
+    unexamined zero must never be published as an affirmative claim.
+    """
+
+    newest_event_ts: Any = None
+    #: recorded harness name (lowercased) -> newest session attestation ts
+    session_attested: dict[str, Any] = field(default_factory=dict)
+    #: newest session attestation whose harness could not be read at all
+    unattributed_at: Any = None
+    session_scoped: bool = False
+
+
+def _attestation_window_hours() -> float:
+    raw_window = os.environ.get("CAIRN_MAX_ATTESTATION_AGE_HOURS", "24")
+    try:
+        return float(raw_window)
+    except ValueError:
+        return 24.0
+
+
+def _attested_harness_names(event: Any) -> list[str]:
+    """Harness names recorded in a session-attestation event's payload."""
+    payload = getattr(event, "payload", None)
+    if not isinstance(payload, dict):
+        return []
+    harnesses = payload.get("harnesses")
+    names: list[str] = []
+    if isinstance(harnesses, list):
+        for entry in harnesses:
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                names.append(entry["name"].strip().lower())
+            elif isinstance(entry, str):
+                names.append(entry.strip().lower())
+    return [n for n in names if n]
+
+
+def _probe_session_attestation(sub: Any, probe: _StoreProbe) -> None:
+    """Record which harnesses attested a SESSION inside the freshness window.
+
+    WI-034: the old freshness check asked whether ANY attestation landed. On
+    the real estate 400/400 recent events were ``entity_kind=work_item``
+    written in-process by agent-notes, which satisfied the check while ZERO
+    session events existed. Scoping the query to the session attestation the
+    HARNESS is supposed to produce is what makes "configured but silent"
+    detectable, which the docstring already claimed.
+    """
+    now = datetime.datetime.now(datetime.UTC)
+    start = now - datetime.timedelta(hours=max(_attestation_window_hours(), 0.0))
+    try:
+        events = sub.read_events(
+            transition=_SESSION_ATTESTATION_TRANSITION,
+            start=start,
+            end=now,
+            limit=200,
+        )
+    except Exception:
+        # Older regista, a store that rejects the filter, anything: we do not
+        # know, and "do not know" is not "nothing attested".
+        return
+    probe.session_scoped = True
+    for event in events or []:
+        if getattr(event, "entity_kind", "work_item") != "session":
+            continue
+        ts = getattr(event, "timestamp", None)
+        if ts is None:
+            continue
+        if getattr(ts, "tzinfo", None) is None:
+            ts = ts.replace(tzinfo=datetime.UTC)
+        names = _attested_harness_names(event)
+        if not names:
+            if probe.unattributed_at is None or ts > probe.unattributed_at:
+                probe.unattributed_at = ts
+            continue
+        for name in names:
+            current = probe.session_attested.get(name)
+            if current is None or ts > current:
+                probe.session_attested[name] = ts
+
+
+def _check_regista(cfg: Any) -> tuple[dict[str, Any], _StoreProbe]:
     """Probe the regista store for availability.
 
-    Returns ``(check, newest_event_ts)``. This is a bounded, read-only
-    reachability probe — it must complete within the suite umbrella's
-    per-probe timeout, so it never replays the chain (WI-030). The chain
-    verdict comes from the last recorded ``cairn integrity`` run instead
-    (see ``_check_chain_integrity``).
+    Returns ``(check, probe)``. This is a bounded, read-only reachability probe
+    — it must complete within the suite umbrella's per-probe timeout, so it
+    never replays the chain (WI-030). The chain verdict comes from the last
+    recorded ``cairn integrity`` run instead (see ``_check_chain_integrity``).
+    The session-attestation query rides along on the same connection: it is a
+    single indexed, time-bounded, limited read.
     """
     if not cfg.is_configured:
         return (
             {"name": "regista", "status": "skip", "detail": "not configured"},
-            None,
+            _StoreProbe(),
         )
     try:
         with _open_regista(cfg) as sub:
             events = sub.read_events(limit=1)
-            newest_ts = events[0].timestamp if events else None
+            probe = _StoreProbe(
+                newest_event_ts=events[0].timestamp if events else None
+            )
+            _probe_session_attestation(sub, probe)
             return (
                 {
                     "name": "regista",
                     "status": "ok",
                     "detail": f"reachable, {len(events)} event(s) in project '{cfg.project}'",
                 },
-                newest_ts,
+                probe,
             )
     except Exception as exc:
         return (
             {"name": "regista", "status": "fail", "detail": f"unreachable: {exc}"},
-            None,
+            _StoreProbe(),
         )
+
+
+def _entry_commands(entries: list[dict[str, Any]]) -> list[str]:
+    """The command strings inside cairn-owned hook *entries*."""
+    commands: list[str] = []
+    for entry in entries:
+        raw = entry.get("hooks", [])
+        if not isinstance(raw, list):
+            continue
+        for hook in raw:
+            if isinstance(hook, dict) and isinstance(hook.get("command"), str):
+                commands.append(hook["command"])
+    return commands
+
+
+def _verify_wired_commands(commands: list[str]) -> tuple[str, str]:
+    """Execute the hook commands found in a harness config.
+
+    WI-034: ``harness_wired`` verified that entries were PRESENT and that env
+    vars were SET; it never checked that the command was executable or that the
+    module it named was importable.  A hook failing on every invocation
+    therefore read ``ok``, and that is why a total loss of session attestation
+    went unnoticed.  This resolves each distinct command and runs its
+    side-effect-free ``--selftest`` under the interpreter that would actually
+    run it.
+    """
+    if not commands:
+        return HOOK_VERIFY_FAIL, "no hook command found to verify"
+    worst = HOOK_VERIFY_OK
+    detail = ""
+    for command in dict.fromkeys(commands):
+        outcome, command_detail = verify_hook_command(command)
+        if outcome == HOOK_VERIFY_FAIL:
+            return outcome, command_detail
+        if worst == HOOK_VERIFY_OK:
+            worst, detail = outcome, command_detail
+    return worst, detail or "hook command verified executable"
 
 
 def _check_harness_wired(cfg: Any, *, required: bool = True) -> dict[str, Any]:
@@ -203,18 +546,21 @@ def _check_harness_wired(cfg: Any, *, required: bool = True) -> dict[str, Any]:
         hooks = {}
     manifest = _load_manifest()
     missing_events: list[str] = []
+    found_commands: list[str] = []
     for event in HOOK_EVENTS:
         event_hooks = hooks.get(event, [])
         if not isinstance(event_hooks, list):
             event_hooks = []
-        if not any(
-            _is_cairn_hook_entry(
-                e, harness="claude", event=event, manifest=manifest
-            )
+        owned = [
+            e
             for e in event_hooks
             if isinstance(e, dict)
-        ):
+            and _is_cairn_hook_entry(e, harness="claude", event=event, manifest=manifest)
+        ]
+        if not owned:
             missing_events.append(event)
+            continue
+        found_commands.extend(_entry_commands(owned))
 
     env = data.get("env", {})
     if not isinstance(env, dict):
@@ -228,6 +574,18 @@ def _check_harness_wired(cfg: Any, *, required: bool = True) -> dict[str, Any]:
             "status": "fail",
             "detail": f"missing hooks: {', '.join(missing_events)}",
         }
+
+    runnable, run_detail = _verify_wired_commands(found_commands)
+    if runnable == HOOK_VERIFY_FAIL:
+        return {
+            "name": "harness_wired",
+            "status": "fail",
+            "detail": (
+                f"hooks are present in {path} but not runnable — {run_detail}. "
+                "Every invocation would fail and nothing would attest; "
+                "re-run `cairn install-harness claude`"
+            ),
+        }
     if not has_dsn or not has_project:
         missing = []
         if not has_dsn:
@@ -239,10 +597,16 @@ def _check_harness_wired(cfg: Any, *, required: bool = True) -> dict[str, Any]:
             "status": "warn",
             "detail": f"hooks present but env missing: {', '.join(missing)}",
         }
+    if runnable == HOOK_VERIFY_OFF_PATH:
+        return {
+            "name": "harness_wired",
+            "status": "warn",
+            "detail": f"hooks + env configured in {path}, but {run_detail}",
+        }
     return {
         "name": "harness_wired",
         "status": "ok",
-        "detail": f"hooks + env configured in {path}",
+        "detail": f"hooks + env configured in {path}; {run_detail}",
     }
 
 
@@ -399,22 +763,39 @@ def _check_codex_harness_wired(cfg: Any) -> dict[str, Any]:
         if not isinstance(hooks, dict):
             hooks = {}
         manifest = _load_manifest()
+        direct_commands: list[str] = []
         for event in CODEX_HOOK_EVENTS:
             entries = hooks.get(event, [])
-            found = isinstance(entries, list) and any(
-                _is_cairn_hook_entry(
-                    entry,
-                    harness="codex",
-                    event=event,
-                    manifest=manifest,
-                )
-                for entry in entries
-                if isinstance(entry, dict)
+            owned = (
+                [
+                    entry
+                    for entry in entries
+                    if isinstance(entry, dict)
+                    and _is_cairn_hook_entry(
+                        entry, harness="codex", event=event, manifest=manifest
+                    )
+                ]
+                if isinstance(entries, list)
+                else []
             )
-            direct_cairn_present = direct_cairn_present or found
-            if not found:
+            direct_cairn_present = direct_cairn_present or bool(owned)
+            direct_commands.extend(_entry_commands(owned))
+            if not owned:
                 missing_events.append(event)
         direct_ok = direct_cairn_present and not missing_events
+        if direct_ok:
+            # Same lesson as harness_wired (WI-034): present is not runnable.
+            outcome, run_detail = _verify_wired_commands(direct_commands)
+            if outcome == HOOK_VERIFY_FAIL:
+                return {
+                    "name": "codex_harness_wired",
+                    "status": "fail",
+                    "detail": (
+                        f"direct Codex hooks are present in {path} but not "
+                        f"runnable — {run_detail}; re-run "
+                        "`cairn install-harness codex`"
+                    ),
+                }
 
     plugin_state, plugin_version = _codex_plugin_state()
     plugin_enabled = plugin_state == "enabled"
@@ -626,6 +1007,40 @@ def _check_codex_activity(*, wired: bool) -> dict[str, Any]:
 
 _INTEGRITY_VERDICT_FILENAME = "integrity-verdict.json"
 
+#: Chain states that are real verdicts and therefore recorded for doctor.
+#: ``verified``/``drift``/``unattributable`` are findings about the chain,
+#: ``unverified_binding`` is a finding about what was NOT established, and
+#: ``unsupported`` is a durable capability fact.  A replay *exception* is the
+#: absence of a verdict and is never recorded (WI-030 review m4).
+_RECORDED_CHAIN_STATES = (
+    "verified",
+    "drift",
+    "unattributable",
+    "unverified_binding",
+    "unsupported",
+)
+
+#: One-line operator-facing meaning per chain state. Also used as the ``detail``
+#: on ``cairn integrity``'s JSON body so an ``ok: false`` result always names
+#: its reason.
+_CHAIN_STATE_DETAIL = {
+    "verified": (
+        "canonical replay verified no drift or halted events, and every event's "
+        "signature binds to a key this project registered"
+    ),
+    "drift": "canonical replay detected chain drift or halted events",
+    "unattributable": (
+        "canonical replay found event(s) whose signature does not bind to a key "
+        "this project registered — the chain is cryptographically unattributable"
+    ),
+    "unverified_binding": (
+        "canonical replay found no drift, but principal binding was NOT "
+        "verified — nothing here claims the chain is attributable"
+    ),
+    "error": "chain replay failed; integrity verdict is unknown",
+    "unsupported": "regista version does not expose the canonical replay API",
+}
+
 
 def _record_failed_attempt(cfg: Any, state: str) -> None:
     """Note a failed replay attempt on the existing verdict without touching it.
@@ -763,7 +1178,7 @@ def _check_chain_integrity(cfg: Any) -> tuple[dict[str, Any], str | None, bool |
     # another (WI-030 review M1) — including "unsupported", which is a claim
     # about a specific store's regista. Markers predating the binding field
     # are treated as unbound and must be re-recorded.
-    if chain_state in ("verified", "drift", "error", "unsupported") and verdict.get(
+    if chain_state in _RECORDED_CHAIN_STATES and verdict.get(
         "store_binding"
     ) != _store_binding(cfg):
         return (
@@ -777,6 +1192,60 @@ def _check_chain_integrity(cfg: Any) -> tuple[dict[str, Any], str | None, bool |
                 ),
             },
             "unbound",
+            None,
+        )
+
+    # Forward/backward compatibility, same reasoning as the store_binding guard
+    # above: a "verified" marker written before cairn consumed regista's binding
+    # fields carries no evidence that the chain is attributable, so it must not
+    # be replayed as a pass (WI-036). Absence of the field is not a zero.
+    if chain_state == "verified" and verdict.get("principal_binding_verified") is not True:
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "warn",
+                "detail": (
+                    f"recorded verdict from {checked_at or 'unknown time'} predates "
+                    "principal-binding verification, so the chain's "
+                    "attributability was never checked; re-run `cairn integrity`"
+                ),
+            },
+            "unverified_binding",
+            None,
+        )
+
+    if chain_state == "unattributable":
+        failures = verdict.get("principal_binding_failures")
+        count = f"{failures} " if isinstance(failures, int) else ""
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "fail",
+                "detail": (
+                    f"canonical replay found {count}event(s) whose signature does "
+                    f"not bind to a key this project registered, at "
+                    f"{checked_at or 'unknown time'} — the chain is "
+                    "cryptographically unattributable and the offline verifier "
+                    "rejects it (cairn integrity)"
+                ),
+            },
+            "unattributable",
+            False,
+        )
+
+    if chain_state == "unverified_binding":
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "warn",
+                "detail": (
+                    f"canonical replay at {checked_at or 'unknown time'} found no "
+                    "drift, but principal binding was NOT verified — this regista "
+                    "did not run the check, so nothing here claims the chain is "
+                    "attributable"
+                ),
+            },
+            "unverified_binding",
             None,
         )
 
@@ -957,8 +1426,9 @@ def _check_content_encryption(cfg: Any) -> dict[str, Any]:
             "status": "ok",
             "detail": "Content encryption delegated to lower layer (external)",
         }
-    key_ref = getattr(cfg, "content_key_ref", None) or getattr(cfg, "content_key_path", None)
-    if not key_ref:
+    configured_ref = getattr(cfg, "content_key_ref", None)
+    configured_path = getattr(cfg, "content_key_path", None)
+    if not configured_ref and not configured_path:
         return {
             "name": "content_encryption",
             "status": "warn",
@@ -968,10 +1438,29 @@ def _check_content_encryption(cfg: Any) -> dict[str, Any]:
                 "Content capture will store plaintext until a key is set."
             ),
         }
+    # Resolve the ref, do not merely note that it is set. A configured but
+    # unresolvable key means content encryption is reported ON while the key it
+    # names cannot be fetched — plaintext capture with a green check over it
+    # (agent-suite WI-041; cairn WI-034). ``resolve_content_key_ref`` builds the
+    # same ``file:`` form the runtime uses, so this probes the real ref.
+    key_ref = configured_ref or f"file:{configured_path}"
+    ok, detail = _verify_secret_ref(key_ref)
+    if not ok:
+        # ``detail`` already names the ref when the problem is its shape; only
+        # add the ref when the resolver's reason does not carry it.
+        subject = "its key" if key_ref in detail else f"its key {key_ref!r}"
+        return {
+            "name": "content_encryption",
+            "status": "fail",
+            "detail": (
+                f"Content encryption is ON but {subject} {detail} — content "
+                "would be captured in plaintext, or capture would fail"
+            ),
+        }
     return {
         "name": "content_encryption",
         "status": "ok",
-        "detail": f"Content encryption ON (key: {key_ref[:40]}...)",
+        "detail": f"Content encryption ON (key {key_ref} resolves)",
     }
 
 
@@ -1008,16 +1497,56 @@ def _newest_local_session_activity() -> float | None:
     return newest
 
 
-def _check_attestation_freshness(
-    cfg: Any, newest_event_ts: Any, *, regista_ok: bool
-) -> dict[str, Any]:
-    """WI-4.1 — silence is a finding.
+def _harness_sessions_ran_locally(harness: str, window_secs: float) -> bool | None:
+    """Whether *harness* provably ran a session inside the window, locally.
 
-    "Wired but not attesting" must be detectable by doctor, not discovered
-    by querying the store by hand a week later.  Sessions ran locally
-    within the window (transcript mtimes) but no attestation landed in the
-    store within the window → fail.  The umbrella already reds out on
-    unconfigured cairn; this makes "configured but silent" equally loud.
+    ``True``/``False`` when there is local evidence either way, ``None`` when
+    cairn has no local signal for that harness at all — in which case silence
+    cannot be distinguished from disuse, and the honest verdict is a warning
+    rather than ok.
+
+    Only Claude Code leaves a signal cairn can read (one transcript per session
+    under ``~/.claude/projects``).  No transcripts at all is read as "no
+    session ran": that is what an unused harness looks like, and it is the
+    pre-existing behaviour.  It does mean a *relocated* transcript directory
+    would read as disuse — the executability check on ``harness_wired`` is what
+    covers the broken-hook case that motivated WI-034, not this correlation.
+    """
+    if harness != "claude":
+        return None
+    newest_local = _newest_local_session_activity()
+    if newest_local is None:
+        return False
+    now = datetime.datetime.now(datetime.UTC).timestamp()
+    return newest_local >= now - window_secs
+
+
+def _check_attestation_freshness(
+    cfg: Any,
+    probe: _StoreProbe,
+    *,
+    regista_ok: bool,
+    harnesses: list[str],
+) -> dict[str, Any]:
+    """WI-4.1 — silence is a finding. WI-034 — per harness, and session-scoped.
+
+    "Wired but not attesting" must be detectable by doctor, not discovered by
+    querying the store by hand a week later.  Two blind spots made this check
+    fail open, both in the same direction:
+
+    * It asked whether ANY attestation landed in the window.  On the real
+      estate 400/400 recent events were ``entity_kind=work_item`` written
+      in-process by agent-notes; that satisfied the check while ZERO session
+      events existed and every Claude Code session went unattested.
+    * It aggregated across harnesses, so an unhooked Claude read green behind a
+      working OpenCode.
+
+    So the question is now asked once per *configured* harness, against session
+    attestation attributed to that harness.  A harness whose sessions provably
+    ran locally but did not attest fails; one with no local signal warns
+    (silence and disuse are indistinguishable, and claiming ok would be the
+    same fail-open move); and a store we could not scope the query against is
+    an honest skip, never a pass.
     """
     name = "attestation_freshness"
     if not cfg.is_configured:
@@ -1028,75 +1557,114 @@ def _check_attestation_freshness(
             "status": "skip",
             "detail": "regista unreachable — cannot read last attestation",
         }
-
-    raw_window = os.environ.get("CAIRN_MAX_ATTESTATION_AGE_HOURS", "24")
-    try:
-        window_hours = float(raw_window)
-    except ValueError:
-        window_hours = 24.0
-    window_secs = window_hours * 3600
-
-    newest_local = _newest_local_session_activity()
-    if newest_local is None:
+    if not harnesses:
         return {
             "name": name,
             "status": "skip",
-            "detail": "no local session transcripts found — nothing to correlate",
+            "detail": "no harness is wired — nothing is expected to attest",
         }
-
-    now = datetime.datetime.now(datetime.UTC).timestamp()
-    if newest_local < now - window_secs:
+    if not probe.session_scoped:
         return {
             "name": name,
-            "status": "ok",
-            "detail": f"no sessions ran within the last {window_hours:g}h",
+            "status": "skip",
+            "detail": (
+                "could not query session-entity attestation in this store, so "
+                "freshness is unknown — an unexamined store is not a fresh one"
+            ),
         }
 
-    event_epoch: float | None = None
-    if newest_event_ts is not None:
-        ts = newest_event_ts
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=datetime.UTC)
-        event_epoch = ts.timestamp()
+    window_hours = _attestation_window_hours()
+    window_secs = window_hours * 3600
+    configured_name = str(getattr(cfg, "harness_name", "") or "").strip().lower()
 
-    if event_epoch is not None and event_epoch >= now - window_secs:
+    fails: list[str] = []
+    warns: list[str] = []
+    oks: list[str] = []
+    for harness in harnesses:
+        accepted = set(_HARNESS_ATTESTATION_NAMES.get(harness, frozenset({harness})))
+        if configured_name and harness in configured_name:
+            accepted.add(configured_name)
+        newest = None
+        for recorded, ts in probe.session_attested.items():
+            if recorded in accepted and (newest is None or ts > newest):
+                newest = ts
+        if newest is not None:
+            oks.append(f"{harness} attested a session at {newest.isoformat()}")
+            continue
+        ran = _harness_sessions_ran_locally(harness, window_secs)
+        if ran is False:
+            oks.append(
+                f"{harness}: no sessions ran within the last {window_hours:g}h"
+            )
+        elif ran is True:
+            fails.append(
+                f"{harness} ran a session within the last {window_hours:g}h but "
+                "attested none — the harness is configured and silent"
+            )
+        else:
+            warns.append(
+                f"{harness} is wired but attested no session in the last "
+                f"{window_hours:g}h, and cairn has no local signal for whether "
+                "one ran"
+            )
+
+    unattributed = ""
+    if probe.unattributed_at is not None and (fails or warns):
+        unattributed = (
+            f"; a session was attested at {probe.unattributed_at.isoformat()} "
+            "but names no harness, so it cannot cover for any of them"
+        )
+
+    if fails:
         return {
             "name": name,
-            "status": "ok",
-            "detail": f"attestation within the last {window_hours:g}h",
+            "status": "fail",
+            "detail": "configured but silent: " + "; ".join(fails + warns) + unattributed,
         }
-
-    local_iso = datetime.datetime.fromtimestamp(newest_local, tz=datetime.UTC).isoformat()
-    last_att = (
-        datetime.datetime.fromtimestamp(event_epoch, tz=datetime.UTC).isoformat()
-        if event_epoch is not None
-        else "never"
-    )
+    if warns:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": "; ".join(warns + oks) + unattributed,
+        }
     return {
         "name": name,
-        "status": "fail",
-        "detail": (
-            f"configured but silent: local session activity at {local_iso} "
-            f"but last attestation {last_att} (window {window_hours:g}h) — "
-            "the harness may be unhooked while config is in place"
-        ),
+        "status": "ok",
+        "detail": "; ".join(oks),
     }
 
 
 def run_doctor(*, json_output: bool = False) -> int:
     cfg = resolve_config()
 
-    regista_check, newest_event_ts = _check_regista(cfg)
+    regista_check, store_probe = _check_regista(cfg)
     chain_check, chain_state, chain_ok = _check_chain_integrity(cfg)
     codex_wired = _check_codex_harness_wired(cfg)
     codex_active = codex_wired["status"] in {"ok", "warn"}
+    claude_wired = _check_harness_wired(cfg, required=not codex_active)
+    opencode_wired = _check_opencode_harness_wired(cfg)
+
+    # A harness counts as *configured* for freshness purposes whenever its
+    # wiring check is anything but "skip" — including "fail". A harness whose
+    # hooks are broken is exactly the one whose silence must be reported, so
+    # excluding it here would restore the fail-open path WI-034 closed.
+    configured_harnesses = [
+        harness
+        for harness, check in (
+            ("claude", claude_wired),
+            ("opencode", opencode_wired),
+            ("codex", codex_wired),
+        )
+        if check["status"] != "skip"
+    ]
+
     checks = [
         _check_config(cfg),
         _check_key_file(cfg),
         regista_check,
         chain_check,
-        _check_harness_wired(cfg, required=not codex_active),
-        _check_opencode_harness_wired(cfg),
+        claude_wired,
+        opencode_wired,
         codex_wired,
         _check_codex_hook_policy(wired=codex_active),
         _check_codex_hook_trust(wired=codex_active),
@@ -1104,7 +1672,10 @@ def run_doctor(*, json_output: bool = False) -> int:
         _check_bridge(),
         _check_content_encryption(cfg),
         _check_attestation_freshness(
-            cfg, newest_event_ts, regista_ok=regista_check["status"] == "ok"
+            cfg,
+            store_probe,
+            regista_ok=regista_check["status"] == "ok",
+            harnesses=configured_harnesses,
         ),
     ]
 
@@ -1161,10 +1732,16 @@ def run_integrity(*, json_output: bool = False) -> int:
     sit on the routine health path.
 
     Exit codes: 0 verified, 1 otherwise (drift, replay error, unsupported
-    replay API, store unreachable, not configured). Only verified/drift/
-    unsupported are recorded; a replay exception or unreachable store exits
-    nonzero without overwriting the last real verdict, so schedulers must
+    replay API, store unreachable, not configured, principal binding failed or
+    unverified). Only real verdicts are recorded (see
+    :data:`_RECORDED_CHAIN_STATES`); a replay exception or unreachable store
+    exits nonzero without overwriting the last real verdict, so schedulers must
     alert on this command's exit code rather than relying on doctor alone.
+
+    Every nonzero exit carries a ``detail`` string alongside ``ok: false``, so
+    the suite umbrella's envelope reader (which treats ``ok: false`` as failure
+    regardless of exit code) always has a reason to report and never has to
+    read fields off a failed result.
     """
     cfg = resolve_config()
 
@@ -1187,7 +1764,7 @@ def run_integrity(*, json_output: bool = False) -> int:
     started = time.monotonic()
     try:
         with _open_regista(cfg) as sub:
-            chain_state, chain_ok = _verify_chain(sub)
+            chain_state, chain_ok, binding = _verify_chain(sub)
     except Exception as exc:
         _record_failed_attempt(cfg, "unreachable")
         report = {
@@ -1207,7 +1784,7 @@ def run_integrity(*, json_output: bool = False) -> int:
     duration = time.monotonic() - started
 
     checked_at = datetime.datetime.now(datetime.UTC).isoformat()
-    verdict = {
+    verdict: dict[str, Any] = {
         "checked_at": checked_at,
         "chain_state": chain_state,
         "chain_ok": chain_ok,
@@ -1215,7 +1792,14 @@ def run_integrity(*, json_output: bool = False) -> int:
         "cairn_version": _cairn_version,
         "project": cfg.project,
         "store_binding": _store_binding(cfg),
+        # Recorded so doctor can tell "checked and clean" from "never checked".
+        # Mirrors ``ReplayReport.to_dict``: the failure count is omitted when
+        # the check did not run, so a reader cannot mistake an unexamined chain
+        # for a clean one (WI-223/WI-036).
+        "principal_binding_verified": binding["principal_binding_verified"],
     }
+    if binding["principal_binding_failures"] is not None:
+        verdict["principal_binding_failures"] = binding["principal_binding_failures"]
 
     # Record the verdict for doctor — atomically (and fsynced, so a crash
     # cannot leave an empty marker), so a concurrent doctor never reads a
@@ -1225,7 +1809,7 @@ def run_integrity(*, json_output: bool = False) -> int:
     # unreachable store, it exits nonzero without clobbering the last real
     # verdict (WI-030 review m4). The marker is not secret; leave it
     # world-readable so a doctor running as a different user can report it.
-    if chain_state in ("verified", "drift", "unsupported"):
+    if chain_state in _RECORDED_CHAIN_STATES:
         path = _integrity_verdict_path(cfg)
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".integrity-")
@@ -1250,6 +1834,7 @@ def run_integrity(*, json_output: bool = False) -> int:
         "component": "cairn",
         "version": _cairn_version,
         "ok": ok,
+        "detail": _CHAIN_STATE_DETAIL.get(chain_state, chain_state),
         **verdict,
     }
 
@@ -1257,15 +1842,10 @@ def run_integrity(*, json_output: bool = False) -> int:
         print(json.dumps(report, indent=2))
     else:
         print(f"cairn integrity — v{_cairn_version}")
-        detail = {
-            "verified": "canonical replay verified no drift or halted events",
-            "drift": "canonical replay detected chain drift or halted events",
-            "error": "chain replay failed; integrity verdict is unknown",
-            "unsupported": "regista version does not expose the canonical replay API",
-        }.get(chain_state, chain_state)
+        detail = _CHAIN_STATE_DETAIL.get(chain_state, chain_state)
         status = "OK" if ok else "FAIL"
         print(f"  [{status:4s}] chain_integrity   {detail}")
-        if chain_state in ("verified", "drift", "unsupported"):
+        if chain_state in _RECORDED_CHAIN_STATES:
             print(f"  replayed in {duration:.1f}s; verdict recorded for doctor")
         else:
             print(

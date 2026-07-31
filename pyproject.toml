@@ -34,6 +34,15 @@ dependencies = [
 regista-hraedon = { path = "../regista", editable = true }
 
 [project.optional-dependencies]
+# A ``vault:`` secret ref resolves only where ``hvac`` is importable in the
+# resolving component's OWN environment — each suite CLI is its own uv tool
+# venv, so hvac in regista's does nothing for cairn's. Without this, a host
+# whose DSN or content key is a vault ref fails with "Unknown secret provider"
+# (observed on the qualification host for both). ``cairn doctor`` names this
+# extra as the remedy, so it has to exist.
+vault = [
+    "regista-hraedon[vault]",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
@@ -55,6 +64,14 @@ dev = [
 [project.scripts]
 cairn = "cairn._cli:cli_entry"
 cairn-bridge = "cairn._bridge:main"
+# Harness hook entry points (WI-033). Generated hook config and the shipped
+# Codex plugin both invoke these names rather than ``python3 -m cairn._*_hook``:
+# a console script's shebang pins cairn's own interpreter, so hook execution can
+# never resolve to a foreign python that cannot import cairn (which silently
+# disabled every hook on a real deployment), and the string is stable at
+# packaging time, so the shipped plugin and the generated entries are identical.
+cairn-claude-hook = "cairn._claude_hook:main"
+cairn-codex-hook = "cairn._codex_hook:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cairn"]

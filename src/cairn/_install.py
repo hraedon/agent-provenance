@@ -15,6 +15,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -23,21 +25,42 @@ from pathlib import Path
 from typing import Any
 
 from ._config import resolve_config
+from ._hook_selftest import HOOK_SELFTEST_ARG, HOOK_SELFTEST_MARKER
 
+# Hook commands are console scripts declared in ``[project.scripts]`` (WI-033).
+#
+# The previous form, ``python3 -m cairn._claude_hook``, assumed cairn was
+# importable by whatever ``python3`` the *harness's* PATH resolved to.  That is
+# false for every isolated install — uv tool, pipx, venv — i.e. every method the
+# install guides prescribe.  On a real deployment all ten generated hooks failed
+# on every invocation, session attestation was absent indefinitely, and doctor
+# stayed green because it only checked the entries were present.
+#
+# A console script fixes both halves of the problem at once: its shebang pins
+# cairn's own interpreter, so module resolution can never land on a foreign
+# python, and the string is stable at packaging time — which ``sys.executable``
+# can never be — so the shipped Codex plugin
+# (``plugins/cairn/hooks/hooks.json``) and the entries generated here are
+# genuinely identical.  Windows needs no separate form: the installer writes
+# ``cairn-codex-hook.exe`` onto the same PATH.
+#
+# Residual failure mode, deliberately preferred: if the script is not on the
+# harness's PATH the hook fails loudly at invocation instead of silently
+# resolving to an interpreter that cannot import cairn.  ``install-harness``
+# and ``doctor`` both execute the command (see :func:`verify_hook_command`)
+# rather than merely recording that it was written.
+CAIRN_HOOK_COMMAND = "cairn-claude-hook"
+CAIRN_CODEX_HOOK_COMMAND = "cairn-codex-hook"
+CAIRN_CODEX_HOOK_COMMAND_WINDOWS = "cairn-codex-hook"
 
-def _python_command() -> str:
-    """Return the python command for the hook entry.
-
-    Uses ``python3`` on Unix (where ``python`` may be Python 2) and
-    ``python`` on Windows (where ``python3`` is often not on PATH).
-    """
-    if sys.platform == "win32":
-        return "python"
-    return "python3"
-
-CAIRN_HOOK_COMMAND = f"{_python_command()} -m cairn._claude_hook"
-CAIRN_CODEX_HOOK_COMMAND = f"{_python_command()} -m cairn._codex_hook"
-CAIRN_CODEX_HOOK_COMMAND_WINDOWS = "python -m cairn._codex_hook"
+# Ownership detection must keep recognising hooks written by earlier versions,
+# which named a bare interpreter.  Without this, an upgrade on a host with no
+# manifest fails to recognise cairn's own hooks: uninstall leaves them behind
+# and install appends the new form *alongside* the broken old one.
+_LEGACY_HOOK_MODULES: dict[str, str] = {
+    "claude": "cairn._claude_hook",
+    "codex": "cairn._codex_hook",
+}
 
 # Codex hook events Cairn handles (Plan 011). SessionStart and tool events
 # attest; Stop performs state cleanup and emits Codex's required JSON response.
@@ -49,11 +72,6 @@ CODEX_HOOK_EVENTS: dict[str, str] = {
     "Stop": "stop",
 }
 _CODEX_TOOL_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
-
-# Note: CAIRN_HOOK_COMMAND is evaluated at import time on the machine
-# running install-harness. If settings.json is synced across platforms,
-# the user should manually adjust the command or use the cairn-hook
-# entry point (planned for a future release).
 
 HOOK_EVENTS: dict[str, str] = {
     "PreToolUse": "pre",
@@ -84,6 +102,162 @@ _ENV_VARS = [
 ]
 
 CAIRN_SENTINEL = "// cairn-managed"
+
+#: Escape hatch for the install-time hook verification below.  Set it only
+#: when the harness's PATH genuinely differs from the installer's and you have
+#: confirmed the hook by hand — the point of the check is that a hook nobody
+#: executed is not a hook anybody can trust.
+SKIP_HOOK_VERIFICATION_ENV = "CAIRN_SKIP_HOOK_VERIFICATION"
+
+
+#: Outcome vocabulary for :func:`verify_hook_command`.
+#:
+#: ``ok``        the command resolved on PATH, ran, and identified as a cairn hook
+#: ``off_path``  it is provably a working cairn hook, but only found in cairn's
+#:               own entry-point directory — runnable, yet the harness's PATH
+#:               may not include that directory
+#: ``fail``      it does not resolve anywhere, will not execute, or executes
+#:               without being a cairn hook (e.g. a python that cannot import it)
+HOOK_VERIFY_OK = "ok"
+HOOK_VERIFY_OFF_PATH = "off_path"
+HOOK_VERIFY_FAIL = "fail"
+
+#: Memoised probe outcomes, keyed by the exact argv executed. Bounded by the
+#: number of distinct hook commands a process sees (at most a handful).
+_HOOK_VERIFY_CACHE: dict[tuple[tuple[str, ...], bool], tuple[str, str]] = {}
+
+
+def _entry_point_dirs() -> list[str]:
+    """Directories where this cairn install's console scripts live."""
+    import sysconfig
+
+    dirs: list[str] = []
+    for candidate in (sysconfig.get_path("scripts"), str(Path(sys.executable).parent)):
+        if candidate and candidate not in dirs and os.path.isdir(candidate):
+            dirs.append(candidate)
+    return dirs
+
+
+def resolve_hook_command(command: str) -> tuple[str | None, list[str], bool]:
+    """Split *command* into ``(resolved argv[0], remaining argv, on_path)``.
+
+    ``argv[0]`` is resolved the way a shell would: bare names via ``PATH``,
+    anything containing a separator as a literal path.  When a bare name is not
+    on ``PATH`` this falls back to cairn's own entry-point directories and
+    reports ``on_path=False`` — the installer's ``PATH`` is only an
+    approximation of the harness's, so "not on my PATH" is a caveat to report,
+    not proof the hook cannot run.  ``None`` means it resolves nowhere.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None, [], False
+    if not argv:
+        return None, [], False
+    exe, rest = argv[0], argv[1:]
+    separators = [os.sep] + ([os.altsep] if os.altsep else [])
+    if any(sep in exe for sep in separators):
+        runnable = os.path.isfile(exe) and os.access(exe, os.X_OK)
+        return (exe if runnable else None), rest, True
+    on_path = shutil.which(exe)
+    if on_path:
+        return on_path, rest, True
+    for directory in _entry_point_dirs():
+        found = shutil.which(exe, path=directory)
+        if found:
+            return found, rest, False
+    return None, rest, False
+
+
+def verify_hook_command(command: str, *, timeout: float = 20.0) -> tuple[str, str]:
+    """Execute *command*'s liveness probe. Returns ``(outcome, detail)``.
+
+    Presence of a hook entry is not evidence that the hook runs.  This resolves
+    ``argv[0]`` and runs the command with its action replaced by
+    ``--selftest``, which every cairn hook answers before touching stdin, state
+    or the store.  A pass therefore means: the command resolves, its
+    interpreter starts, and cairn imports under it — the three things that were
+    all false for the ten deployed hooks of WI-033 while ``harness_wired``
+    reported ``ok`` (WI-034).
+    """
+    resolved, rest, on_path = resolve_hook_command(command)
+    if resolved is None:
+        name = (shlex.split(command) or [command])[0] if command.strip() else command
+        return HOOK_VERIFY_FAIL, (
+            f"{name!r} does not resolve to an executable — "
+            "the hook would fail on every invocation"
+        )
+    # Drop the trailing action token so the probe cannot attest anything.
+    probe = [resolved, *rest[:-1], HOOK_SELFTEST_ARG]
+    # One probe per distinct command per process: the answer cannot change
+    # while we run, and install-harness wires up to ten events onto the same
+    # executable.
+    cache_key = (tuple(probe), on_path)
+    cached = _HOOK_VERIFY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        proc = subprocess.run(probe, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return HOOK_VERIFY_FAIL, f"{resolved} could not be executed: {exc}"
+    result = _classify_selftest(proc, resolved, on_path)
+    _HOOK_VERIFY_CACHE[cache_key] = result
+    return result
+
+
+def _classify_selftest(
+    proc: subprocess.CompletedProcess[str], resolved: str, on_path: bool
+) -> tuple[str, str]:
+    if proc.returncode != 0:
+        lines = [
+            ln for ln in (proc.stderr or proc.stdout or "").splitlines() if ln.strip()
+        ]
+        tail = lines[-1].strip() if lines else f"exit status {proc.returncode}"
+        return HOOK_VERIFY_FAIL, (
+            f"{resolved} failed the hook selftest (exit {proc.returncode}): {tail}"
+        )
+    if HOOK_SELFTEST_MARKER not in (proc.stdout or ""):
+        return HOOK_VERIFY_FAIL, (
+            f"{resolved} ran but is not a cairn hook (no selftest marker) — "
+            "the name resolves to some other program"
+        )
+    if not on_path:
+        return HOOK_VERIFY_OFF_PATH, (
+            f"{resolved} runs and imports cairn, but the name is not on this "
+            "PATH — confirm the harness session can find it"
+        )
+    return HOOK_VERIFY_OK, f"verified executable: {resolved}"
+
+
+def verify_generated_hooks(harness: str, commands: list[str]) -> tuple[str, str]:
+    """Verify every distinct command written for *harness*.
+
+    All events for a harness share one executable, so this probes the unique
+    commands only — one subprocess per harness in practice.  The worst outcome
+    across commands wins.
+    """
+    if os.environ.get(SKIP_HOOK_VERIFICATION_ENV):
+        return HOOK_VERIFY_OK, (
+            f"hook verification skipped ({SKIP_HOOK_VERIFICATION_ENV} set)"
+        )
+    worst = HOOK_VERIFY_OK
+    detail = "no hook commands to verify"
+    for command in dict.fromkeys(commands):
+        outcome, command_detail = verify_hook_command(command)
+        if outcome == HOOK_VERIFY_FAIL:
+            return outcome, command_detail
+        if worst == HOOK_VERIFY_OK:
+            worst, detail = outcome, command_detail
+    return worst, detail
+
+
+def _hook_commands_for(harness: str) -> list[str]:
+    """The distinct command strings this install writes for *harness*."""
+    if harness == "claude":
+        return [f"{CAIRN_HOOK_COMMAND} {a}" for a in HOOK_EVENTS.values()]
+    if harness == "codex":
+        return [f"{CAIRN_CODEX_HOOK_COMMAND} {a}" for a in CODEX_HOOK_EVENTS.values()]
+    return []
 
 
 class ConfigLoadError(Exception):
@@ -180,6 +354,87 @@ class InstallResult:
             "no_op": self.no_op,
             "status": self.status.value,
         }
+
+
+def _reconcile_event_hooks(
+    event_hooks: list[Any],
+    *,
+    harness: str,
+    event: str,
+    manifest: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    """Bring *event_hooks* to exactly one canonical cairn entry, in place.
+
+    Returns ``(outcome, entry)`` where outcome is ``"noop"``, ``"added"`` or
+    ``"updated"``.
+
+    WI-033: recognising a legacy hook as cairn-owned is not enough — an upgrade
+    has to REWRITE it. Reported live on a uv-tool host whose ten hooks all named
+    a bare ``python3`` that could not import cairn: install-harness recognised
+    them, said "already wired (no-op)", and left every one of them broken. So an
+    owned entry that is not byte-identical to the current canonical entry is
+    replaced in place (keeping its position among the user's other hooks), and
+    any further cairn-owned duplicates for the same event are removed.
+    """
+    expected = _expected_hook_entry(harness, event)
+    if expected is None:
+        return "noop", None
+    owned = [
+        i
+        for i, entry in enumerate(event_hooks)
+        if isinstance(entry, dict)
+        and _is_cairn_hook_entry(entry, harness=harness, event=event, manifest=manifest)
+    ]
+    if not owned:
+        event_hooks.append(expected)
+        return "added", expected
+    changed = False
+    first = owned[0]
+    if event_hooks[first] != expected:
+        event_hooks[first] = expected
+        changed = True
+    for index in reversed(owned[1:]):
+        del event_hooks[index]
+        changed = True
+    return ("updated" if changed else "noop"), expected
+
+
+def _annotate_hook_verification(
+    result: InstallResult, harness: str, path: Path
+) -> None:
+    """Execute the hooks this install writes and record the outcome.
+
+    WI-033/WI-034: writing a hook entry is not the same as installing a
+    working hook, and an installer that reports success on a hook it never ran
+    is the same fail-open pattern as a doctor check that observes presence.  A
+    command that cannot run downgrades the result to ``degraded``, which
+    ``results_succeeded`` treats as failure, so the exit code is nonzero and
+    the operator is told before the first unattested session — not a week
+    later by querying the store.
+    """
+    commands = _hook_commands_for(harness)
+    if not commands:
+        return
+    outcome, detail = verify_generated_hooks(harness, commands)
+    if outcome == HOOK_VERIFY_FAIL:
+        result.status = InstallStatus.DEGRADED
+        result.actions.append(
+            InstallAction(
+                "error",
+                str(path),
+                f"hook command is not runnable — {detail}. "
+                f"Hooks are wired but would fail on every invocation; ensure "
+                f"cairn's entry-point directory is on the harness's PATH "
+                f"(or set {SKIP_HOOK_VERIFICATION_ENV}=1 to bypass this check)",
+            )
+        )
+        return
+    # A clean re-run stays a true no-op (nothing was written, nothing to say);
+    # only a *failed* verification is loud enough to break that silence.
+    if result.no_op:
+        return
+    kind = "warn" if outcome == HOOK_VERIFY_OFF_PATH else "verify"
+    result.actions.append(InstallAction(kind, str(path), detail))
 
 
 def _claude_settings_path() -> Path:
@@ -709,14 +964,28 @@ def _cairn_hook_commands(harness: str) -> frozenset[str]:
     Used as a fallback for ownership detection when the manifest is
     unavailable (pre-manifest installs).  This is **exact** match, NOT
     substring — a user hook that merely references cairn will not match.
+
+    Includes the legacy bare-interpreter forms cairn used before WI-033.  An
+    upgrade must still recognise them, or uninstall leaves the old (broken)
+    hooks behind and install appends the console-script form alongside them.
     """
     cmds: set[str] = set()
+    module = _LEGACY_HOOK_MODULES.get(harness)
+    legacy_prefixes = (
+        [f"python3 -m {module}", f"python -m {module}"] if module else []
+    )
     if harness == "claude":
-        for action in HOOK_EVENTS.values():
-            cmds.add(f"{CAIRN_HOOK_COMMAND} {action}")
+        actions = list(HOOK_EVENTS.values())
+        current = CAIRN_HOOK_COMMAND
     elif harness == "codex":
-        for action in CODEX_HOOK_EVENTS.values():
-            cmds.add(f"{CAIRN_CODEX_HOOK_COMMAND} {action}")
+        actions = list(CODEX_HOOK_EVENTS.values())
+        current = CAIRN_CODEX_HOOK_COMMAND
+    else:
+        return frozenset()
+    for action in actions:
+        cmds.add(f"{current} {action}")
+        for prefix in legacy_prefixes:
+            cmds.add(f"{prefix} {action}")
     return frozenset(cmds)
 
 
@@ -769,8 +1038,12 @@ def _is_cairn_hook_entry(
     2. **Expected entry hash match** — the entry exactly matches what
        cairn would create right now for *harness*+*event*.
     3. **Exact command fallback** — the entry's command string is one
-       of the known cairn commands (exact match, not substring).
-    4. **Legacy script fallback** — ``python[3] /path/cairn_hook.py``,
+       of the known cairn commands (exact match, not substring), including
+       the pre-WI-033 bare ``python[3] -m cairn._*_hook`` forms.
+    4. **Legacy module fallback** — ``<any python> -m cairn._*_hook
+       <action>``, which also covers the absolute-interpreter form operators
+       hand-wrote to mitigate WI-033.
+    5. **Legacy script fallback** — ``python[3] /path/cairn_hook.py``,
        gated on *harness* being specified.
 
     This replaces the former substring check
@@ -806,7 +1079,25 @@ def _is_cairn_hook_entry(
             if cmd in known_cmds:
                 return True
 
-    # 4. Legacy script fallback (pre-module invocation).
+    # 4. Legacy module invocation under any interpreter path.
+    # Covers ``python3 -m cairn._claude_hook <action>`` and the absolute-path
+    # variants operators were told to hand-write as a mitigation for WI-033.
+    # The module name must match cairn's *exactly* (not a substring), so a
+    # user hook that merely mentions cairn still does not match.
+    if harness:
+        module = _LEGACY_HOOK_MODULES.get(harness)
+        if module:
+            for h in hook_list:
+                cmd = h.get("command", "")
+                try:
+                    tokens = shlex.split(cmd)
+                except ValueError:
+                    tokens = cmd.split()
+                if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == module:
+                    if Path(tokens[0]).name.startswith("python"):
+                        return True
+
+    # 5. Legacy script fallback (pre-module invocation).
     # Catches old-format installs: ``python[3] /path/cairn_hook.py <action>``.
     # Gated on *harness* to avoid false positives when called without
     # context.  Uses exact basename match (``Path(t).name == "cairn_hook.py"``)
@@ -934,38 +1225,27 @@ def _install_claude(
                 )
             )
 
-    for event, action in HOOK_EVENTS.items():
+    for event in HOOK_EVENTS:
         event_hooks = hooks.setdefault(event, [])
         if not isinstance(event_hooks, list):
             event_hooks = []
             hooks[event] = event_hooks
-        already = any(
-            _is_cairn_hook_entry(
-                e, harness="claude", event=event, manifest=manifest
-            )
-            for e in event_hooks
-            if isinstance(e, dict)
+        outcome, new_entry = _reconcile_event_hooks(
+            event_hooks, harness="claude", event=event, manifest=manifest
         )
-        if already:
+        if outcome == "noop" or new_entry is None:
             continue
-        new_entry = {
-            "matcher": "*",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": f"{CAIRN_HOOK_COMMAND} {action}",
-                    "timeout": 10,
-                }
-            ],
-        }
-        event_hooks.append(new_entry)
         changed = True
         _record_manifest(manifest, "claude", event, new_entry)
         result.actions.append(
             InstallAction(
                 "merge_json",
                 str(path),
-                f"register cairn {event} hook",
+                (
+                    f"register cairn {event} hook"
+                    if outcome == "added"
+                    else f"rewrite cairn {event} hook to the current entry point"
+                ),
                 keys=[f"hooks.{event}"],
             )
         )
@@ -975,6 +1255,8 @@ def _install_claude(
     elif not dry_run and changed:
         _save_json(path, data)
         _save_manifest(manifest)
+
+    _annotate_hook_verification(result, "claude", path)
 
     return result
 
@@ -1115,34 +1397,27 @@ def _install_codex(
         data["hooks"] = hooks
     changed = False
 
-    for event, action in CODEX_HOOK_EVENTS.items():
+    for event in CODEX_HOOK_EVENTS:
         event_hooks = hooks.setdefault(event, [])
         if not isinstance(event_hooks, list):
             event_hooks = []
             hooks[event] = event_hooks
-        if any(
-            _is_cairn_hook_entry(e, harness="codex", event=event, manifest=manifest)
-            for e in event_hooks
-            if isinstance(e, dict)
-        ):
+        outcome, new_entry = _reconcile_event_hooks(
+            event_hooks, harness="codex", event=event, manifest=manifest
+        )
+        if outcome == "noop" or new_entry is None:
             continue
-        inner = {
-            "type": "command",
-            "command": f"{CAIRN_CODEX_HOOK_COMMAND} {action}",
-            "commandWindows": f"{CAIRN_CODEX_HOOK_COMMAND_WINDOWS} {action}",
-            "timeout": 10,
-        }
-        new_entry: dict[str, Any] = {"hooks": [inner]}
-        if event in _CODEX_TOOL_EVENTS:
-            new_entry = {"matcher": "*", "hooks": [inner]}
-        event_hooks.append(new_entry)
         changed = True
         _record_manifest(manifest, "codex", event, new_entry)
         result.actions.append(
             InstallAction(
                 "merge_json",
                 str(path),
-                f"register cairn {event} hook",
+                (
+                    f"register cairn {event} hook"
+                    if outcome == "added"
+                    else f"rewrite cairn {event} hook to the current entry point"
+                ),
                 keys=[f"hooks.{event}"],
             )
         )
@@ -1152,6 +1427,8 @@ def _install_codex(
     elif not dry_run and changed:
         _save_json(path, data)
         _save_manifest(manifest)
+
+    _annotate_hook_verification(result, "codex", path)
 
     return result
 
