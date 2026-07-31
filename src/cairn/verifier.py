@@ -1930,6 +1930,16 @@ class Verifier:
                 or "transcript_content" in payload
             )
             if has_digest and not has_content:
+                # An event may say why its content is absent: cairn withholds
+                # content rather than storing plaintext when content encryption
+                # was configured and its key could not be used (WI-037).  Report
+                # the recorded cause instead of leaving the auditor to guess.
+                withheld = payload.get("content_encryption_error")
+                cause = (
+                    f" The event records why: {withheld}"
+                    if isinstance(withheld, str) and withheld
+                    else ""
+                )
                 report.content_coverage_gaps.append(
                     ContentCoverageGap(
                         session_id=str(session_id),
@@ -1940,7 +1950,7 @@ class Verifier:
                             f"but event {ev.event_id} ({transition}) has only a "
                             f"digest — content field is missing. The session "
                             f"declared content capture but this event was "
-                            f"recorded digest-only."
+                            f"recorded digest-only.{cause}"
                         ),
                     )
                 )

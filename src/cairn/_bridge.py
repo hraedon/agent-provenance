@@ -48,6 +48,7 @@ from regista import Regista  # noqa: E402
 
 from cairn import CairnAdapter, CairnConfig  # noqa: E402
 from cairn._config import _parse_bool, resolve_config  # noqa: E402
+from cairn._content_crypto import CONTENT_ENCRYPTION_ERROR_FIELD  # noqa: E402
 from cairn.schema import hash_payload  # noqa: E402
 
 _MAX_INPUT_BYTES = 10 * 1024 * 1024  # 10 MiB safety limit on stdin
@@ -220,6 +221,24 @@ def main() -> None:
     print(json.dumps(result))
 
 
+def _content_reply(event: Any) -> dict[str, Any]:
+    """Reply for a content-capturing action, surfacing a withheld-content note.
+
+    When content encryption was configured and unusable, the adapter records the
+    event digest-only and writes the reason into the signed payload (WI-037).
+    Passing it back lets the *hook* log a local, attributable degradation record
+    too, so the operator does not have to read the store to find out.
+    """
+    reply: dict[str, Any] = {"status": "ok", "event_id": str(event.event_id)}
+    payload = getattr(event, "payload", None)
+    if isinstance(payload, dict):
+        note = payload.get(CONTENT_ENCRYPTION_ERROR_FIELD)
+        if isinstance(note, str) and note:
+            reply[CONTENT_ENCRYPTION_ERROR_FIELD] = note
+            sys.stderr.write(f"cairn_bridge: {note}\n")
+    return reply
+
+
 def _dispatch(
     adapter: CairnAdapter,
     action: str,
@@ -298,7 +317,7 @@ def _dispatch(
             sequence=msg.get("sequence"),
             content_capture=content_capture,
         )
-        return {"status": "ok", "event_id": str(event.event_id)}
+        return _content_reply(event)
 
     if action == "assistant_message":
         message = msg.get("message", "")
@@ -309,7 +328,7 @@ def _dispatch(
             sequence=msg.get("sequence"),
             content_capture=content_capture,
         )
-        return {"status": "ok", "event_id": str(event.event_id)}
+        return _content_reply(event)
 
     if action == "transcript_attestation":
         transcript = msg.get("transcript", "")
@@ -320,7 +339,7 @@ def _dispatch(
             event_count=msg.get("event_count"),
             content_capture=content_capture,
         )
-        return {"status": "ok", "event_id": str(event.event_id)}
+        return _content_reply(event)
 
     if action == "subagent_start":
         agent_id = msg.get("agent_id")
@@ -355,7 +374,7 @@ def _dispatch(
             compact_summary=msg.get("compact_summary"),
             content_capture=msg.get("content_capture", False),
         )
-        return {"status": "ok", "event_id": str(event.event_id)}
+        return _content_reply(event)
 
     raise ValueError(f"unreachable: action={action}")
 

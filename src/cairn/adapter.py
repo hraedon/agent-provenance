@@ -39,7 +39,12 @@ from typing import Any
 import structlog
 from regista import Regista
 
-from ._content_crypto import encrypt_content_fields, resolve_content_encryption_stance
+from ._content_crypto import (
+    ContentEncryptionUnavailableError,
+    encrypt_content_fields,
+    recorded_content_encryption_stance,
+    withhold_content_fields,
+)
 from .schema import (
     AssistantMessagePayload,
     CairnConfig,
@@ -149,7 +154,11 @@ class CairnAdapter:
         actor = actor_id or self._actor_id
         ts = attested_at or datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
         if content_encryption is None:
-            content_encryption = resolve_content_encryption_stance()
+            # The VERIFIED stance, not the configured one: an attestation that
+            # says "on" while the key does not resolve is the defect WI-037
+            # closed.  This resolves the content key once per session, which is
+            # where the claim is made — not on every captured event.
+            content_encryption = recorded_content_encryption_stance()
         payload = ScopeAttestationPayload(
             version="2" if content_capture else "1",
             principal_id=principal_id,
@@ -240,7 +249,11 @@ class CairnAdapter:
         actor = actor_id or self._actor_id
         ts = attested_at or datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
         if content_encryption is None:
-            content_encryption = resolve_content_encryption_stance()
+            # The VERIFIED stance, not the configured one: an attestation that
+            # says "on" while the key does not resolve is the defect WI-037
+            # closed.  This resolves the content key once per session, which is
+            # where the claim is made — not on every captured event.
+            content_encryption = recorded_content_encryption_stance()
         payload = SessionAttestationPayload(
             version="2" if content_capture else "1",
             principal_id=principal_id,
@@ -449,6 +462,28 @@ class CairnAdapter:
     # Content capture (Plan 010 WI-2.1)
     # ----------------------------------------------------------------------
 
+    def _encrypt_or_withhold(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Encrypt content fields, or withhold them and say so (WI-037).
+
+        Silently storing plaintext when a content key was configured is the one
+        branch that must never happen: the operator has been told encryption is
+        on, so plaintext is worse than no content at all.  When encryption is
+        unavailable the content is dropped, the digests are kept (integrity and
+        the chain are unaffected), and the reason is recorded IN the signed
+        payload — so the store itself carries the explanation, and the verifier's
+        content-coverage check reports a gap with a cause rather than a mystery.
+        """
+        try:
+            return encrypt_content_fields(payload)
+        except ContentEncryptionUnavailableError as exc:
+            log.warning(
+                "cairn.content_encryption_unavailable",
+                key_ref=exc.key_ref,
+                reason=exc.reason,
+                action="content withheld; event recorded digest-only",
+            )
+            return withhold_content_fields(payload, str(exc))
+
     def record_user_message(
         self,
         session_id: str,
@@ -480,7 +515,7 @@ class CairnAdapter:
         ).to_dict()
 
         if content_capture:
-            payload = encrypt_content_fields(payload)
+            payload = self._encrypt_or_withhold(payload)
 
         entity_id = uuid.UUID(session_id) if isinstance(session_id, str) else session_id
         event = self._sub.append_event(
@@ -528,7 +563,7 @@ class CairnAdapter:
         ).to_dict()
 
         if content_capture:
-            payload = encrypt_content_fields(payload)
+            payload = self._encrypt_or_withhold(payload)
 
         entity_id = uuid.UUID(session_id) if isinstance(session_id, str) else session_id
         event = self._sub.append_event(
@@ -578,7 +613,7 @@ class CairnAdapter:
         ).to_dict()
 
         if content_capture:
-            payload = encrypt_content_fields(payload)
+            payload = self._encrypt_or_withhold(payload)
 
         entity_id = uuid.UUID(session_id) if isinstance(session_id, str) else session_id
         event = self._sub.append_event(
@@ -720,7 +755,7 @@ class CairnAdapter:
         ).to_dict()
 
         if content_capture:
-            payload = encrypt_content_fields(payload)
+            payload = self._encrypt_or_withhold(payload)
 
         entity_id = uuid.UUID(session_id) if isinstance(session_id, str) else session_id
         event = self._sub.append_event(

@@ -102,6 +102,64 @@ def _resolve(key_suite: str, key_legacy: str, suite_env: dict[str, str]) -> str 
     return None
 
 
+def content_key_ref_of(key_ref: str | None, key_path: str | None) -> str | None:
+    """The secret ref the content-encryption path will actually resolve.
+
+    One builder for one string: the doctor's check and the runtime's encryption
+    must probe the *same* ref, or they can disagree about whether content
+    encryption works (WI-037).  ``key_ref`` wins over ``key_path``; a path is
+    expressed as regista's ``file:`` ref so both forms take one code path.
+    """
+    if key_ref:
+        return key_ref
+    if key_path:
+        return f"file:{key_path}"
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class ContentSettings:
+    """The operator's content-encryption configuration, as configured.
+
+    "As configured" is the whole point of the type: it records intent and the
+    ref that intent names, and says nothing about whether the ref resolves.
+    :func:`cairn._content_crypto.content_encryption_status_for` turns it into a
+    verdict by resolving it.
+    """
+
+    encryption: str = "on"
+    key_ref: str | None = None
+    key_path: str | None = None
+
+    @property
+    def configured_key_ref(self) -> str | None:
+        return content_key_ref_of(self.key_ref, self.key_path)
+
+
+def resolve_content_settings(suite_env: dict[str, str] | None = None) -> ContentSettings:
+    """Content-encryption config with the same precedence as everything else.
+
+    Process env first, then ``suite.env``.  ``resolve_config`` delegates here so
+    the runtime and the doctor read one source: reading only ``os.environ`` in
+    the runtime (as ``_content_crypto`` did before WI-037) meant a content key
+    set in ``suite.env`` — the documented way to configure the suite — resolved
+    for the doctor and was invisible to the code doing the encrypting, i.e. a
+    green check over plaintext capture.
+    """
+    env = _load_suite_env() if suite_env is None else suite_env
+    key_ref = os.environ.get("CAIRN_CONTENT_KEY_REF") or env.get("CAIRN_CONTENT_KEY_REF")
+    key_path = os.environ.get("CAIRN_CONTENT_KEY_PATH") or env.get("CAIRN_CONTENT_KEY_PATH")
+    raw = (
+        os.environ.get("CAIRN_CONTENT_ENCRYPTION")
+        or env.get("CAIRN_CONTENT_ENCRYPTION")
+        or "on"
+    )
+    stance = raw.strip().lower()
+    if stance not in ("on", "off", "external"):
+        stance = "on"
+    return ContentSettings(encryption=stance, key_ref=key_ref, key_path=key_path)
+
+
 @dataclasses.dataclass(frozen=True)
 class CairnEnvConfig:
     dsn: str | None = None
@@ -176,22 +234,10 @@ def resolve_config() -> CairnEnvConfig:
     )
     disabled = _parse_bool(os.environ.get("CAIRN_DISABLE"))
 
-    content_key_ref = (
-        os.environ.get("CAIRN_CONTENT_KEY_REF")
-        or suite_env.get("CAIRN_CONTENT_KEY_REF")
-    )
-    content_key_path = (
-        os.environ.get("CAIRN_CONTENT_KEY_PATH")
-        or suite_env.get("CAIRN_CONTENT_KEY_PATH")
-    )
-    content_encryption_raw = (
-        os.environ.get("CAIRN_CONTENT_ENCRYPTION")
-        or suite_env.get("CAIRN_CONTENT_ENCRYPTION")
-        or "on"
-    )
-    content_encryption = content_encryption_raw.strip().lower()
-    if content_encryption not in ("on", "off", "external"):
-        content_encryption = "on"
+    content = resolve_content_settings(suite_env)
+    content_key_ref = content.key_ref
+    content_key_path = content.key_path
+    content_encryption = content.encryption
 
     integrity_max_age_raw = (
         os.environ.get("CAIRN_INTEGRITY_MAX_AGE_HOURS")
