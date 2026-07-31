@@ -627,6 +627,39 @@ def _check_codex_activity(*, wired: bool) -> dict[str, Any]:
 _INTEGRITY_VERDICT_FILENAME = "integrity-verdict.json"
 
 
+def _record_failed_attempt(cfg: Any, state: str) -> None:
+    """Note a failed replay attempt on the existing verdict without touching it.
+
+    Best-effort: failure to note the attempt must never mask the command's
+    exit code. Only a marker bound to the current store is annotated.
+    """
+    try:
+        verdict = _load_integrity_verdict(cfg)
+        if not verdict or "chain_state" not in verdict:
+            return
+        if verdict.get("store_binding") != _store_binding(cfg):
+            return
+        verdict["last_attempt"] = {
+            "checked_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "chain_state": state,
+        }
+        path = _integrity_verdict_path(cfg)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".integrity-")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(verdict, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+        except Exception:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
+            raise
+    except Exception:
+        return
+
+
 def _integrity_verdict_path(cfg: Any) -> Path:
     # Durable state dir, not the tmp-backed session state_dir — a recorded
     # drift FAIL must survive reboot (WI-030 review M2).
@@ -643,6 +676,37 @@ def _store_binding(cfg: Any) -> str:
     """
     material = f"{cfg.dsn or ''}\n{cfg.project or ''}".encode()
     return hashlib.sha256(material).hexdigest()[:16]
+
+
+def _parse_utc(value: Any) -> datetime.datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.UTC)
+    return parsed
+
+
+def _newer_failed_attempt(verdict: dict[str, Any]) -> str | None:
+    """Timestamp of a failed replay attempt newer than the verdict, if any.
+
+    ``cairn integrity`` never overwrites a real verdict with an exception
+    (m4), but it does note the attempt so a *persistently failing* replay
+    escalates in doctor instead of hiding behind an old green verdict.
+    """
+    attempt = verdict.get("last_attempt")
+    if not isinstance(attempt, dict) or attempt.get("chain_state") == "verified":
+        return None
+    attempt_dt = _parse_utc(attempt.get("checked_at"))
+    verdict_dt = _parse_utc(verdict.get("checked_at"))
+    if attempt_dt is None:
+        return None
+    if verdict_dt is None or attempt_dt > verdict_dt:
+        return attempt.get("checked_at")
+    return None
 
 
 def _load_integrity_verdict(cfg: Any) -> dict[str, Any] | None:
@@ -693,11 +757,13 @@ def _check_chain_integrity(cfg: Any) -> tuple[dict[str, Any], str | None, bool |
 
     chain_state = verdict.get("chain_state")
     checked_at = verdict.get("checked_at")
+    failed_attempt_at = _newer_failed_attempt(verdict)
 
     # A verdict certifies exactly one store+project; never report it for
-    # another (WI-030 review M1). Markers predating the binding field are
-    # treated as unbound and must be re-recorded.
-    if chain_state in ("verified", "drift", "error") and verdict.get(
+    # another (WI-030 review M1) — including "unsupported", which is a claim
+    # about a specific store's regista. Markers predating the binding field
+    # are treated as unbound and must be re-recorded.
+    if chain_state in ("verified", "drift", "error", "unsupported") and verdict.get(
         "store_binding"
     ) != _store_binding(cfg):
         return (
@@ -755,6 +821,24 @@ def _check_chain_integrity(cfg: Any) -> tuple[dict[str, Any], str | None, bool |
                 None,
             )
         if max_age > 0 and age_hours > max_age:
+            if failed_attempt_at is not None:
+                # Stale AND newer attempts are failing: the verdict is not
+                # merely old, it is unrefreshable — escalate to fail so a
+                # replay-breaking condition cannot hide behind warn forever.
+                return (
+                    {
+                        "name": "chain_integrity",
+                        "status": "fail",
+                        "detail": (
+                            f"verified verdict from {checked_at} is older than "
+                            f"{max_age:g}h and the most recent replay attempt "
+                            f"({failed_attempt_at}) failed — investigate "
+                            "`cairn integrity`"
+                        ),
+                    },
+                    "verified",
+                    None,
+                )
             return (
                 {
                     "name": "chain_integrity",
@@ -762,6 +846,20 @@ def _check_chain_integrity(cfg: Any) -> tuple[dict[str, Any], str | None, bool |
                     "detail": (
                         f"last full replay verified at {checked_at} — older than "
                         f"{max_age:g}h; re-run `cairn integrity` or schedule it"
+                    ),
+                },
+                "verified",
+                True,
+            )
+        if failed_attempt_at is not None:
+            return (
+                {
+                    "name": "chain_integrity",
+                    "status": "warn",
+                    "detail": (
+                        f"verified at {checked_at}, but the most recent replay "
+                        f"attempt ({failed_attempt_at}) failed; investigate "
+                        "`cairn integrity`"
                     ),
                 },
                 "verified",
@@ -1091,6 +1189,7 @@ def run_integrity(*, json_output: bool = False) -> int:
         with _open_regista(cfg) as sub:
             chain_state, chain_ok = _verify_chain(sub)
     except Exception as exc:
+        _record_failed_attempt(cfg, "unreachable")
         report = {
             "component": "cairn",
             "version": _cairn_version,
@@ -1141,6 +1240,10 @@ def run_integrity(*, json_output: bool = False) -> int:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(tmp)
             raise
+    elif chain_state == "error":
+        # An exception is not a verdict (m4) — but note the failed attempt so
+        # doctor escalates if attempts keep failing behind an old verdict.
+        _record_failed_attempt(cfg, "error")
 
     ok = chain_state == "verified" and chain_ok is True
     report = {

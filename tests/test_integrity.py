@@ -214,10 +214,15 @@ def test_integrity_replay_error_exits_nonzero_and_preserves_verdict(
 
     verdict = json.loads(_integrity_verdict_path(cfg).read_text())
     assert verdict["chain_state"] == "verified"
+    assert verdict["last_attempt"]["chain_state"] == "error"
 
-    rc = run_doctor(json_output=True)
+    # the verdict survives, but the failed attempt is escalated as a warning
+    run_doctor(json_output=True)
     report = _doctor_report(capsys)
-    assert _find_check(report, "chain_integrity")["status"] == "ok"
+    check = _find_check(report, "chain_integrity")
+    assert check["status"] == "warn"
+    assert "failed" in check["detail"]
+    assert report["regista"]["chain_state"] == "verified"
 
 
 def test_integrity_replay_error_with_no_prior_verdict_leaves_never_run(
@@ -398,6 +403,101 @@ def test_max_age_env_parsing_rejects_invalid(monkeypatch, tmp_path):
     for raw, expected in (("nope", 168.0), ("-5", 168.0), ("nan", 168.0), ("0", 0.0)):
         monkeypatch.setenv("CAIRN_INTEGRITY_MAX_AGE_HOURS", raw)
         assert resolve_config().integrity_max_age_hours == expected, raw
+
+
+def test_unsupported_verdict_from_other_store_is_unbound(cfg):
+    """'unsupported' is a claim about a specific store's regista — it must
+    not be reported for a different store (review round 2)."""
+    other = CairnEnvConfig(
+        dsn=cfg.dsn,
+        key_path=cfg.key_path,
+        project="other_project",
+        state_dir=cfg.state_dir,
+        integrity_dir=cfg.integrity_dir,
+    )
+    _write_verdict(other, age_hours=1.0, state="unsupported")
+    check, chain_state, _chain_ok = _check_chain_integrity(cfg)
+    assert check["status"] == "skip"
+    assert chain_state == "unbound"
+
+
+def test_integrity_dir_defaults_to_durable_state_home():
+    """A directly constructed config must not yield a CWD-relative marker."""
+    cfg = CairnEnvConfig()
+    assert cfg.integrity_dir
+    assert Path(cfg.integrity_dir).is_absolute()
+
+
+# ---------------------------------------------------------------------------
+# failed-attempt escalation (review round 2 medium: a persistently failing
+# replay must not hide behind an old green verdict)
+# ---------------------------------------------------------------------------
+
+
+def test_failed_attempt_after_fresh_verdict_warns(monkeypatch, cfg, capsys):
+    _patch_regista(monkeypatch, cfg, _StubRegista())
+    assert run_integrity(json_output=True) == 0
+    capsys.readouterr()
+
+    _patch_regista(monkeypatch, cfg, _StubRegista(replay_exc=RuntimeError("boom")))
+    assert run_integrity(json_output=True) == 1
+    capsys.readouterr()
+
+    check, chain_state, chain_ok = _check_chain_integrity(cfg)
+    assert check["status"] == "warn"
+    assert "failed" in check["detail"]
+    assert chain_state == "verified"
+    assert chain_ok is True
+
+
+def test_failed_attempt_behind_stale_verdict_fails(monkeypatch, cfg):
+    _write_verdict(cfg, age_hours=200.0)
+    marker = json.loads(_integrity_verdict_path(cfg).read_text())
+    marker["last_attempt"] = {
+        "checked_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "chain_state": "error",
+    }
+    _integrity_verdict_path(cfg).write_text(json.dumps(marker))
+
+    check, _chain_state, chain_ok = _check_chain_integrity(cfg)
+    assert check["status"] == "fail"
+    assert "failed" in check["detail"]
+    assert chain_ok is None
+
+
+def test_successful_rerun_clears_failed_attempt(monkeypatch, cfg, capsys):
+    _patch_regista(monkeypatch, cfg, _StubRegista(replay_exc=RuntimeError("boom")))
+    _write_verdict(cfg, age_hours=1.0)
+    assert run_integrity(json_output=True) == 1
+    capsys.readouterr()
+    assert "last_attempt" in json.loads(_integrity_verdict_path(cfg).read_text())
+
+    _patch_regista(monkeypatch, cfg, _StubRegista())
+    assert run_integrity(json_output=True) == 0
+    capsys.readouterr()
+    marker = json.loads(_integrity_verdict_path(cfg).read_text())
+    assert "last_attempt" not in marker
+
+    check, _chain_state, chain_ok = _check_chain_integrity(cfg)
+    assert check["status"] == "ok"
+    assert chain_ok is True
+
+
+def test_failed_attempt_never_annotates_foreign_marker(monkeypatch, cfg, capsys):
+    other = CairnEnvConfig(
+        dsn=cfg.dsn,
+        key_path=cfg.key_path,
+        project="other_project",
+        state_dir=cfg.state_dir,
+        integrity_dir=cfg.integrity_dir,
+    )
+    _write_verdict(other, age_hours=1.0)
+
+    _patch_regista(monkeypatch, cfg, _StubRegista(replay_exc=RuntimeError("boom")))
+    assert run_integrity(json_output=True) == 1
+    capsys.readouterr()
+    marker = json.loads(_integrity_verdict_path(cfg).read_text())
+    assert "last_attempt" not in marker
 
 
 # ---------------------------------------------------------------------------

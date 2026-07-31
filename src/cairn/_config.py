@@ -117,7 +117,9 @@ class CairnEnvConfig:
     content_key_path: str | None = None
     content_encryption: str = "on"
     integrity_max_age_hours: float = 168.0
-    integrity_dir: str = ""
+    # default_factory, not "": an empty default would make the verdict path
+    # CWD-relative for any direct construction that omits the field.
+    integrity_dir: str = dataclasses.field(default_factory=_default_integrity_dir)
 
     @property
     def is_configured(self) -> bool:
