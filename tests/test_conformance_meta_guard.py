@@ -6,17 +6,21 @@ against a module that was never installed, so every case skipped, CI stayed gree
 and zero contract was enforced. A skipped gate is indistinguishable from a passing
 one in a green build — the canonical "fails open" hazard.
 
-The 1.0.0 PyPI wheel does not ship ``assert_cases_declared`` or
-``ConformanceGateError``; the in-module guard is implemented locally using only
-stdlib + pytest so the meta-guard itself never imports an unavailable 1.1 symbol.
-
-The empty-dimension guard is in ``test_cli_conformance.py`` (implemented
-locally). This file catches the other half — "the whole module skipped" — by
-running the conformance module as a subprocess and asserting at least one case
-*passed* (not all-skipped).
+Kit 1.1.0 ships both meta-guard helpers; this file consumes the shipped
+``ConformanceGateError`` rather than a local copy (WI-023). The empty-dimension
+guard (``assert_cases_declared``) lives in ``test_cli_conformance.py``. This file
+catches the other half — "the whole module skipped" — by running the conformance
+module as a subprocess and asserting at least one case *passed* (not all-skipped).
 
 The guard is factored into a pure function (``require_gate_ran``) so a deny-case
-can prove it rejects an all-skip summary — not a tautology.
+can prove it rejects an all-skip summary — not a tautology (process-calibration
+§5).
+
+Import note: ``importorskip`` keeps a kit-less local checkout (no ``[dev]`` extra,
+e.g. a 3.11 runtime env — the kit requires py>=3.12) from hard-erroring at
+collection. In CI the kit is a mandatory pinned dep, so this guard runs and
+enforces; if the kit import name ever drifts again, the live-case test below
+reddens the build instead of silently skipping (WI-026).
 """
 
 from __future__ import annotations
@@ -29,20 +33,24 @@ from pathlib import Path
 
 import pytest
 
+# Kit 1.1.0 ships ConformanceGateError; consume it rather than a local copy.
+conformance = pytest.importorskip("agent_suite.conformance")
+ConformanceGateError = conformance.ConformanceGateError
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFORMANCE_TEST = REPO_ROOT / "tests" / "test_cli_conformance.py"
 
 
-class ConformanceGateError(AssertionError):
-    """A conformance gate that ran too few cases or did not exit cleanly."""
-
-
-# A pytest -q summary line ends with the timing suffix "in <number>s". Anchoring
-# to that suffix — rather than scanning the whole captured stream — means a count-like
-# token printed by a test under examination (e.g. a CLI emitting JSON with a
-# "passed" field) cannot be mistaken for pytest's own summary. Counts are parsed
-# from the LAST summary line only.
-_SUMMARY_LINE_RE = re.compile(r"^(?P<line>.*?\bin \d+(?:\.\d+)?s)\s*$", re.MULTILINE)
+# A pytest summary line carries the timing suffix "in <number>s". Anchoring to
+# that suffix — rather than scanning the whole captured stream — means a
+# count-like token printed by a test under examination (e.g. a CLI emitting JSON
+# with a "passed" field) cannot be mistaken for pytest's own summary. Counts are
+# parsed from the LAST summary line only. The trailing ``=+`` run is optional so
+# the parser matches BOTH the default reporter's decorated summary
+# ("===== N passed in Xs =====") and the quiet reporter's bare line
+# ("N passed in Xs") — the gate runs the default reporter (no ``-q``) for a
+# stable, always-present summary line.
+_SUMMARY_LINE_RE = re.compile(r"^(?P<line>.*?\bin \d+(?:\.\d+)?s)\s*(?:=+\s*)?$", re.MULTILINE)
 _COUNT_RE = {
     "passed": re.compile(r"(\d+)\s+passed"),
     "skipped": re.compile(r"(\d+)\s+skipped"),
@@ -95,7 +103,15 @@ def require_gate_ran(
 
 
 def _run_pytest(test_path: Path, tmp_path: Path) -> subprocess.CompletedProcess[str]:
-    """Run pytest on ``test_path`` with color disabled and return the result."""
+    """Run pytest on ``test_path`` with color disabled and return the result.
+
+    Deliberately NOT ``-q``: the quiet reporter prints a terse progress line whose
+    short summary can be elided or reformatted across pytest versions, which makes
+    the ``in <num>s`` summary-line parse below fragile. The default reporter always
+    emits a stable ``N passed[, M skipped] in Xs`` summary line that ``_SUMMARY_LINE_RE``
+    anchors on. Color is forced off (``--color=no`` + ``NO_COLOR``/``PY_COLORS``) so
+    ANSI escapes can never corrupt that parse.
+    """
     env = {
         **os.environ,
         "NO_COLOR": "1",
@@ -105,7 +121,7 @@ def _run_pytest(test_path: Path, tmp_path: Path) -> subprocess.CompletedProcess[
     proc = subprocess.run(
         [
             sys.executable, "-m", "pytest", str(test_path),
-            "-q", "-p", "no:cacheprovider", "--no-header", "--color=no",
+            "-p", "no:cacheprovider", "--no-header", "--color=no",
         ],
         cwd=REPO_ROOT,
         env=env,
