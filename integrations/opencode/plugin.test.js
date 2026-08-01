@@ -321,3 +321,111 @@ if (msg.action === "begin") {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// WI-011 item 2: the plugin's `event` hook handles session.started.
+// plugin.test.js exercised attest_session through the fake bridge but never
+// invoked the plugin's event handler itself; these tests drive plugin.event().
+// ---------------------------------------------------------------------------
+
+// A fake bridge that records every message it receives (one JSON per line) to
+// the file named by CAIRN_TEST_RECORD, then answers attest_session with ok.
+function writeRecordingBridge(path, recordFile) {
+  writeBridge(
+    path,
+    `import { readFileSync, appendFileSync } from "node:fs";
+const msg = JSON.parse(readFileSync(0, "utf8"));
+appendFileSync(${JSON.stringify(recordFile)}, JSON.stringify(msg) + "\\n");
+process.stdout.write(JSON.stringify({ status: "ok", event_id: "ev-" + msg.action }) + "\\n");`,
+  );
+}
+
+function readRecord(recordFile) {
+  if (!existsSync(recordFile)) return [];
+  return readFileSync(recordFile, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+}
+
+describe("WI-011: plugin event handler attests session.started", () => {
+  test("session.started invokes attest_session with the session id and harness", async () => {
+    const sub = mkdtempSync(join(tmpdir(), "cairn-evstart-"));
+    const recordFile = join(sub, "record.jsonl");
+    const bridge = join(sub, "rec.mjs");
+    writeRecordingBridge(bridge, recordFile);
+    const savedBridge = process.env.CAIRN_BRIDGE_PATH;
+    const savedAttest = process.env.CAIRN_ATTEST_ON_START;
+    process.env.CAIRN_BRIDGE_PATH = bridge;
+    process.env.CAIRN_ATTEST_ON_START = "1";
+    try {
+      const plugin = await cairnPlugin({ client: mkClient([]), stateDir: sub });
+      await plugin.event({
+        event: { type: "session.started", properties: { sessionID: "sess-ev1", version: "1.2.3" } },
+      });
+
+      const calls = readRecord(recordFile);
+      const attest = calls.find((c) => c.action === "attest_session");
+      expect(attest).toBeDefined();
+      expect(attest.session_id).toBe("sess-ev1");
+      expect(attest.harnesses).toEqual([{ name: "opencode", version: "1.2.3" }]);
+      // No degradation on a successful attestation.
+      expect(existsSync(join(sub, "sess-ev1", "degradation.log"))).toBe(false);
+    } finally {
+      process.env.CAIRN_BRIDGE_PATH = savedBridge;
+      if (savedAttest === undefined) delete process.env.CAIRN_ATTEST_ON_START;
+      else process.env.CAIRN_ATTEST_ON_START = savedAttest;
+      rmSync(sub, { recursive: true, force: true });
+    }
+  });
+
+  test("session.started is ignored when CAIRN_ATTEST_ON_START is off", async () => {
+    const sub = mkdtempSync(join(tmpdir(), "cairn-evoff-"));
+    const recordFile = join(sub, "record.jsonl");
+    const bridge = join(sub, "rec.mjs");
+    writeRecordingBridge(bridge, recordFile);
+    const savedBridge = process.env.CAIRN_BRIDGE_PATH;
+    const savedAttest = process.env.CAIRN_ATTEST_ON_START;
+    process.env.CAIRN_BRIDGE_PATH = bridge;
+    process.env.CAIRN_ATTEST_ON_START = "0";
+    try {
+      const plugin = await cairnPlugin({ client: mkClient([]), stateDir: sub });
+      await plugin.event({
+        event: { type: "session.started", properties: { sessionID: "sess-ev0" } },
+      });
+      const attest = readRecord(recordFile).find((c) => c.action === "attest_session");
+      expect(attest).toBeUndefined();
+    } finally {
+      process.env.CAIRN_BRIDGE_PATH = savedBridge;
+      if (savedAttest === undefined) delete process.env.CAIRN_ATTEST_ON_START;
+      else process.env.CAIRN_ATTEST_ON_START = savedAttest;
+      rmSync(sub, { recursive: true, force: true });
+    }
+  });
+
+  test("session.started without a sessionID degrades and does not attest", async () => {
+    const sub = mkdtempSync(join(tmpdir(), "cairn-evnosid-"));
+    const recordFile = join(sub, "record.jsonl");
+    const bridge = join(sub, "rec.mjs");
+    writeRecordingBridge(bridge, recordFile);
+    const savedBridge = process.env.CAIRN_BRIDGE_PATH;
+    const savedAttest = process.env.CAIRN_ATTEST_ON_START;
+    process.env.CAIRN_BRIDGE_PATH = bridge;
+    process.env.CAIRN_ATTEST_ON_START = "1";
+    try {
+      const plugin = await cairnPlugin({ client: mkClient([]), stateDir: sub });
+      await plugin.event({ event: { type: "session.started", properties: {} } });
+
+      // No attestation was attempted...
+      expect(readRecord(recordFile).find((c) => c.action === "attest_session")).toBeUndefined();
+      // ...and the missing sessionID was recorded as a degradation.
+      const logPath = join(sub, "session-start", "degradation.log");
+      expect(existsSync(logPath)).toBe(true);
+      const entry = readFileSync(logPath, "utf8").trim().split("\n").map(JSON.parse).pop();
+      expect(entry.action).toBe("session_start");
+      expect(entry.detail).toMatch(/sessionID/i);
+    } finally {
+      process.env.CAIRN_BRIDGE_PATH = savedBridge;
+      if (savedAttest === undefined) delete process.env.CAIRN_ATTEST_ON_START;
+      else process.env.CAIRN_ATTEST_ON_START = savedAttest;
+      rmSync(sub, { recursive: true, force: true });
+    }
+  });
+});
