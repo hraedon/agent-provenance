@@ -5844,9 +5844,14 @@ def test_bc016_unset_witness_scheme_with_signature_is_unverified(tmp_path: Path)
     assert not report.all_ok
 
 
-def test_bc016_hmac_witness_is_delegated_and_counts_as_coverage(tmp_path: Path) -> None:
-    """An HMAC witness is authenticated by regista's delivery layer: cairn labels
-    it delegated (not unverified) and it still satisfies coverage."""
+def test_bc016_hmac_witness_is_unverified_when_unpinned(tmp_path: Path) -> None:
+    """WI-043: absence of a pinned key means unverified, not delegated.
+
+    An HMAC witness the operator did NOT pin cannot be corroborated by cairn.
+    Relabeling the scheme to ``hmac-sha256`` with a fabricated blob must yield
+    an UNVERIFIED receipt, a coverage violation, and ``all_ok=False`` — the
+    exact primitive that previously passed silently as delegated coverage.
+    """
     key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
     ev_id, env, c_hash, sig = _bc016_signed_event()
 
@@ -5854,19 +5859,37 @@ def test_bc016_hmac_witness_is_delegated_and_counts_as_coverage(tmp_path: Path) 
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
         witness_id=str(uuid.uuid4()),
         witness_pubkey_hex=None,
-        witness_sig_hex="ab" * 32,  # an HMAC tag cairn cannot re-check
+        witness_sig_hex="ab" * 32,  # a fabricated blob cairn cannot corroborate
         key_scheme="hmac-sha256",
     )
     report = Verifier(key_set).verify_bundle(_finalize_bundle(bundle, tmp_path))
 
     receipt = report.witness_receipts[0]
     assert receipt.signature_valid is None
-    assert receipt.unverified is False  # delegated, NOT unverified
-    assert "delegated" in (receipt.verification_detail or "").lower() or \
-        "hmac" in (receipt.verification_detail or "").lower()
-    assert report.unverified_witness_receipts == 0
-    assert len(report.witness_coverage_violations) == 0  # HMAC counts as coverage
-    assert report.all_ok
+    assert receipt.unverified is True  # unpinned => unverified, NOT delegated
+    assert report.unverified_witness_receipts == 1
+    assert len(report.witness_coverage_violations) == 1  # excluded from coverage
+    assert not report.all_ok
+
+
+def test_bc016_unpinned_hmac_relabel_with_fabricated_blob_fails(tmp_path: Path) -> None:
+    """Adversarial: the unpinned + hmac-relabel + fabricated-blob attack that
+    previously returned ``all_ok=True`` must now fail the verdict."""
+    key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=str(uuid.uuid4()),
+        witness_pubkey_hex=None,
+        witness_sig_hex="ab" * 32,
+        key_scheme="hmac-sha256",  # relabel away from ed25519
+    )
+    report = Verifier(key_set).verify_bundle(_finalize_bundle(bundle, tmp_path))
+
+    assert report.witness_receipts[0].unverified is True
+    assert len(report.witness_coverage_violations) == 1
+    assert not report.all_ok
 
 
 def test_bc016_unverified_state_surfaces_in_json_report(tmp_path: Path) -> None:

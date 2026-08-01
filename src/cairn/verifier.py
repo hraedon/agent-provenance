@@ -1112,6 +1112,12 @@ class Verifier:
         UNVERIFIED and excluded from coverage.  A pinned key forces Ed25519
         verification regardless of the scheme the bundle claims, so a bundle
         cannot relabel an Ed25519 witness as HMAC to skip verification.
+
+        WI-043 residual: absence of a pinned key means *unverified*, not
+        delegated.  An HMAC witness the operator did not pin cannot be
+        corroborated by cairn, so a receipt it carries — even one that relabels
+        an Ed25519 witness as ``hmac-sha256`` with a fabricated blob — is
+        UNVERIFIED and is excluded from coverage.
         """
         if not report.witness_receipts:
             return
@@ -1182,8 +1188,9 @@ class Verifier:
             elif delegated:
                 sig_valid = None
                 detail = (
-                    "HMAC witness — authenticated by regista's delivery layer; "
-                    "not independently re-verified by cairn"
+                    "UNVERIFIED: HMAC witness is not an operator-pinned trust "
+                    "root — absence of a pinned key means unverified, not "
+                    "delegated (WI-043)"
                 )
             else:
                 sig_valid = None
@@ -1196,7 +1203,7 @@ class Verifier:
                 else:
                     detail = "No witness signature present — nothing to verify"
 
-            unverified = receipt.has_signature and sig_valid is None and not delegated
+            unverified = receipt.has_signature and sig_valid is None
             updated_receipts.append(replace(
                 receipt,
                 signature_valid=sig_valid,
@@ -1251,12 +1258,13 @@ class Verifier:
 
         # Build lookup: event_id → set of witness_ids with confirmed receipts.
         # A receipt counts as confirmed only if its signature was verified
-        # (signature_valid is True), or it is an HMAC witness whose receipt
-        # regista's delivery layer already authenticated (signature_valid None,
-        # scheme hmac-sha256 — delegated trust).  Every other unverified receipt
-        # is excluded (BC-016): a forged signature (False), an Ed25519 receipt
-        # with no public key (None + ed25519), and any receipt carrying a
-        # signature cairn could not verify (``unverified``) are NOT coverage.
+        # (signature_valid is True), or it is a signature-less legacy receipt
+        # (signature_valid None, no ``unverified`` flag, not ed25519).  Every
+        # other receipt is excluded (BC-016 / WI-043): a forged signature
+        # (False), an Ed25519 receipt with no public key (None + ed25519), an
+        # unpinned HMAC receipt carrying a signature it cannot corroborate
+        # (``unverified``), and any receipt cairn could not verify are NOT
+        # coverage.
         receipts_by_event: dict[str, set[str]] = {}
         for r in report.witness_receipts:
             if r.signature_valid is False:

@@ -256,11 +256,13 @@ class WitnessReceiptEntry:
     independently verify it).  ``None`` covers two HONEST and distinct cases
     that the verdict must not conflate with "verified":
 
-    * a *delegated* HMAC witness, authenticated by regista's delivery layer
-      (cairn holds no HMAC key to re-check), and
+    * a *delegated* receipt — a signature-less legacy receipt (no key the
+      operator pinned, no signature to check), and
     * an *unverified* receipt — a signature is present but cairn could not
-      check it (unknown/unsupported scheme, or an Ed25519 witness whose public
-      key / event envelope is unavailable).
+      check it (unknown/unsupported scheme, an Ed25519 witness whose public
+      key / event envelope is unavailable, or an HMAC witness the operator did
+      not pin — WI-043: absence of a pinned key means unverified, not
+      delegated).
 
     ``unverified`` marks the second case (BC-016): a receipt carrying a
     signature cairn could not verify.  Such a receipt is excluded from witness
