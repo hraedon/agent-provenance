@@ -167,11 +167,15 @@ class Verifier:
                 TSA timestamp tokens against this trust anchor (BC-229).
             witness_keys: Optional mapping ``witness_id → Ed25519 public
                 key bytes`` for verifying witness receipt signatures
-                (BC-016).  When provided, witness receipt signatures are
-                cryptographically verified; receipts with invalid
-                signatures do not count toward witness coverage.  When
-                omitted, receipt signatures are not checked (a warning is
-                emitted if any receipts have signatures).
+                (BC-016).  These are the *enrolled/anchored* witness keys —
+                the only witness keys that count as a trust root.  A public
+                key carried inside the bundle's ``witness_registrations`` is
+                display-only and is never used to establish trust (WI-043):
+                such a receipt is never reported VERIFIED and never counts
+                toward coverage, regardless of the scheme the bundle claims.
+                A pinned key here also forces Ed25519 verification even when
+                the bundle claims a different scheme (closes the relabel
+                bypass).
             max_bundle_size_bytes: Maximum bundle file size in bytes.
                 Bundles exceeding this are rejected before parsing to
                 prevent OOM (WI-021).  ``None`` uses the default (512 MB).
@@ -183,6 +187,7 @@ class Verifier:
         self._key_meta = key_metadata or {}
         self._tsa_cert_path = tsa_cert_path
         self._witness_keys = witness_keys or {}
+        self._bundle_witness_keys: dict[str, bytes] = {}
         self._max_bundle_bytes = (
             max_bundle_size_bytes
             if max_bundle_size_bytes is not None
@@ -1048,9 +1053,9 @@ class Verifier:
     ) -> None:
         """Load witness registrations and receipts from the bundle.
 
-        Also collects witness public keys from registrations when present,
-        so that _verify_witness_signatures can cryptographically verify
-        receipt signatures (BC-016).
+        Bundle-carried Ed25519 public keys are collected into
+        ``_bundle_witness_keys`` for display/attribution only — they are NOT a
+        trust root (WI-043) and never feed ``_verify_witness_signatures``.
         """
         raw_witnesses = raw_bundle.get("witness_registrations")
         if raw_witnesses:
@@ -1067,13 +1072,10 @@ class Verifier:
                         key_scheme=key_scheme if isinstance(key_scheme, str) else None,
                     )
                 )
-                # Collect Ed25519 public keys from registrations
                 if pubkey_hex and key_scheme == "ed25519":
                     try:
                         wid = str(w.get("witness_id", ""))
-                        self._witness_keys.setdefault(
-                            wid, bytes.fromhex(pubkey_hex)
-                        )
+                        self._bundle_witness_keys[wid] = bytes.fromhex(pubkey_hex)
                     except (ValueError, TypeError):
                         pass
 
@@ -1102,31 +1104,23 @@ class Verifier:
     def _verify_witness_signatures(
         self, events: list[Event], report: VerificationReport
     ) -> None:
-        """Cryptographically verify witness receipt signatures (BC-016).
+        """Cryptographically verify witness receipt signatures (BC-016, WI-043).
 
-        For each witness receipt:
-        - If the witness has an Ed25519 public key (from ``witness_keys``
-          parameter or bundle registrations), verify the receipt's
-          signature against the event's canonical envelope.
-        - If the witness key scheme is ``hmac-sha256`` (or unknown and no
-          key is available), the receipt is accepted without cryptographic
-          verification (backward-compatible — regista's own delivery layer
-          already verified HMAC witnesses).
-
-        Receipts with invalid Ed25519 signatures are marked
-        ``signature_valid=False`` and will not count toward witness
-        coverage in ``_check_witness_coverage``.
+        Trust roots are the *enrolled/anchored* keys in ``self._witness_keys``
+        only.  A public key carried inside the bundle is display-only and is
+        never used to verify a receipt (WI-043): such a receipt is reported
+        UNVERIFIED and excluded from coverage.  A pinned key forces Ed25519
+        verification regardless of the scheme the bundle claims, so a bundle
+        cannot relabel an Ed25519 witness as HMAC to skip verification.
         """
         if not report.witness_receipts:
             return
 
-        # Build event lookup: event_id → canonical_envelope bytes
         env_by_event: dict[str, bytes] = {}
         for ev in events:
             if ev.canonical_envelope is not None:
                 env_by_event[str(ev.event_id)] = ev.canonical_envelope
 
-        # Build witness_id → key_scheme lookup from registrations
         scheme_by_witness: dict[str, str] = {}
         for reg in report.witness_registrations:
             if reg.key_scheme:
@@ -1139,26 +1133,24 @@ class Verifier:
             ev_id = receipt.event_id
             key_scheme = scheme_by_witness.get(wid)
 
-            # Determine if this witness requires Ed25519 signature verification
-            needs_ed25519 = key_scheme == "ed25519" or (
-                key_scheme is None and wid in self._witness_keys
-            )
+            pinned = wid in self._witness_keys
+            ran_ed25519 = pinned or key_scheme == "ed25519"
+            delegated = (not ran_ed25519) and key_scheme == "hmac-sha256"
 
             sig_valid: bool | None
             detail: str
-            if needs_ed25519:
+            if ran_ed25519:
                 pub_key = self._witness_keys.get(wid)
                 sig_bytes = self._witness_sig_cache.get((ev_id, wid))
 
                 if pub_key is None:
                     sig_valid = None
                     detail = (
-                        "UNVERIFIED: witness uses Ed25519 but no public key is "
-                        "available — signature NOT checked"
+                        "UNVERIFIED: witness has no enrolled/anchored Ed25519 "
+                        "public key — a bundle-carried key is display-only and "
+                        "is not a trust root (WI-043)"
                     )
                 elif sig_bytes is None:
-                    # An Ed25519 witness must sign; a missing signature is a
-                    # definite failure, not merely "unverified".
                     sig_valid = False
                     detail = "Missing witness signature"
                 else:
@@ -1187,22 +1179,13 @@ class Verifier:
                         except Exception as exc:
                             sig_valid = False
                             detail = f"Verification error: {type(exc).__name__}"
-            elif key_scheme == "hmac-sha256":
-                # Delegated trust: regista's delivery layer authenticated the
-                # HMAC receipt. cairn holds no HMAC key to re-check (holding it
-                # would put a shared secret in the verifier), so this is reported
-                # honestly as delegated, NOT as an independent verification — and
-                # it is NOT marked unverified. See docs/witness-signature-verification.md.
+            elif delegated:
                 sig_valid = None
                 detail = (
                     "HMAC witness — authenticated by regista's delivery layer; "
                     "not independently re-verified by cairn"
                 )
             else:
-                # Unknown / unsupported key scheme. cairn has no rule to verify
-                # it. BC-016: a signature cairn cannot verify is UNVERIFIED, never
-                # silently confirmed. (A receipt with no signature at all is a
-                # legacy receipt with nothing to check — not unverified.)
                 sig_valid = None
                 if receipt.has_signature:
                     detail = (
@@ -1213,13 +1196,7 @@ class Verifier:
                 else:
                     detail = "No witness signature present — nothing to verify"
 
-            # A receipt is "unverified" when it carries a signature cairn did not
-            # successfully verify and that is not an HMAC delegation (BC-016).
-            unverified = (
-                receipt.has_signature
-                and sig_valid is None
-                and key_scheme != "hmac-sha256"
-            )
+            unverified = receipt.has_signature and sig_valid is None and not delegated
             updated_receipts.append(replace(
                 receipt,
                 signature_valid=sig_valid,
