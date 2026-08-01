@@ -190,6 +190,106 @@ def test_uninstall_claude_noop_on_clean(cfg, claude_settings):
 
 
 # ----------------------------------------------------------------------
+# uninstall env-var ownership (WI-029)
+# ----------------------------------------------------------------------
+
+
+def test_install_claude_records_env_ownership_in_manifest(cfg, claude_settings):
+    """Install records exactly the env keys cairn wrote, so uninstall can
+    tell its own keys apart from the user's."""
+    _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+
+    owned = _load_manifest()["installs"]["claude"]["env_keys"]
+    # cairn wrote every valued key it owns; PRINCIPAL_ID comes from cfg.
+    assert "REGISTA_DSN" in owned
+    assert "CAIRN_PROJECT" in owned
+    assert "CAIRN_HARNESS_NAME" in owned
+
+
+def test_uninstall_claude_preserves_user_set_env_var(cfg, claude_settings):
+    """The core WI-029 fix: a REGISTA_DSN the user set before install survives
+    uninstall, while cairn's own keys are removed."""
+    user_dsn = "postgresql://user-owned:secret@host/db"
+    claude_settings.write_text(json.dumps({"env": {"REGISTA_DSN": user_dsn}}))
+
+    # Install no-clobbers the user's REGISTA_DSN and writes the rest.
+    _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+    data = json.loads(claude_settings.read_text())
+    assert data["env"]["REGISTA_DSN"] == user_dsn  # untouched by install
+    assert data["env"]["CAIRN_PROJECT"] == cfg.project  # cairn wrote this
+
+    result = _uninstall_claude(
+        claude_settings,
+        json.loads(claude_settings.read_text()),
+        dry_run=False,
+        result=InstallResult(harness="claude"),
+        manifest=_load_manifest(),
+    )
+
+    data = json.loads(claude_settings.read_text())
+    assert data["env"]["REGISTA_DSN"] == user_dsn  # user's key preserved
+    assert "CAIRN_PROJECT" not in data["env"]  # cairn's key removed
+    assert not result.no_op
+    skip_actions = [a for a in result.actions if a.kind == "skip"]
+    assert any("REGISTA_DSN" in a.detail for a in skip_actions)
+
+
+def test_uninstall_claude_removes_all_owned_keys(cfg, claude_settings):
+    """With a tracked install and no user keys, uninstall clears the whole
+    cairn-owned env block (the realistic CLI flow loads the manifest)."""
+    _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+
+    _uninstall_claude(
+        claude_settings,
+        json.loads(claude_settings.read_text()),
+        dry_run=False,
+        result=InstallResult(harness="claude"),
+        manifest=_load_manifest(),
+    )
+
+    data = json.loads(claude_settings.read_text()) if claude_settings.exists() else {}
+    assert "env" not in data or not data.get("env")
+
+
+def test_uninstall_claude_legacy_no_manifest_falls_back_to_remove_all(
+    cfg, claude_settings
+):
+    """Pre-WI-029 installs have no ownership record; with no manifest to consult,
+    uninstall keeps its legacy remove-all behaviour rather than stranding wiring."""
+    _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+
+    _uninstall_claude(
+        claude_settings,
+        json.loads(claude_settings.read_text()),
+        dry_run=False,
+        result=InstallResult(harness="claude"),
+        manifest=None,  # simulate a caller that never loaded the manifest
+    )
+
+    data = json.loads(claude_settings.read_text()) if claude_settings.exists() else {}
+    assert "env" not in data or not data.get("env")
+
+
+def test_uninstall_opencode_preserves_user_set_env_var(cfg, tmp_path, monkeypatch):
+    """OpenCode uninstall honours the same ownership rule (WI-029)."""
+    path = tmp_path / "opencode.json"
+    monkeypatch.setenv("CAIRN_OPENCODE_CONFIG", str(path))
+    user_dsn = "postgresql://user-owned:secret@host/db"
+    path.write_text(json.dumps({"env": {"REGISTA_DSN": user_dsn}}))
+
+    _install_opencode(cfg, dry_run=False, uninstall=False, user=None)
+    data = json.loads(path.read_text())
+    assert data["env"]["REGISTA_DSN"] == user_dsn
+    assert data["env"]["CAIRN_ATTEST_ON_START"] == "1"  # cairn wrote this
+
+    _install_opencode(cfg, dry_run=False, uninstall=True, user=None)
+
+    data = json.loads(path.read_text())
+    assert data["env"]["REGISTA_DSN"] == user_dsn  # preserved
+    assert "CAIRN_ATTEST_ON_START" not in data["env"]  # cairn's key removed
+
+
+# ----------------------------------------------------------------------
 # _is_cairn_hook_entry — hash-based ownership (Plan 011 WI-3.1)
 # ----------------------------------------------------------------------
 

@@ -872,6 +872,9 @@ def _load_manifest() -> dict[str, Any]:
             for event, hashes in list(hh.items()):
                 if not isinstance(hashes, list):
                     del hh[event]
+            ek = install.get("env_keys")
+            if ek is not None and not isinstance(ek, list):
+                install["env_keys"] = []
         return data
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         pass
@@ -1019,6 +1022,56 @@ def _clear_manifest_event(
     """Remove all recorded hashes for *harness*+*event*."""
     install = manifest.get("installs", {}).get(harness, {})
     install.get("hook_hashes", {}).pop(event, None)
+
+
+# ------------------------------------------------------------------
+# Manifest — env-var ownership (WI-029)
+#
+# Install honours a no-clobber rule: a key the user already set is
+# left alone.  Uninstall must therefore remove only the keys cairn
+# actually wrote, not every key in ``_ENV_VARS`` — removing a user-set
+# REGISTA_DSN on uninstall is the data-loss bug WI-029 fixes.  Ownership
+# is recorded here, mirroring the hook-hash scheme above.
+# ------------------------------------------------------------------
+
+
+def _manifest_env_keys(
+    manifest: dict[str, Any] | None, harness: str
+) -> list[str] | None:
+    """Return the env keys cairn recorded as its own for *harness*.
+
+    ``None`` means ownership was never tracked (a pre-WI-029 install, or a
+    caller that did not load the manifest) — the uninstaller treats that as
+    "unknown" and falls back to its legacy behaviour rather than guessing.
+    """
+    if manifest is None:
+        return None
+    install = manifest.get("installs", {}).get(harness, {})
+    keys = install.get("env_keys")
+    if isinstance(keys, list):
+        return [k for k in keys if isinstance(k, str)]
+    return None
+
+
+def _record_manifest_env(
+    manifest: dict[str, Any], harness: str, key: str
+) -> None:
+    """Record that cairn wrote *key* into *harness*'s env block."""
+    installs = manifest.setdefault("installs", {})
+    install = installs.setdefault(harness, {})
+    keys = install.setdefault("env_keys", [])
+    if key not in keys:
+        keys.append(key)
+
+
+def _clear_manifest_env(
+    manifest: dict[str, Any], harness: str, key: str
+) -> None:
+    """Forget the ownership record for *key* once uninstall removes it."""
+    install = manifest.get("installs", {}).get(harness, {})
+    keys = install.get("env_keys")
+    if isinstance(keys, list) and key in keys:
+        keys.remove(key)
 
 
 def _is_cairn_hook_entry(
@@ -1216,6 +1269,7 @@ def _install_claude(
         if not current and val:
             env[key] = val
             changed = True
+            _record_manifest_env(manifest, "claude", key)
             result.actions.append(
                 InstallAction(
                     "merge_json",
@@ -1309,18 +1363,38 @@ def _uninstall_claude(
             if manifest is not None and not dry_run:
                 _clear_manifest_event(manifest, "claude", event)
 
+    # WI-029: remove only the env keys cairn actually wrote.  Ownership is
+    # tracked in the manifest (see _record_manifest_env); a key the user set
+    # before install — which the no-clobber rule left untouched — is not ours
+    # to delete.  When ownership was never tracked (pre-WI-029 install, or a
+    # caller that passed no manifest) we cannot tell ours from the user's, so
+    # we fall back to the legacy remove-all rather than strand cairn's wiring.
+    owned = _manifest_env_keys(manifest, "claude")
     for key in _ENV_VARS:
-        if key in env:
-            changed = True
+        if key not in env:
+            continue
+        if owned is not None and key not in owned:
             result.actions.append(
                 InstallAction(
-                    "merge_json",
+                    "skip",
                     str(path),
-                    f"remove {key}",
+                    f"{key} not written by cairn — keeping existing value",
                     keys=[f"env.{key}"],
                 )
             )
-            env.pop(key, None)
+            continue
+        changed = True
+        result.actions.append(
+            InstallAction(
+                "merge_json",
+                str(path),
+                f"remove {key}",
+                keys=[f"env.{key}"],
+            )
+        )
+        env.pop(key, None)
+        if manifest is not None and not dry_run:
+            _clear_manifest_env(manifest, "claude", key)
 
     if not result.actions:
         result.no_op = True
@@ -1512,8 +1586,15 @@ def _install_opencode(
         )
         return result
 
+    manifest = _load_manifest()
+
     if uninstall:
-        return _uninstall_opencode(path, data, dry_run=dry_run, result=result)
+        result = _uninstall_opencode(
+            path, data, dry_run=dry_run, result=result, manifest=manifest
+        )
+        if not dry_run and not result.no_op:
+            _save_manifest(manifest)
+        return result
 
     env = data.setdefault("env", {})
     if not isinstance(env, dict):
@@ -1545,6 +1626,7 @@ def _install_opencode(
         if not current and val:
             env[key] = val
             changed = True
+            _record_manifest_env(manifest, "opencode", key)
             result.actions.append(
                 InstallAction("merge_json", str(path), f"set {key}", keys=[f"env.{key}"])
             )
@@ -1590,6 +1672,7 @@ def _install_opencode(
         result.no_op = True
     elif not dry_run and changed:
         _save_json(path, data)
+        _save_manifest(manifest)
 
     return result
 
@@ -1600,19 +1683,34 @@ def _uninstall_opencode(
     *,
     dry_run: bool,
     result: InstallResult,
+    manifest: dict[str, Any] | None = None,
 ) -> InstallResult:
     env = data.get("env", {})
     if not isinstance(env, dict):
         env = {}
     changed = False
 
+    # WI-029: remove only cairn-owned env keys (see _uninstall_claude).
+    owned = _manifest_env_keys(manifest, "opencode")
     for key in _ENV_VARS:
-        if key in env:
-            changed = True
+        if key not in env:
+            continue
+        if owned is not None and key not in owned:
             result.actions.append(
-                InstallAction("merge_json", str(path), f"remove {key}", keys=[f"env.{key}"])
+                InstallAction(
+                    "skip", str(path),
+                    f"{key} not written by cairn — keeping existing value",
+                    keys=[f"env.{key}"],
+                )
             )
-            env.pop(key, None)
+            continue
+        changed = True
+        result.actions.append(
+            InstallAction("merge_json", str(path), f"remove {key}", keys=[f"env.{key}"])
+        )
+        env.pop(key, None)
+        if manifest is not None and not dry_run:
+            _clear_manifest_env(manifest, "opencode", key)
 
     plugin_path = _find_opencode_plugin()
     if plugin_path:
