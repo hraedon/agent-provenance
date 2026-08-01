@@ -2171,8 +2171,10 @@ def test_doctor_chain_integrity_drift_fails_and_exits_nonzero(
 def test_doctor_chain_integrity_error_fails_and_exits_nonzero(
     doctor_ready_cfg, monkeypatch, tmp_path
 ):
-    """Replay error: integrity exits 1 without recording; doctor reports the
-    honest never_run skip (WI-030 m4 — an exception is not a verdict)."""
+    """Replay error: integrity exits 1; doctor annotates the never-verified
+    store (WI-032) and warns honestly — a never-verified store whose replay
+    keeps failing must not look like a clean never_run skip forever. An
+    exception is still not a verdict (chain_ok stays None, doctor stays ok)."""
 
     class _FakeRegista:
         def __init__(self, **kwargs):
@@ -2192,7 +2194,7 @@ def test_doctor_chain_integrity_error_fails_and_exits_nonzero(
     report = _doctor_report(monkeypatch, doctor_ready_cfg)
 
     chain = _find_check(report, "chain_integrity")
-    assert chain["status"] == "skip"
+    assert chain["status"] == "warn"
     assert report["regista"]["chain_ok"] is None
     assert report["regista"]["chain_state"] == "never_run"
     assert report["ok"] is True

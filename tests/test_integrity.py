@@ -77,13 +77,7 @@ class _StubRegista:
     ) -> None:
         self.replay_called = False
         self.binding_requested: bool | None = None
-        self._report = replay_report or ReplayReport(
-            table_name="events",
-            replayed_ok=1,
-            replayed_drift=0,
-            halted=0,
-            principal_binding_verified=True,
-        )
+        self._report = replay_report
         self._exc = replay_exc
         self._delay = replay_delay
 
@@ -97,6 +91,14 @@ class _StubRegista:
             time.sleep(self._delay)
         if self._exc is not None:
             raise self._exc
+        if self._report is None:
+            self._report = ReplayReport(
+                table_name="events",
+                replayed_ok=1,
+                replayed_drift=0,
+                halted=0,
+                principal_binding_verified=True,
+            )
         return self._report
 
     def close(self) -> None:
@@ -263,11 +265,18 @@ def test_integrity_replay_error_with_no_prior_verdict_leaves_never_run(
     _patch_regista(monkeypatch, cfg, stub)
     assert run_integrity(json_output=True) == 1
     capsys.readouterr()
-    assert not _integrity_verdict_path(cfg).exists()
+
+    # WI-032: a never-verified store whose scheduled replay keeps failing is
+    # annotated with a chain_state-less marker (``last_attempt`` only), so
+    # doctor can warn instead of showing a green ``never_run`` skip forever.
+    # The marker exists but carries no verdict — an exception is not a verdict.
+    marker = json.loads(_integrity_verdict_path(cfg).read_text())
+    assert "chain_state" not in marker
+    assert marker["last_attempt"]["chain_state"] == "error"
 
     run_doctor(json_output=True)
     report = _doctor_report(capsys)
-    assert _find_check(report, "chain_integrity")["status"] == "skip"
+    assert _find_check(report, "chain_integrity")["status"] == "warn"
     assert report["regista"]["chain_state"] == "never_run"
 
 
