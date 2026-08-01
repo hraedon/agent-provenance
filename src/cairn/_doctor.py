@@ -1058,7 +1058,11 @@ def _record_failed_attempt(cfg: Any, state: str) -> None:
     except Exception as exc:
         # Persistently failing annotation (e.g. broken marker-dir perms) must
         # not be invisible (WI-031 r3) — but never mask the caller's exit code.
-        print(f"cairn: WARNING: could not record integrity attempt: {exc}", file=sys.stderr)
+        print(
+            f"cairn: WARNING: could not record integrity attempt: "
+            f"{type(exc).__name__}",
+            file=sys.stderr,
+        )
         return
 
 
@@ -1110,9 +1114,15 @@ def _store_mac_key(cfg: Any) -> bytes | None:
     try:
         from regista._secrets import resolve as resolve_secret
 
+        def _to_bytes(raw: object) -> bytes | None:
+            if isinstance(raw, bytes):
+                return raw
+            if isinstance(raw, str):
+                return raw.encode()
+            return None
+
         if cfg.key_ref:
-            raw = resolve_secret(cfg.key_ref)
-            return raw if isinstance(raw, bytes) else None
+            return _to_bytes(resolve_secret(cfg.key_ref))
         if cfg.key_path:
             data = json.loads(Path(cfg.key_path).read_text())
             keys = data.get("keys") if isinstance(data, dict) else None
@@ -1120,8 +1130,7 @@ def _store_mac_key(cfg: Any) -> bytes | None:
                 key = keys[0]
                 ref = key.get("secret_ref")
                 if isinstance(ref, str) and ref:
-                    raw = resolve_secret(ref)
-                    return raw if isinstance(raw, bytes) else None
+                    return _to_bytes(resolve_secret(ref))
                 secret = key.get("secret")
                 if isinstance(secret, str) and secret:
                     return secret.encode()
@@ -1146,18 +1155,23 @@ def _compute_verdict_mac(cfg: Any, body: dict[str, Any]) -> str | None:
 
 
 def _verdict_mac_state(cfg: Any, verdict: dict[str, Any]) -> str:
-    """Classify a marker's MAC: ``valid``, ``invalid``, ``unkeyed``, ``legacy``.
+    """Classify a marker's MAC: ``valid``, ``invalid``, ``unkeyed``, ``stripped``, ``legacy``.
 
     * ``valid``    — a MAC is present and matches the body under the store key.
     * ``invalid``  — a MAC is present but does not match (tampered, or the store
                      key changed since it was written).
     * ``unkeyed``  — a MAC is present but no store key can be resolved now, so it
                      cannot be checked. Not trusted.
-    * ``legacy``   — no MAC field (a pre-WI-031 marker). Tolerated as unverified.
+    * ``stripped`` — no MAC field but a store key CAN be resolved: the MAC was
+                     never written or was deleted (WI-031 fail-open). Not trusted.
+    * ``legacy``   — no MAC field and no store key resolvable (a pre-WI-031
+                     marker, or a store with no key configured). Tolerated.
     """
     stored = verdict.get("mac")
     if not isinstance(stored, str) or not stored:
-        return "legacy"
+        if _store_mac_key(cfg) is None:
+            return "legacy"
+        return "stripped"
     key = _store_mac_key(cfg)
     if key is None:
         return "unkeyed"
@@ -1252,12 +1266,50 @@ def _check_chain_integrity(cfg: Any) -> tuple[dict[str, Any], str | None, bool |
             None,
         )
 
+    # WI-032: a chain_state-less marker holds only ``last_attempt`` — a store that
+    # was never verified but whose scheduled replay keeps failing. Without this it
+    # would show a green ``never_run`` skip forever. Report it honestly as a warn.
+    # Recognized BEFORE the MAC check: the marker is intentionally MAC-less (an
+    # attempt annotation, not a verdict), so it must never be mistaken for a
+    # stripped verdict below.
+    if "chain_state" not in verdict:
+        if verdict.get("store_binding") != _store_binding(cfg):
+            return (
+                {
+                    "name": "chain_integrity",
+                    "status": "skip",
+                    "detail": (
+                        "recorded attempt marker is for a different store or "
+                        "project; run `cairn integrity` against this configuration"
+                    ),
+                },
+                "unbound",
+                None,
+            )
+        attempt = verdict.get("last_attempt")
+        attempt_at = attempt.get("checked_at") if isinstance(attempt, dict) else None
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "warn",
+                "detail": (
+                    "store was never verified, and the most recent replay attempt "
+                    f"({attempt_at or 'unknown time'}) failed — run "
+                    "`cairn integrity` and investigate the failure"
+                ),
+            },
+            "never_run",
+            None,
+        )
+
     # WI-031: the marker is operator-trusted plain JSON; its MAC is what keeps a
     # same-host writer from flipping drift->verified. A marker that carries a MAC
     # which does not verify is never trusted: a mismatch is reported as a fail
-    # (tampering, or the store key rotated), and a MAC cairn cannot check for
-    # want of a key is reported as unverified. A marker with NO mac field is a
-    # pre-WI-031 (legacy) marker and is tolerated, evaluated on its chain_state.
+    # (tampering, or the store key rotated), a MAC cairn cannot check for want of
+    # a key is reported as unverified, and a verdict marker with NO mac field
+    # while a store key IS configured was stripped (or never written) and is
+    # reported as unverified rather than trusted. Only a marker with no mac field
+    # AND no resolvable key (pre-WI-031, or an un-keyed store) is tolerated.
     mac_state = _verdict_mac_state(cfg, verdict)
     if mac_state == "invalid":
         return (
@@ -1288,37 +1340,19 @@ def _check_chain_integrity(cfg: Any) -> tuple[dict[str, Any], str | None, bool |
             "unverified_marker",
             None,
         )
-
-    # WI-032: a chain_state-less marker holds only ``last_attempt`` — a store that
-    # was never verified but whose scheduled replay keeps failing. Without this it
-    # would show a green ``never_run`` skip forever. Report it honestly as a warn.
-    if "chain_state" not in verdict:
-        if verdict.get("store_binding") != _store_binding(cfg):
-            return (
-                {
-                    "name": "chain_integrity",
-                    "status": "skip",
-                    "detail": (
-                        "recorded attempt marker is for a different store or "
-                        "project; run `cairn integrity` against this configuration"
-                    ),
-                },
-                "unbound",
-                None,
-            )
-        attempt = verdict.get("last_attempt")
-        attempt_at = attempt.get("checked_at") if isinstance(attempt, dict) else None
+    if mac_state == "stripped":
         return (
             {
                 "name": "chain_integrity",
                 "status": "warn",
                 "detail": (
-                    "store was never verified, and the most recent replay attempt "
-                    f"({attempt_at or 'unknown time'}) failed — run "
-                    "`cairn integrity` and investigate the failure"
+                    "integrity verdict marker carries no MAC but a store key is "
+                    "configured — the MAC was stripped or never written; treating "
+                    "the verdict as unverified. Re-run `cairn integrity` to record "
+                    "a MAC'd verdict (WI-031)"
                 ),
             },
-            "never_run",
+            "unverified_marker",
             None,
         )
 

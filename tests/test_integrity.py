@@ -976,8 +976,9 @@ def test_verdict_mac_state_classifications(keyed_cfg, cfg, monkeypatch):
     mac = _compute_verdict_mac(keyed_cfg, body)
     assert mac is not None
 
-    # legacy: no mac field
-    assert _verdict_mac_state(keyed_cfg, dict(body)) == "legacy"
+    # stripped: no mac field but a store key IS resolvable (WI-031 fail-open fix
+    # — a same-host writer deleting the mac no longer earns silent trust)
+    assert _verdict_mac_state(keyed_cfg, dict(body)) == "stripped"
     # valid: mac matches
     assert _verdict_mac_state(keyed_cfg, dict(body, mac=mac)) == "valid"
     # invalid: body tampered, mac stale
@@ -985,6 +986,8 @@ def test_verdict_mac_state_classifications(keyed_cfg, cfg, monkeypatch):
     # unkeyed: mac present but no key to check it
     monkeypatch.delenv("CAIRN_TEST_SECRET", raising=False)
     assert _verdict_mac_state(cfg, dict(body, mac=mac)) == "unkeyed"
+    # legacy: no mac field AND no key resolvable (pre-WI-031 / un-keyed store)
+    assert _verdict_mac_state(cfg, dict(body)) == "legacy"
 
 
 def test_doctor_accepts_a_valid_mac(keyed_cfg):
@@ -1034,6 +1037,19 @@ def test_doctor_tolerates_a_legacy_unmacd_marker(cfg, monkeypatch):
     assert check["status"] == "ok"
     assert chain_state == "verified"
     assert chain_ok is True
+
+
+def test_doctor_warns_on_a_stripped_mac_when_a_key_is_configured(keyed_cfg):
+    """WI-031 fail-open fix: with a store key configured, a verdict marker whose
+    MAC field was deleted (or never written) must NOT be silently trusted — a
+    same-host writer stripping the mac to flip drift->verified is caught."""
+    _write_raw_verdict(keyed_cfg, _fresh_verified_body(keyed_cfg))  # no mac field
+
+    check, chain_state, chain_ok = _check_chain_integrity(keyed_cfg)
+    assert check["status"] == "warn"
+    assert chain_state == "unverified_marker"
+    assert chain_ok is None
+    assert "MAC" in check["detail"]
 
 
 def _patch_regista_no_replay(monkeypatch, cfg) -> None:
