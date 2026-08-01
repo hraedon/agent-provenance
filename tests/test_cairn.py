@@ -5699,6 +5699,192 @@ def test_bc016_export_hex_encodes_witness_public_key(tmp_path: Path) -> None:
 
 
 # ----------------------------------------------------------------------
+# BC-016: honest UNVERIFIED-witness state (design note in
+# docs/witness-signature-verification.md). A receipt cairn cannot verify must
+# never be silently treated as confirmed.
+# ----------------------------------------------------------------------
+
+
+def _bc016_signed_event() -> tuple[uuid.UUID, bytes, bytes, bytes]:
+    """A signed event: returns (event_id, envelope, canonical_hash, signature)."""
+    from regista._signing import sign_event
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    ev_id = uuid.uuid4()
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=datetime.now(UTC),
+        transition="tool_call",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+    return ev_id, env, c_hash, sig
+
+
+def test_bc016_wrong_public_key_fails_verification(tmp_path: Path) -> None:
+    """A valid signature checked against the WRONG witness key is a failure."""
+    import nacl.signing
+
+    key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+
+    signing_sk = nacl.signing.SigningKey.generate()
+    wrong_sk = nacl.signing.SigningKey.generate()
+    witness_sig = signing_sk.sign(env).signature  # signed by signing_sk...
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=str(uuid.uuid4()),
+        witness_pubkey_hex=wrong_sk.verify_key.encode().hex(),  # ...verified vs wrong_sk
+        witness_sig_hex=witness_sig.hex(),
+    )
+    report = Verifier(key_set).verify_bundle(_finalize_bundle(bundle, tmp_path))
+    assert report.witness_receipts[0].signature_valid is False
+    assert report.witness_receipts[0].unverified is False  # proven bad, not "unchecked"
+    assert report.witness_signature_failures == 1
+    assert not report.all_ok
+
+
+def test_bc016_tampered_event_invalidates_witness_signature(tmp_path: Path) -> None:
+    """A witness signature over the original envelope fails once the event
+    envelope in the bundle is tampered — the receipt is bound to the bytes."""
+    import nacl.signing
+
+    key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_sig = witness_sk.sign(env).signature  # valid over the REAL envelope
+
+    # Build the bundle, then tamper the stored event envelope.
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=str(uuid.uuid4()),
+        witness_pubkey_hex=witness_sk.verify_key.encode().hex(),
+        witness_sig_hex=witness_sig.hex(),
+    )
+    tampered_env = bytearray(env)
+    tampered_env[-1] ^= 0xFF
+    bundle["events"][0]["canonical_envelope"] = bytes(tampered_env).hex()
+
+    report = Verifier(key_set).verify_bundle(_finalize_bundle(bundle, tmp_path))
+    receipt = report.witness_receipts[0]
+    assert receipt.signature_valid is False
+    assert not report.all_ok
+
+
+def test_bc016_unsupported_witness_type_is_honest_unverified(tmp_path: Path) -> None:
+    """A receipt with a signature whose key scheme cairn cannot verify is
+    UNVERIFIED — not confirmed, not coverage, and the verdict reflects it."""
+    import nacl.signing
+
+    key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_sig = witness_sk.sign(env).signature
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=str(uuid.uuid4()),
+        witness_pubkey_hex=witness_sk.verify_key.encode().hex(),
+        witness_sig_hex=witness_sig.hex(),
+        key_scheme="rsa-pkcs1",  # a scheme cairn has no verifier for
+    )
+    report = Verifier(key_set).verify_bundle(_finalize_bundle(bundle, tmp_path))
+
+    receipt = report.witness_receipts[0]
+    assert receipt.signature_valid is None  # NOT verified...
+    assert receipt.unverified is True       # ...and honestly flagged
+    assert "UNVERIFIED" in (receipt.verification_detail or "")
+    # Excluded from coverage: the active witness is now "missing".
+    assert len(report.witness_coverage_violations) == 1
+    assert report.unverified_witness_receipts == 1
+    # The verdict must not claim success while a witness is unverified.
+    assert not report.all_ok
+
+
+def test_bc016_unset_witness_scheme_with_signature_is_unverified(tmp_path: Path) -> None:
+    """A receipt carrying a signature but no declared key scheme is the original
+    BC-016 hole: it must be UNVERIFIED, never silently confirmed."""
+    import nacl.signing
+
+    key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_sig = witness_sk.sign(env).signature
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=str(uuid.uuid4()),
+        witness_pubkey_hex=None,
+        witness_sig_hex=witness_sig.hex(),
+        key_scheme=None,  # no scheme declared at all
+    )
+    report = Verifier(key_set).verify_bundle(_finalize_bundle(bundle, tmp_path))
+
+    receipt = report.witness_receipts[0]
+    assert receipt.signature_valid is None
+    assert receipt.unverified is True
+    assert not report.all_ok
+
+
+def test_bc016_hmac_witness_is_delegated_and_counts_as_coverage(tmp_path: Path) -> None:
+    """An HMAC witness is authenticated by regista's delivery layer: cairn labels
+    it delegated (not unverified) and it still satisfies coverage."""
+    key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=str(uuid.uuid4()),
+        witness_pubkey_hex=None,
+        witness_sig_hex="ab" * 32,  # an HMAC tag cairn cannot re-check
+        key_scheme="hmac-sha256",
+    )
+    report = Verifier(key_set).verify_bundle(_finalize_bundle(bundle, tmp_path))
+
+    receipt = report.witness_receipts[0]
+    assert receipt.signature_valid is None
+    assert receipt.unverified is False  # delegated, NOT unverified
+    assert "delegated" in (receipt.verification_detail or "").lower() or \
+        "hmac" in (receipt.verification_detail or "").lower()
+    assert report.unverified_witness_receipts == 0
+    assert len(report.witness_coverage_violations) == 0  # HMAC counts as coverage
+    assert report.all_ok
+
+
+def test_bc016_unverified_state_surfaces_in_json_report(tmp_path: Path) -> None:
+    """The JSON report carries the per-receipt unverified flag and the count."""
+    import nacl.signing
+
+    key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_sig = witness_sk.sign(env).signature
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=str(uuid.uuid4()),
+        witness_pubkey_hex=witness_sk.verify_key.encode().hex(),
+        witness_sig_hex=witness_sig.hex(),
+        key_scheme="rsa-pkcs1",
+    )
+    report = Verifier(key_set).verify_bundle(_finalize_bundle(bundle, tmp_path))
+    data = Verifier.format_report_json(report)
+    assert data["unverified_witness_receipts"] == 1
+    assert data["witness_receipts"][0]["unverified"] is True
+    assert data["witness_receipts"][0]["signature_valid"] is None
+
+
+# ----------------------------------------------------------------------
 # Plan 027: Review assurance level computation
 # ----------------------------------------------------------------------
 

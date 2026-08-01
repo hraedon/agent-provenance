@@ -1132,7 +1132,6 @@ class Verifier:
             if reg.key_scheme:
                 scheme_by_witness[reg.witness_id] = reg.key_scheme
 
-        has_any_keys = bool(self._witness_keys)
         updated_receipts: list[WitnessReceiptEntry] = []
 
         for receipt in report.witness_receipts:
@@ -1145,36 +1144,31 @@ class Verifier:
                 key_scheme is None and wid in self._witness_keys
             )
 
+            sig_valid: bool | None
+            detail: str
             if needs_ed25519:
                 pub_key = self._witness_keys.get(wid)
                 sig_bytes = self._witness_sig_cache.get((ev_id, wid))
 
                 if pub_key is None:
-                    updated_receipts.append(replace(
-                        receipt,
-                        signature_valid=None,
-                        verification_detail=(
-                            "Witness uses Ed25519 but no public key "
-                            "available — signature NOT verified"
-                        ),
-                    ))
+                    sig_valid = None
+                    detail = (
+                        "UNVERIFIED: witness uses Ed25519 but no public key is "
+                        "available — signature NOT checked"
+                    )
                 elif sig_bytes is None:
-                    updated_receipts.append(replace(
-                        receipt,
-                        signature_valid=False,
-                        verification_detail="Missing witness signature",
-                    ))
+                    # An Ed25519 witness must sign; a missing signature is a
+                    # definite failure, not merely "unverified".
+                    sig_valid = False
+                    detail = "Missing witness signature"
                 else:
                     envelope = env_by_event.get(ev_id)
                     if envelope is None:
-                        updated_receipts.append(replace(
-                            receipt,
-                            signature_valid=None,
-                            verification_detail=(
-                                "Event canonical envelope not available "
-                                "in bundle — cannot verify"
-                            ),
-                        ))
+                        sig_valid = None
+                        detail = (
+                            "UNVERIFIED: event canonical envelope not available "
+                            "in bundle — cannot verify witness signature"
+                        )
                     else:
                         try:
                             from regista._signing_scheme import Ed25519Scheme
@@ -1184,52 +1178,73 @@ class Verifier:
                                 hashlib.sha256(envelope).digest(),
                                 pub_key,
                             )
-                            updated_receipts.append(replace(
-                                receipt,
-                                signature_valid=verified,
-                                verification_detail=(
-                                    "Ed25519 signature verified"
-                                    if verified
-                                    else "Ed25519 signature verification FAILED"
-                                ),
-                            ))
+                            sig_valid = verified
+                            detail = (
+                                "Ed25519 signature verified"
+                                if verified
+                                else "Ed25519 signature verification FAILED"
+                            )
                         except Exception as exc:
-                            updated_receipts.append(replace(
-                                receipt,
-                                signature_valid=False,
-                                verification_detail=f"Verification error: {exc}",
-                            ))
+                            sig_valid = False
+                            detail = f"Verification error: {type(exc).__name__}"
+            elif key_scheme == "hmac-sha256":
+                # Delegated trust: regista's delivery layer authenticated the
+                # HMAC receipt. cairn holds no HMAC key to re-check (holding it
+                # would put a shared secret in the verifier), so this is reported
+                # honestly as delegated, NOT as an independent verification — and
+                # it is NOT marked unverified. See docs/witness-signature-verification.md.
+                sig_valid = None
+                detail = (
+                    "HMAC witness — authenticated by regista's delivery layer; "
+                    "not independently re-verified by cairn"
+                )
             else:
-                # HMAC witness or legacy — no signature verification needed
-                updated_receipts.append(replace(
-                    receipt,
-                    signature_valid=None,
-                    verification_detail=(
-                        "HMAC witness — signature not checked"
-                        if key_scheme == "hmac-sha256"
-                        else "No key scheme — signature not checked"
-                    ),
-                ))
+                # Unknown / unsupported key scheme. cairn has no rule to verify
+                # it. BC-016: a signature cairn cannot verify is UNVERIFIED, never
+                # silently confirmed. (A receipt with no signature at all is a
+                # legacy receipt with nothing to check — not unverified.)
+                sig_valid = None
+                if receipt.has_signature:
+                    detail = (
+                        f"UNVERIFIED: witness key scheme "
+                        f"{key_scheme or '(unset)'} is not one cairn can verify "
+                        "(ed25519, hmac-sha256) — signature present but NOT checked"
+                    )
+                else:
+                    detail = "No witness signature present — nothing to verify"
+
+            # A receipt is "unverified" when it carries a signature cairn did not
+            # successfully verify and that is not an HMAC delegation (BC-016).
+            unverified = (
+                receipt.has_signature
+                and sig_valid is None
+                and key_scheme != "hmac-sha256"
+            )
+            updated_receipts.append(replace(
+                receipt,
+                signature_valid=sig_valid,
+                verification_detail=detail,
+                unverified=unverified,
+            ))
 
         report.witness_receipts = updated_receipts
 
-        if has_any_keys:
-            failed = sum(1 for r in updated_receipts if r.signature_valid is False)
-            if failed:
-                log.warning(
-                    "cairn.witness_signature_failed",
-                    failed_count=failed,
-                    total_receipts=len(updated_receipts),
-                )
-        else:
-            sig_receipts = sum(1 for r in updated_receipts if r.has_signature)
-            if sig_receipts:
-                log.warning(
-                    "cairn.witness_signatures_not_checked",
-                    signed_receipts=sig_receipts,
-                    note="No witness public keys provided — "
-                    "receipt signatures not verified",
-                )
+        failed = sum(1 for r in updated_receipts if r.signature_valid is False)
+        if failed:
+            log.warning(
+                "cairn.witness_signature_failed",
+                failed_count=failed,
+                total_receipts=len(updated_receipts),
+            )
+        unverified_count = sum(1 for r in updated_receipts if r.unverified)
+        if unverified_count:
+            log.warning(
+                "cairn.witness_signatures_unverified",
+                unverified_count=unverified_count,
+                total_receipts=len(updated_receipts),
+                note="receipt signatures present but not verified — "
+                "witness corroboration is NOT established (BC-016)",
+            )
 
     def _check_witness_coverage(
         self, events: list[Event], report: VerificationReport
@@ -1259,13 +1274,17 @@ class Verifier:
 
         # Build lookup: event_id → set of witness_ids with confirmed receipts.
         # A receipt counts as confirmed only if its signature was verified
-        # (signature_valid is True).  For HMAC witnesses, signature_valid is
-        # None (not checked) and the receipt still counts — regista's delivery
-        # layer already verified HMAC.  For Ed25519 witnesses, None means the
-        # public key was unavailable, so the receipt does NOT count.
+        # (signature_valid is True), or it is an HMAC witness whose receipt
+        # regista's delivery layer already authenticated (signature_valid None,
+        # scheme hmac-sha256 — delegated trust).  Every other unverified receipt
+        # is excluded (BC-016): a forged signature (False), an Ed25519 receipt
+        # with no public key (None + ed25519), and any receipt carrying a
+        # signature cairn could not verify (``unverified``) are NOT coverage.
         receipts_by_event: dict[str, set[str]] = {}
         for r in report.witness_receipts:
             if r.signature_valid is False:
+                continue
+            if r.unverified:
                 continue
             wid_scheme = scheme_by_witness.get(r.witness_id)
             if r.signature_valid is None and wid_scheme == "ed25519":
