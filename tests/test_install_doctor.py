@@ -289,6 +289,28 @@ def test_uninstall_opencode_preserves_user_set_env_var(cfg, tmp_path, monkeypatc
     assert "CAIRN_ATTEST_ON_START" not in data["env"]  # cairn's key removed
 
 
+def test_load_manifest_carries_env_keys_from_a_corrupt_value(tmp_path: Path):
+    """A manifest whose ``env_keys`` is the wrong shape (here a JSON object
+    instead of a list) must not lose every recorded ownership key by resetting
+    to ``[]`` — that would make cairn forget it owned the keys and strand its
+    wiring on uninstall.  Salvage the valid string keys so ownership carries
+    forward (env_keys: [] seeding)."""
+    manifest_path = tmp_path / "manifest.json"
+    os.environ["CAIRN_MANIFEST_PATH"] = str(manifest_path)
+    manifest_path.write_text(json.dumps({
+        "version": 1,
+        "installs": {
+            "claude": {
+                "env_keys": {"REGISTA_DSN": True, "CAIRN_PROJECT": 1},
+                "hook_hashes": {},
+            }
+        },
+    }))
+
+    loaded = _load_manifest()
+    assert loaded["installs"]["claude"]["env_keys"] == ["REGISTA_DSN", "CAIRN_PROJECT"]
+
+
 # ----------------------------------------------------------------------
 # _is_cairn_hook_entry — hash-based ownership (Plan 011 WI-3.1)
 # ----------------------------------------------------------------------

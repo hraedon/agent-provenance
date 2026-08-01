@@ -874,7 +874,10 @@ def _load_manifest() -> dict[str, Any]:
                     del hh[event]
             ek = install.get("env_keys")
             if ek is not None and not isinstance(ek, list):
-                install["env_keys"] = []
+                install["env_keys"] = [
+                    k for k in (ek.keys() if isinstance(ek, dict) else (ek,))
+                    if isinstance(k, str)
+                ]
         return data
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         pass
