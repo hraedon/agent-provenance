@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import uuid
@@ -393,6 +394,90 @@ def test_encrypt_content_fields_refuses_to_return_plaintext(monkeypatch):
     with pytest.raises(ContentEncryptionUnavailableError) as excinfo:
         encrypt_content_fields(payload)
     assert "withheld rather than stored in plaintext" in str(excinfo.value)
+
+
+# ----------------------------------------------------------------------
+# WI-040: resolving is not USING — the verdict must exercise the cipher.
+# The day WI-037 shipped, this estate reported "key resolves" while every
+# capture raised: cryptography absent from the venv, then key material the
+# algorithm rejected (regista WI-231). One probe catches both and any
+# future scheme mismatch.
+# ----------------------------------------------------------------------
+
+
+def test_status_unusable_when_the_key_resolves_but_cannot_key_the_cipher(
+    monkeypatch, tmp_path
+):
+    """The exact WI-040 shape: resolve succeeds, encryption cannot run.
+
+    A key file holding material of the wrong size for AES-256-GCM resolves
+    fine — the pre-fix check called that usable, and capture then raised on
+    every event.
+    """
+    from cairn._content_crypto import content_encryption_status
+
+    bad_key = tmp_path / "content.key"
+    bad_key.write_bytes(b"x" * 40)  # resolves; no reading of it yields 32 bytes
+    monkeypatch.setenv("CAIRN_CONTENT_KEY_REF", f"file:{bad_key}")
+
+    status = content_encryption_status()
+    assert status.configured is True
+    assert status.usable is False
+    assert "resolves, but" in status.detail
+    assert status.recorded_stance == CONTENT_ENCRYPTION_OFF
+
+
+def test_status_usable_only_after_a_cipher_round_trip(monkeypatch, content_key):
+    from cairn._content_crypto import content_encryption_status
+
+    monkeypatch.setenv("CAIRN_CONTENT_KEY_REF", content_key)
+    status = content_encryption_status()
+    assert status.usable is True
+    assert "encrypts" in status.detail
+
+
+def test_verify_content_key_catches_a_missing_cipher(monkeypatch, content_key):
+    """cryptography absent from cairn's OWN venv was the first WI-040 cause.
+
+    cairn now depends on regista-hraedon[encryption], so the real import
+    cannot be made to fail here; simulate the failure regista raises when the
+    cipher is not importable and assert it is a verdict, not a green check.
+    """
+    import regista._encryption
+
+    from cairn._content_crypto import verify_content_key
+
+    def _no_cipher(*args, **kwargs):
+        raise RuntimeError(
+            "Encryption scheme 'aes-256-gcm' requires the 'cryptography' package"
+        )
+
+    monkeypatch.setattr(regista._encryption, "encrypt_fields", _no_cipher)
+    ok, detail = verify_content_key(content_key)
+    assert ok is False
+    assert "cannot encrypt" in detail
+    assert "cryptography" in detail
+
+
+def test_the_estates_base64url_key_is_usable(monkeypatch, tmp_path):
+    """The estate's real key shape: 43 chars of base64url decoding to 32 bytes.
+
+    Needs regista's WI-231 key-encoding contract; until SUITE.lock pins a
+    release that has it, this documents the target rather than gating CI.
+    """
+    import regista._encryption
+
+    if not hasattr(regista._encryption, "decode_key_material"):
+        pytest.skip("regista without WI-231 key-encoding contract")
+
+    from cairn._content_crypto import content_encryption_status
+
+    key_file = tmp_path / "content.key"
+    key_file.write_bytes(base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"="))
+    monkeypatch.setenv("CAIRN_CONTENT_KEY_REF", f"file:{key_file}")
+
+    status = content_encryption_status()
+    assert status.usable is True, status.detail
 
 
 def test_withhold_content_fields_keeps_digests_and_records_the_reason():

@@ -1402,7 +1402,7 @@ def _check_content_encryption(cfg: Any) -> dict[str, Any]:
     return {
         "name": "content_encryption",
         "status": "ok",
-        "detail": f"Content encryption ON (key {key_ref} resolves)",
+        "detail": f"Content encryption ON (key {key_ref} {status.detail})",
     }
 
 
