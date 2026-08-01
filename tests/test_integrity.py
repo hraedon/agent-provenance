@@ -24,8 +24,13 @@ import cairn._doctor as doctor_mod
 from cairn._config import CairnEnvConfig, resolve_config
 from cairn._doctor import (
     _check_chain_integrity,
+    _compute_verdict_mac,
     _integrity_verdict_path,
+    _load_integrity_verdict,
+    _record_failed_attempt,
     _store_binding,
+    _store_mac_key,
+    _verdict_mac_state,
     run_doctor,
     run_integrity,
 )
@@ -887,3 +892,240 @@ def test_integrity_rejects_an_unattributable_postgres_chain(
     assert check["status"] == "fail", report
     assert report["regista"]["chain_ok"] is False
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Verdict-marker MAC (WI-031) + never-verified failed-attempt marker (WI-032)
+#
+# These tests exercise the marker hardening directly (helpers + doctor's read
+# path) and via run_integrity with _verify_chain stubbed, so they do NOT depend
+# on regista 0.5.4's ReplayReport shape (the pre-existing WI-057 drift that
+# breaks the stub-based tests above).
+# ---------------------------------------------------------------------------
+
+MAC_SECRET = "cairn-mac-test-secret"
+
+
+@pytest.fixture
+def keyed_cfg(cfg, monkeypatch):
+    """A cfg whose store MAC key actually resolves (the key file's secret_ref
+    points at CAIRN_TEST_SECRET, so set it)."""
+    monkeypatch.setenv("CAIRN_TEST_SECRET", MAC_SECRET)
+    return cfg
+
+
+def _write_raw_verdict(cfg, body: dict) -> None:
+    path = _integrity_verdict_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body))
+
+
+def _fresh_verified_body(cfg, **over) -> dict:
+    body = {
+        "checked_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "chain_state": "verified",
+        "chain_ok": True,
+        "store_binding": _store_binding(cfg),
+        "principal_binding_verified": True,
+        "principal_binding_failures": 0,
+    }
+    body.update(over)
+    return body
+
+
+def test_store_mac_key_resolves_from_key_path_secret_ref(keyed_cfg):
+    assert _store_mac_key(keyed_cfg) == MAC_SECRET.encode()
+
+
+def test_store_mac_key_is_none_when_unresolvable(cfg, monkeypatch):
+    monkeypatch.delenv("CAIRN_TEST_SECRET", raising=False)
+    assert _store_mac_key(cfg) is None
+
+
+def test_compute_verdict_mac_is_deterministic_and_body_sensitive(keyed_cfg):
+    body = _fresh_verified_body(keyed_cfg)
+    mac1 = _compute_verdict_mac(keyed_cfg, body)
+    mac2 = _compute_verdict_mac(keyed_cfg, dict(body))
+    assert mac1 is not None
+    assert mac1 == mac2  # deterministic
+    assert mac1.startswith("hmac-sha256:")
+    # The MAC field itself is excluded, so adding it does not change the MAC.
+    with_mac = dict(body, mac=mac1)
+    assert _compute_verdict_mac(keyed_cfg, with_mac) == mac1
+    # Any field change invalidates it.
+    tampered = dict(body, chain_state="drift")
+    assert _compute_verdict_mac(keyed_cfg, tampered) != mac1
+
+
+def test_compute_verdict_mac_is_none_without_a_key(cfg, monkeypatch):
+    monkeypatch.delenv("CAIRN_TEST_SECRET", raising=False)
+    assert _compute_verdict_mac(cfg, _fresh_verified_body(cfg)) is None
+
+
+def test_verdict_mac_state_classifications(keyed_cfg, cfg, monkeypatch):
+    body = _fresh_verified_body(keyed_cfg)
+    mac = _compute_verdict_mac(keyed_cfg, body)
+    assert mac is not None
+
+    # legacy: no mac field
+    assert _verdict_mac_state(keyed_cfg, dict(body)) == "legacy"
+    # valid: mac matches
+    assert _verdict_mac_state(keyed_cfg, dict(body, mac=mac)) == "valid"
+    # invalid: body tampered, mac stale
+    assert _verdict_mac_state(keyed_cfg, dict(body, chain_state="drift", mac=mac)) == "invalid"
+    # unkeyed: mac present but no key to check it
+    monkeypatch.delenv("CAIRN_TEST_SECRET", raising=False)
+    assert _verdict_mac_state(cfg, dict(body, mac=mac)) == "unkeyed"
+
+
+def test_doctor_accepts_a_valid_mac(keyed_cfg):
+    body = _fresh_verified_body(keyed_cfg)
+    body["mac"] = _compute_verdict_mac(keyed_cfg, body)
+    _write_raw_verdict(keyed_cfg, body)
+
+    check, chain_state, chain_ok = _check_chain_integrity(keyed_cfg)
+    assert check["status"] == "ok"
+    assert chain_state == "verified"
+    assert chain_ok is True
+
+
+def test_doctor_rejects_a_tampered_verdict_marker(keyed_cfg):
+    """A drift verdict re-labelled 'verified' without the key must fail closed."""
+    body = _fresh_verified_body(keyed_cfg, chain_state="drift", chain_ok=False)
+    body["mac"] = _compute_verdict_mac(keyed_cfg, body)  # MAC over the drift body
+    body["chain_state"] = "verified"  # forge a green verdict
+    body["chain_ok"] = True
+    _write_raw_verdict(keyed_cfg, body)
+
+    check, chain_state, chain_ok = _check_chain_integrity(keyed_cfg)
+    assert check["status"] == "fail"
+    assert chain_state == "tampered"
+    assert chain_ok is False
+    assert "MAC" in check["detail"]
+
+
+def test_doctor_treats_an_unkeyed_mac_as_unverified(cfg, keyed_cfg, monkeypatch):
+    body = _fresh_verified_body(keyed_cfg)
+    body["mac"] = _compute_verdict_mac(keyed_cfg, body)
+    _write_raw_verdict(cfg, body)
+    monkeypatch.delenv("CAIRN_TEST_SECRET", raising=False)  # key now unavailable
+
+    check, chain_state, chain_ok = _check_chain_integrity(cfg)
+    assert check["status"] == "warn"
+    assert chain_state == "unverified_marker"
+    assert chain_ok is None
+
+
+def test_doctor_tolerates_a_legacy_unmacd_marker(cfg, monkeypatch):
+    """Pre-WI-031 markers carry no MAC and are still evaluated on chain_state."""
+    monkeypatch.delenv("CAIRN_TEST_SECRET", raising=False)
+    _write_raw_verdict(cfg, _fresh_verified_body(cfg))
+
+    check, chain_state, chain_ok = _check_chain_integrity(cfg)
+    assert check["status"] == "ok"
+    assert chain_state == "verified"
+    assert chain_ok is True
+
+
+def _patch_regista_no_replay(monkeypatch, cfg) -> None:
+    """Yield an inert client; _verify_chain is stubbed separately, so no replay
+    runs and the broken 0.5.4 ReplayReport default is never constructed."""
+    @contextmanager
+    def _fake_open(_cfg):
+        yield object()
+
+    monkeypatch.setattr(doctor_mod, "_open_regista", _fake_open)
+    monkeypatch.setattr(doctor_mod, "resolve_config", lambda: cfg)
+
+
+def test_run_integrity_stamps_a_valid_mac_and_event_count(keyed_cfg, monkeypatch, capsys):
+    """run_integrity records verified_event_count and a MAC doctor can verify."""
+    binding = {
+        "principal_binding_verified": True,
+        "principal_binding_failures": None,
+        "replayed_ok": 42,
+    }
+    monkeypatch.setattr(doctor_mod, "_verify_chain", lambda sub: ("verified", True, binding))
+    _patch_regista_no_replay(monkeypatch, keyed_cfg)
+
+    rc = run_integrity(json_output=True)
+    assert rc == 0
+    capsys.readouterr()  # drain the integrity output before doctor runs
+
+    marker = json.loads(_integrity_verdict_path(keyed_cfg).read_text())
+    assert marker["verified_event_count"] == 42
+    assert isinstance(marker.get("mac"), str)
+    # The recorded MAC verifies against the stored body.
+    assert _verdict_mac_state(keyed_cfg, marker) == "valid"
+
+    # And doctor trusts it end to end.
+    run_doctor(json_output=True)
+    report = _doctor_report(capsys)
+    assert _find_check(report, "chain_integrity")["status"] == "ok"
+
+
+def test_run_integrity_writes_no_mac_when_key_unavailable(cfg, monkeypatch, capsys):
+    monkeypatch.delenv("CAIRN_TEST_SECRET", raising=False)
+    binding = {
+        "principal_binding_verified": True,
+        "principal_binding_failures": None,
+        "replayed_ok": 7,
+    }
+    monkeypatch.setattr(doctor_mod, "_verify_chain", lambda sub: ("verified", True, binding))
+    _patch_regista_no_replay(monkeypatch, cfg)
+
+    rc = run_integrity(json_output=True)
+    assert rc == 0
+    marker = json.loads(_integrity_verdict_path(cfg).read_text())
+    assert "mac" not in marker  # honest: un-MAC'd rather than a broken MAC
+    assert marker["verified_event_count"] == 7
+
+
+# --- WI-032: never-verified store with a persistently failing replay ---
+
+
+def test_record_failed_attempt_seeds_a_marker_when_none_exists(keyed_cfg):
+    """A never-verified store gets a chain_state-less marker holding the attempt."""
+    assert _load_integrity_verdict(keyed_cfg) is None
+
+    _record_failed_attempt(keyed_cfg, "unreachable")
+
+    marker = json.loads(_integrity_verdict_path(keyed_cfg).read_text())
+    assert "chain_state" not in marker  # no verdict was ever reached
+    assert marker["store_binding"] == _store_binding(keyed_cfg)
+    assert marker["last_attempt"]["chain_state"] == "unreachable"
+
+
+def test_doctor_warns_on_never_verified_with_failing_attempts(keyed_cfg):
+    _record_failed_attempt(keyed_cfg, "error")
+
+    check, chain_state, chain_ok = _check_chain_integrity(keyed_cfg)
+    assert check["status"] == "warn"
+    assert chain_state == "never_run"
+    assert chain_ok is None
+    assert "never verified" in check["detail"]
+
+
+def test_record_failed_attempt_still_annotates_an_existing_verdict(keyed_cfg):
+    """With a real verdict present, the attempt is annotated and re-MAC'd."""
+    body = _fresh_verified_body(keyed_cfg)
+    body["mac"] = _compute_verdict_mac(keyed_cfg, body)
+    _write_raw_verdict(keyed_cfg, body)
+
+    _record_failed_attempt(keyed_cfg, "error")
+
+    marker = json.loads(_integrity_verdict_path(keyed_cfg).read_text())
+    assert marker["chain_state"] == "verified"  # verdict untouched
+    assert marker["last_attempt"]["chain_state"] == "error"
+    assert _verdict_mac_state(keyed_cfg, marker) == "valid"  # re-MAC'd
+
+
+def test_record_failed_attempt_ignores_a_foreign_store(keyed_cfg):
+    body = _fresh_verified_body(keyed_cfg, store_binding="deadbeefdeadbeef")
+    body["mac"] = _compute_verdict_mac(keyed_cfg, body)
+    _write_raw_verdict(keyed_cfg, body)
+
+    _record_failed_attempt(keyed_cfg, "error")
+
+    marker = json.loads(_integrity_verdict_path(keyed_cfg).read_text())
+    assert "last_attempt" not in marker  # foreign marker left alone

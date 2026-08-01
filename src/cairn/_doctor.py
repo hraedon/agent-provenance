@@ -11,11 +11,13 @@ from __future__ import annotations
 import contextlib
 import datetime
 import hashlib
+import hmac
 import json
 import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import tomllib
@@ -216,6 +218,7 @@ def _verify_chain(sub: Any) -> tuple[str, bool | None, dict[str, Any]]:
     no_binding: dict[str, Any] = {
         "principal_binding_verified": False,
         "principal_binding_failures": None,
+        "replayed_ok": None,
     }
     if not hasattr(sub, "replay"):
         return "unsupported", None, no_binding
@@ -240,6 +243,9 @@ def _verify_chain(sub: Any) -> tuple[str, bool | None, dict[str, Any]]:
     binding: dict[str, Any] = {
         "principal_binding_verified": verified,
         "principal_binding_failures": failures if (verified or failures) else None,
+        # The count of events the replay established (WI-031 m5): recorded so
+        # doctor can later report events-since-verdict, not only verdict age.
+        "replayed_ok": int(getattr(report, "replayed_ok", 0) or 0),
     }
 
     if report.replayed_drift > 0 or report.halted > 0:
@@ -978,22 +984,55 @@ _CHAIN_STATE_DETAIL = {
 
 
 def _record_failed_attempt(cfg: Any, state: str) -> None:
-    """Note a failed replay attempt on the existing verdict without touching it.
+    """Note a failed replay attempt so doctor can see it (WI-032).
 
-    Best-effort: failure to note the attempt must never mask the command's
-    exit code. Only a marker bound to the current store is annotated.
+    When a verdict already exists, annotate it with ``last_attempt`` without
+    touching the verdict itself. When NO verdict exists yet — a never-verified
+    store whose scheduled replay keeps failing — record a chain_state-less marker
+    holding only ``last_attempt`` and the store binding, so doctor can warn that
+    the store was never verified instead of showing a green ``never_run`` skip
+    forever (WI-032).
+
+    Best-effort: failure to note the attempt must never mask the command's exit
+    code. A re-stat CAS guards the load-modify-write: if the marker changes
+    between read and replace (a concurrent successful replay landed a fresh
+    verdict), the annotation is dropped rather than clobbering it (WI-031 r3).
+    Only a marker bound to the current store is annotated.
     """
     try:
+        path = _integrity_verdict_path(cfg)
+        binding = _store_binding(cfg)
+        try:
+            before = os.stat(path)
+            fingerprint: tuple[int, int] | None = (before.st_mtime_ns, before.st_size)
+        except OSError:
+            fingerprint = None
+
         verdict = _load_integrity_verdict(cfg)
-        if not verdict or "chain_state" not in verdict:
+        if verdict and "chain_state" in verdict:
+            # Annotate an existing real verdict; leave its verdict fields alone.
+            if verdict.get("store_binding") != binding:
+                return
+        elif verdict is None:
+            # Never verified: seed a chain_state-less marker (WI-032) so the
+            # failing attempts are visible to doctor.
+            verdict = {"store_binding": binding}
+        else:
+            # Unreadable / malformed marker — do not build on top of it.
             return
-        if verdict.get("store_binding") != _store_binding(cfg):
-            return
+
         verdict["last_attempt"] = {
             "checked_at": datetime.datetime.now(datetime.UTC).isoformat(),
             "chain_state": state,
         }
-        path = _integrity_verdict_path(cfg)
+        # Re-MAC so the annotation does not invalidate the marker (WI-031). A
+        # marker that carried no MAC (no resolvable key) stays un-MAC'd.
+        if isinstance(verdict.get("mac"), str):
+            mac = _compute_verdict_mac(cfg, verdict)
+            if mac is not None:
+                verdict["mac"] = mac
+
+        path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".integrity-")
         try:
             with os.fdopen(fd, "w") as f:
@@ -1001,12 +1040,25 @@ def _record_failed_attempt(cfg: Any, state: str) -> None:
                 f.flush()
                 os.fsync(f.fileno())
             os.chmod(tmp, 0o644)
+            # Re-stat CAS: abort if the live marker changed under us.
+            try:
+                now = os.stat(path)
+                current: tuple[int, int] | None = (now.st_mtime_ns, now.st_size)
+            except OSError:
+                current = None
+            if current != fingerprint:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp)
+                return
             os.replace(tmp, path)
         except Exception:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(tmp)
             raise
-    except Exception:
+    except Exception as exc:
+        # Persistently failing annotation (e.g. broken marker-dir perms) must
+        # not be invisible (WI-031 r3) — but never mask the caller's exit code.
+        print(f"cairn: WARNING: could not record integrity attempt: {exc}", file=sys.stderr)
         return
 
 
@@ -1026,6 +1078,93 @@ def _store_binding(cfg: Any) -> str:
     """
     material = f"{cfg.dsn or ''}\n{cfg.project or ''}".encode()
     return hashlib.sha256(material).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Verdict-marker MAC (WI-031)
+#
+# The marker is operator-trusted plain JSON in the user state home, readable by
+# any local user (0o644, so a doctor running as another user can report it).
+# Left plain, a same-host writer can flip ``drift`` to ``verified`` and doctor —
+# which deliberately never replays — would report the forgery as a clean chain.
+# MACing the body with the configured store signing key closes that: forging a
+# green verdict now requires the key that signs the chain itself. The MAC covers
+# every field except itself, over canonical JSON, so any edit — including the
+# last-verified position — invalidates it. When no key can be resolved the
+# marker is written un-MAC'd and doctor reports it as unverified rather than
+# trusted: absence of a MAC is never a pass.
+# ---------------------------------------------------------------------------
+
+_VERDICT_MAC_SCHEME = "hmac-sha256"
+
+
+def _store_mac_key(cfg: Any) -> bytes | None:
+    """Raw bytes of the configured store signing key, for MACing the marker.
+
+    Resolves the same key the bridge signs events with: ``key_ref`` directly, or
+    the first key in ``key_path`` (via its ``secret_ref`` or inline ``secret``).
+    Returns ``None`` when nothing is configured or resolution fails — the caller
+    then writes/reads the marker without a MAC and reports it as unverified.
+    Never raises: a MAC is an integrity hardening, not a reason to fail replay.
+    """
+    try:
+        from regista._secrets import resolve as resolve_secret
+
+        if cfg.key_ref:
+            raw = resolve_secret(cfg.key_ref)
+            return raw if isinstance(raw, bytes) else None
+        if cfg.key_path:
+            data = json.loads(Path(cfg.key_path).read_text())
+            keys = data.get("keys") if isinstance(data, dict) else None
+            if isinstance(keys, list) and keys and isinstance(keys[0], dict):
+                key = keys[0]
+                ref = key.get("secret_ref")
+                if isinstance(ref, str) and ref:
+                    raw = resolve_secret(ref)
+                    return raw if isinstance(raw, bytes) else None
+                secret = key.get("secret")
+                if isinstance(secret, str) and secret:
+                    return secret.encode()
+    except Exception:
+        return None
+    return None
+
+
+def _canonical_verdict_bytes(body: dict[str, Any]) -> bytes:
+    """Canonical bytes of a verdict body for MACing (every field but ``mac``)."""
+    payload = {k: v for k, v in body.items() if k != "mac"}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _compute_verdict_mac(cfg: Any, body: dict[str, Any]) -> str | None:
+    """MAC over the verdict body, or ``None`` when no store key is available."""
+    key = _store_mac_key(cfg)
+    if key is None:
+        return None
+    digest = hmac.new(key, _canonical_verdict_bytes(body), hashlib.sha256).hexdigest()
+    return f"{_VERDICT_MAC_SCHEME}:{digest}"
+
+
+def _verdict_mac_state(cfg: Any, verdict: dict[str, Any]) -> str:
+    """Classify a marker's MAC: ``valid``, ``invalid``, ``unkeyed``, ``legacy``.
+
+    * ``valid``    — a MAC is present and matches the body under the store key.
+    * ``invalid``  — a MAC is present but does not match (tampered, or the store
+                     key changed since it was written).
+    * ``unkeyed``  — a MAC is present but no store key can be resolved now, so it
+                     cannot be checked. Not trusted.
+    * ``legacy``   — no MAC field (a pre-WI-031 marker). Tolerated as unverified.
+    """
+    stored = verdict.get("mac")
+    if not isinstance(stored, str) or not stored:
+        return "legacy"
+    key = _store_mac_key(cfg)
+    if key is None:
+        return "unkeyed"
+    expected = _compute_verdict_mac(cfg, verdict)
+    if expected is not None and hmac.compare_digest(stored, expected):
+        return "valid"
+    return "invalid"
 
 
 def _parse_utc(value: Any) -> datetime.datetime | None:
@@ -1064,15 +1203,23 @@ def _load_integrity_verdict(cfg: Any) -> dict[str, Any] | None:
 
     Returns ``None`` when no verdict has been recorded. A malformed file
     returns ``{"chain_state": "unreadable"}`` so doctor can surface it.
+
+    A chain_state-less marker holding only ``last_attempt`` + ``store_binding``
+    is a valid WI-032 record (a never-verified store whose replay keeps failing)
+    and is returned as-is, distinct from a malformed file.
     """
     path = _integrity_verdict_path(cfg)
     if not path.is_file():
         return None
     try:
         data = json.loads(path.read_text())
-        if not isinstance(data, dict) or "chain_state" not in data:
+        if not isinstance(data, dict):
             return {"chain_state": "unreadable"}
-        return data
+        if "chain_state" in data:
+            return data
+        if isinstance(data.get("last_attempt"), dict):
+            return data
+        return {"chain_state": "unreadable"}
     except Exception:
         return {"chain_state": "unreadable"}
 
@@ -1099,6 +1246,76 @@ def _check_chain_integrity(cfg: Any) -> tuple[dict[str, Any], str | None, bool |
                 "detail": (
                     "full chain replay is not part of routine health (WI-030); "
                     "no verdict recorded yet — run `cairn integrity` or schedule it"
+                ),
+            },
+            "never_run",
+            None,
+        )
+
+    # WI-031: the marker is operator-trusted plain JSON; its MAC is what keeps a
+    # same-host writer from flipping drift->verified. A marker that carries a MAC
+    # which does not verify is never trusted: a mismatch is reported as a fail
+    # (tampering, or the store key rotated), and a MAC cairn cannot check for
+    # want of a key is reported as unverified. A marker with NO mac field is a
+    # pre-WI-031 (legacy) marker and is tolerated, evaluated on its chain_state.
+    mac_state = _verdict_mac_state(cfg, verdict)
+    if mac_state == "invalid":
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "fail",
+                "detail": (
+                    "integrity verdict marker failed its MAC check — the file was "
+                    "modified without the store key (possible tampering) or the "
+                    "store key changed since it was written; re-run "
+                    "`cairn integrity` to re-record a trusted verdict"
+                ),
+            },
+            "tampered",
+            False,
+        )
+    if mac_state == "unkeyed":
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "warn",
+                "detail": (
+                    "integrity verdict marker carries a MAC but no store key is "
+                    "configured to verify it — treating the verdict as unverified; "
+                    "re-run `cairn integrity` with the store key available"
+                ),
+            },
+            "unverified_marker",
+            None,
+        )
+
+    # WI-032: a chain_state-less marker holds only ``last_attempt`` — a store that
+    # was never verified but whose scheduled replay keeps failing. Without this it
+    # would show a green ``never_run`` skip forever. Report it honestly as a warn.
+    if "chain_state" not in verdict:
+        if verdict.get("store_binding") != _store_binding(cfg):
+            return (
+                {
+                    "name": "chain_integrity",
+                    "status": "skip",
+                    "detail": (
+                        "recorded attempt marker is for a different store or "
+                        "project; run `cairn integrity` against this configuration"
+                    ),
+                },
+                "unbound",
+                None,
+            )
+        attempt = verdict.get("last_attempt")
+        attempt_at = attempt.get("checked_at") if isinstance(attempt, dict) else None
+        return (
+            {
+                "name": "chain_integrity",
+                "status": "warn",
+                "detail": (
+                    "store was never verified, and the most recent replay attempt "
+                    f"({attempt_at or 'unknown time'}) failed — run "
+                    "`cairn integrity` and investigate the failure"
                 ),
             },
             "never_run",
@@ -1834,6 +2051,11 @@ def run_integrity(*, json_output: bool = False) -> int:
     }
     if binding["principal_binding_failures"] is not None:
         verdict["principal_binding_failures"] = binding["principal_binding_failures"]
+    # Last-verified position (WI-031 m5): how many events the replay established,
+    # so doctor can later report events-since-verdict rather than only verdict age.
+    replayed_ok = binding.get("replayed_ok")
+    if isinstance(replayed_ok, int):
+        verdict["verified_event_count"] = replayed_ok
 
     # Record the verdict for doctor — atomically (and fsynced, so a crash
     # cannot leave an empty marker), so a concurrent doctor never reads a
@@ -1844,6 +2066,13 @@ def run_integrity(*, json_output: bool = False) -> int:
     # verdict (WI-030 review m4). The marker is not secret; leave it
     # world-readable so a doctor running as a different user can report it.
     if chain_state in _RECORDED_CHAIN_STATES:
+        # MAC the body with the store key (WI-031) so a same-host writer cannot
+        # flip drift->verified in this world-readable file. Computed last, over
+        # the final body; absent (and reported as unverified by doctor) when no
+        # store key can be resolved.
+        mac = _compute_verdict_mac(cfg, verdict)
+        if mac is not None:
+            verdict["mac"] = mac
         path = _integrity_verdict_path(cfg)
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".integrity-")
