@@ -270,6 +270,41 @@ def test_uninstall_claude_legacy_no_manifest_falls_back_to_remove_all(
     assert "env" not in data or not data.get("env")
 
 
+def test_uninstall_claude_preserves_all_keys_on_a_zero_write_install(
+    cfg, claude_settings
+):
+    """WI-029 zero-write edge: when the operator pre-set EVERY env var, install
+    writes nothing. Ownership must still be recorded (env_keys: []) so uninstall
+    removes only cairn's (zero) keys and the operator's pre-set keys survive —
+    not the legacy remove-all that previously deleted them all."""
+    from cairn._install import _env_values
+
+    desired = dict(_env_values(cfg, "claude-code"))
+    user_env = {k: f"user-value-for-{k}" for k in desired}
+    claude_settings.write_text(json.dumps({"env": user_env}))
+
+    _install_claude(cfg, dry_run=False, uninstall=False, user=None)
+
+    # zero writes: every key is still the operator's value
+    data = json.loads(claude_settings.read_text())
+    assert all(data["env"][k] == f"user-value-for-{k}" for k in user_env)
+    # ownership is recorded as empty (seeded), not absent
+    owned = _load_manifest()["installs"]["claude"]["env_keys"]
+    assert owned == []
+
+    _uninstall_claude(
+        claude_settings,
+        json.loads(claude_settings.read_text()),
+        dry_run=False,
+        result=InstallResult(harness="claude"),
+        manifest=_load_manifest(),
+    )
+
+    # every operator key survives uninstall
+    data = json.loads(claude_settings.read_text())
+    assert all(data["env"][k] == f"user-value-for-{k}" for k in user_env)
+
+
 def test_uninstall_opencode_preserves_user_set_env_var(cfg, tmp_path, monkeypatch):
     """OpenCode uninstall honours the same ownership rule (WI-029)."""
     path = tmp_path / "opencode.json"

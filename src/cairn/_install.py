@@ -1067,6 +1067,22 @@ def _record_manifest_env(
         keys.append(key)
 
 
+def _seed_manifest_env_owned(manifest: dict[str, Any], harness: str) -> None:
+    """Record env-key ownership for *harness* even when cairn writes nothing.
+
+    Seeding ``env_keys`` unconditionally at install distinguishes a WI-029
+    install (ownership tracked — possibly empty) from a pre-WI-029 install
+    (ownership unknown). Without this, a zero-write install — where the
+    operator pre-set every env var and the no-clobber rule wrote nothing —
+    leaves no ``env_keys``, so the uninstaller cannot tell its (zero) keys
+    from the operator's and falls back to the legacy remove-all, deleting the
+    operator's pre-set keys (WI-029 data loss). An existing list is preserved.
+    """
+    installs = manifest.setdefault("installs", {})
+    install = installs.setdefault(harness, {})
+    install.setdefault("env_keys", [])
+
+
 def _clear_manifest_env(
     manifest: dict[str, Any], harness: str, key: str
 ) -> None:
@@ -1257,6 +1273,7 @@ def _install_claude(
         elif hv == "unknown":
             desired_env.pop("CAIRN_HARNESS_VERSION", None)
 
+    _seed_manifest_env_owned(manifest, "claude")
     for key, val in desired_env.items():
         current = env.get(key)
         if current and current != val:
@@ -1615,6 +1632,7 @@ def _install_opencode(
             desired_env["CAIRN_HARNESS_VERSION"] = detected
 
     changed = False
+    _seed_manifest_env_owned(manifest, "opencode")
     for key, val in desired_env.items():
         current = env.get(key)
         if current and current != val:
