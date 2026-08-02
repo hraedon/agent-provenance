@@ -88,9 +88,9 @@ def verify_secret_ref(ref: str) -> tuple[bool, str]:
     try:
         from regista._secrets import resolve as resolve_secret
     except Exception as exc:  # pragma: no cover - regista always present
-        return False, f"regista secret resolver unavailable: {exc}"
+        return False, f"regista secret resolver unavailable: {type(exc).__name__}"
     try:
         resolve_secret(ref)
     except Exception as exc:
-        return False, f"does not resolve: {exc}"
+        return False, f"does not resolve: {type(exc).__name__}"
     return True, "resolves"

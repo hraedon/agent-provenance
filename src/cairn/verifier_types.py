@@ -251,9 +251,23 @@ class WitnessRegistrationEntry:
 class WitnessReceiptEntry:
     """A confirmed witness receipt from the bundle.
 
-    ``signature_valid`` is ``None`` when no witness public key was available
-    to verify the signature (backward-compatible mode — a warning is emitted).
-    When a key is available, it is ``True`` (verified) or ``False`` (failed).
+    ``signature_valid`` is ``True`` (verified), ``False`` (the signature is
+    present but does not check — a forgery), or ``None`` (cairn did not
+    independently verify it).  ``None`` covers two HONEST and distinct cases
+    that the verdict must not conflate with "verified":
+
+    * a *delegated* receipt — a signature-less legacy receipt (no key the
+      operator pinned, no signature to check), and
+    * an *unverified* receipt — a signature is present but cairn could not
+      check it (unknown/unsupported scheme, an Ed25519 witness whose public
+      key / event envelope is unavailable, or an HMAC witness the operator did
+      not pin — WI-043: absence of a pinned key means unverified, not
+      delegated).
+
+    ``unverified`` marks the second case (BC-016): a receipt carrying a
+    signature cairn could not verify.  Such a receipt is excluded from witness
+    coverage and surfaced in the report — it is never silently treated as
+    confirmed.  See ``docs/witness-signature-verification.md``.
     """
 
     event_id: str
@@ -262,6 +276,7 @@ class WitnessReceiptEntry:
     has_signature: bool = False
     signature_valid: bool | None = None
     verification_detail: str | None = None
+    unverified: bool = False
 
 
 @dataclass(frozen=True)
@@ -466,6 +481,16 @@ class VerificationReport:
         return sum(1 for r in self.witness_receipts if r.signature_valid is False)
 
     @property
+    def unverified_witness_receipts(self) -> int:
+        """Receipts carrying a signature cairn could not verify (BC-016).
+
+        Distinct from :attr:`witness_signature_failures` (a proven forgery):
+        these are *not proven* — the witness's corroboration is absent, so the
+        verdict must not claim it.
+        """
+        return sum(1 for r in self.witness_receipts if r.unverified)
+
+    @property
     def all_ok(self) -> bool:
         bundle_ok = self.bundle_hash_ok is not False
         chain_ok = self.chain_integrity_ok is not False
@@ -478,6 +503,7 @@ class VerificationReport:
             and self.delegation_chain_failures == 0
             and self.tsa_signature_failures == 0
             and self.witness_signature_failures == 0
+            and self.unverified_witness_receipts == 0
             and len(self.witness_coverage_violations) == 0
             and len(self.sequence_gaps) == 0
             and len(self.scope_violations) == 0

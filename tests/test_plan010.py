@@ -327,6 +327,21 @@ def test_is_content_encryption_active_requires_the_key_to_resolve(monkeypatch):
     assert "does not resolve" in status.detail
 
 
+def test_content_key_resolution_failure_does_not_expose_exception_detail(monkeypatch):
+    from cairn._secretrefs import verify_secret_ref
+
+    def fail_with_sensitive_detail(ref: str) -> str:
+        raise RuntimeError(f"secret value exposed while resolving {ref}")
+
+    monkeypatch.setattr("regista._secrets.resolve", fail_with_sensitive_detail)
+
+    ok, detail = verify_secret_ref("env:CONTENT_KEY")
+
+    assert ok is False
+    assert detail == "does not resolve: RuntimeError"
+    assert "secret value" not in detail
+
+
 def test_content_encryption_active_when_the_key_really_resolves(monkeypatch, content_key):
     from cairn._content_crypto import is_content_encryption_active
 

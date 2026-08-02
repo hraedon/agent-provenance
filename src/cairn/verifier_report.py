@@ -255,8 +255,10 @@ def format_report(report: VerificationReport) -> str:
         sig_failed = sum(
             1 for r in report.witness_receipts if r.signature_valid is False
         )
-        sig_unchecked = sum(
-            1 for r in report.witness_receipts if r.signature_valid is None
+        sig_unverified = report.unverified_witness_receipts
+        sig_delegated = sum(
+            1 for r in report.witness_receipts
+            if r.signature_valid is None and not r.unverified
         )
         header = (
             f"WITNESS FEDERATION ({w_count} witnesses, {r_count} receipts, "
@@ -264,8 +266,10 @@ def format_report(report: VerificationReport) -> str:
         )
         if sig_failed:
             header += f", {sig_failed} signature failures"
-        if sig_unchecked:
-            header += f", {sig_unchecked} signatures unchecked"
+        if sig_unverified:
+            header += f", {sig_unverified} UNVERIFIED"
+        if sig_delegated:
+            header += f", {sig_delegated} delegated (HMAC)"
         header += ")"
         lines.append(header)
         lines.append("-" * 40)
@@ -279,11 +283,14 @@ def format_report(report: VerificationReport) -> str:
         if report.witness_receipts:
             lines.append("")
             for r in report.witness_receipts:
-                sig_status = "UNCHECKED"
                 if r.signature_valid is True:
                     sig_status = "VERIFIED"
                 elif r.signature_valid is False:
                     sig_status = "FAILED"
+                elif r.unverified:
+                    sig_status = "UNVERIFIED"
+                else:
+                    sig_status = "DELEGATED"
                 lines.append(
                     f"  receipt event {r.event_id[:8]}.. "
                     f"witness {r.witness_id[:8]}.. sig: {sig_status}"
@@ -589,10 +596,12 @@ def format_report_json(report: VerificationReport) -> dict[str, Any]:
                 "confirmed_at": r.confirmed_at,
                 "has_signature": r.has_signature,
                 "signature_valid": r.signature_valid,
+                "unverified": r.unverified,
                 "verification_detail": r.verification_detail,
             }
             for r in report.witness_receipts
         ],
+        "unverified_witness_receipts": report.unverified_witness_receipts,
         "witness_coverage_violations": [
             {
                 "event_id": v.event_id,
@@ -1220,14 +1229,17 @@ def format_report_html(report: VerificationReport) -> str:
         sig_failed = sum(
             1 for r in report.witness_receipts if r.signature_valid is False
         )
-        sig_unchecked = sum(
-            1 for r in report.witness_receipts if r.signature_valid is None
+        sig_unverified = report.unverified_witness_receipts
+        sig_delegated = sum(
+            1 for r in report.witness_receipts
+            if r.signature_valid is None and not r.unverified
         )
         w_header = (
             f"Witness Federation ({w_count} witnesses, "
             f"{r_count} receipts, {v_count} violations"
             + (f", {sig_failed} signature failures" if sig_failed else "")
-            + (f", {sig_unchecked} unchecked" if sig_unchecked else "")
+            + (f", {sig_unverified} UNVERIFIED" if sig_unverified else "")
+            + (f", {sig_delegated} delegated (HMAC)" if sig_delegated else "")
             + ")"
         )
         rows = ""
@@ -1265,8 +1277,10 @@ def format_report_html(report: VerificationReport) -> str:
                     sig_html = '<span style="color:#16a34a;font-weight:bold">VERIFIED</span>'
                 elif r.signature_valid is False:
                     sig_html = '<span style="color:#dc2626;font-weight:bold">FAILED</span>'
+                elif r.unverified:
+                    sig_html = '<span style="color:#dc2626;font-weight:bold">UNVERIFIED</span>'
                 else:
-                    sig_html = '<span style="color:#d97706">UNCHECKED</span>'
+                    sig_html = '<span style="color:#d97706">DELEGATED</span>'
                 detail = _esc(r.verification_detail or "")
                 r_rows += (
                     f"<tr>"

@@ -5292,12 +5292,12 @@ def test_bc016_valid_witness_signature_verified(tmp_path: Path) -> None:
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
         witness_id=witness_id,
-        witness_pubkey_hex=witness_pk.hex(),
+        witness_pubkey_hex=None,
         witness_sig_hex=witness_sig.hex(),
     )
     bundle_path = _finalize_bundle(bundle, tmp_path)
 
-    verifier = Verifier(key_set)
+    verifier = Verifier(key_set, witness_keys={witness_id: witness_pk})
     report = verifier.verify_bundle(bundle_path)
     assert len(report.witness_receipts) == 1
     assert report.witness_receipts[0].signature_valid is True
@@ -5339,12 +5339,12 @@ def test_bc016_invalid_witness_signature_detected(tmp_path: Path) -> None:
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
         witness_id=witness_id,
-        witness_pubkey_hex=witness_pk.hex(),
+        witness_pubkey_hex=None,
         witness_sig_hex=bad_sig.hex(),
     )
     bundle_path = _finalize_bundle(bundle, tmp_path)
 
-    verifier = Verifier(key_set)
+    verifier = Verifier(key_set, witness_keys={witness_id: witness_pk})
     report = verifier.verify_bundle(bundle_path)
     assert len(report.witness_receipts) == 1
     assert report.witness_receipts[0].signature_valid is False
@@ -5385,12 +5385,12 @@ def test_bc016_invalid_signature_does_not_count_as_coverage(tmp_path: Path) -> N
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
         witness_id=witness_id,
-        witness_pubkey_hex=witness_pk.hex(),
+        witness_pubkey_hex=None,
         witness_sig_hex=bad_sig.hex(),
     )
     bundle_path = _finalize_bundle(bundle, tmp_path)
 
-    verifier = Verifier(key_set)
+    verifier = Verifier(key_set, witness_keys={witness_id: witness_pk})
     report = verifier.verify_bundle(bundle_path)
     assert report.witness_receipts[0].signature_valid is False
     assert len(report.witness_coverage_violations) == 1
@@ -5398,7 +5398,8 @@ def test_bc016_invalid_signature_does_not_count_as_coverage(tmp_path: Path) -> N
 
 
 def test_bc016_missing_signature_for_ed25519_witness(tmp_path: Path) -> None:
-    """A receipt without a signature for an Ed25519 witness is FAILED."""
+    """An Ed25519 witness with no anchored key (and no bundle key) is reported
+    honestly as having no key to verify against — never VERIFIED."""
     from regista._signing import sign_event
 
     key_bytes = b"supersecret-test-key-32bytes!!"
@@ -5424,8 +5425,8 @@ def test_bc016_missing_signature_for_ed25519_witness(tmp_path: Path) -> None:
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
         witness_id=witness_id,
-        witness_pubkey_hex=None,  # no public key in registration
-        witness_sig_hex=None,     # no signature in receipt
+        witness_pubkey_hex=None,
+        witness_sig_hex=None,
         key_scheme="ed25519",
     )
     bundle_path = _finalize_bundle(bundle, tmp_path)
@@ -5434,7 +5435,8 @@ def test_bc016_missing_signature_for_ed25519_witness(tmp_path: Path) -> None:
     report = verifier.verify_bundle(bundle_path)
     assert len(report.witness_receipts) == 1
     assert report.witness_receipts[0].signature_valid is None
-    assert "no public key" in (report.witness_receipts[0].verification_detail or "").lower()
+    detail = (report.witness_receipts[0].verification_detail or "").lower()
+    assert "public key" in detail and "no" in detail
 
 
 def test_bc016_external_witness_keys_via_constructor(tmp_path: Path) -> None:
@@ -5559,12 +5561,12 @@ def test_bc016_witness_signature_in_text_report(tmp_path: Path) -> None:
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
         witness_id=witness_id,
-        witness_pubkey_hex=witness_pk.hex(),
+        witness_pubkey_hex=None,
         witness_sig_hex=bad_sig.hex(),
     )
     bundle_path = _finalize_bundle(bundle, tmp_path)
 
-    verifier = Verifier(key_set)
+    verifier = Verifier(key_set, witness_keys={witness_id: witness_pk})
     report = verifier.verify_bundle(bundle_path)
     text = format_report(report)
     assert "WITNESS FEDERATION" in text
@@ -5607,12 +5609,12 @@ def test_bc016_witness_signature_in_json_report(tmp_path: Path) -> None:
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
         witness_id=witness_id,
-        witness_pubkey_hex=witness_pk.hex(),
+        witness_pubkey_hex=None,
         witness_sig_hex=witness_sig.hex(),
     )
     bundle_path = _finalize_bundle(bundle, tmp_path)
 
-    verifier = Verifier(key_set)
+    verifier = Verifier(key_set, witness_keys={witness_id: witness_pk})
     report = verifier.verify_bundle(bundle_path)
     data = format_report_json(report)
     assert "witness_receipts" in data
@@ -5657,12 +5659,12 @@ def test_bc016_witness_signature_in_html_report(tmp_path: Path) -> None:
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
         witness_id=witness_id,
-        witness_pubkey_hex=witness_pk.hex(),
+        witness_pubkey_hex=None,
         witness_sig_hex=bad_sig.hex(),
     )
     bundle_path = _finalize_bundle(bundle, tmp_path)
 
-    verifier = Verifier(key_set)
+    verifier = Verifier(key_set, witness_keys={witness_id: witness_pk})
     report = verifier.verify_bundle(bundle_path)
     html = format_report_html(report)
     assert "Receipt Signatures" in html
@@ -5696,6 +5698,318 @@ def test_bc016_export_hex_encodes_witness_public_key(tmp_path: Path) -> None:
     # Should survive JSON serialization
     json.dumps(sw)
     assert sw["public_key"] == witness_pk_hex
+
+
+# ----------------------------------------------------------------------
+# BC-016: honest UNVERIFIED-witness state (design note in
+# docs/witness-signature-verification.md). A receipt cairn cannot verify must
+# never be silently treated as confirmed.
+# ----------------------------------------------------------------------
+
+
+def _bc016_signed_event() -> tuple[uuid.UUID, bytes, bytes, bytes]:
+    """A signed event: returns (event_id, envelope, canonical_hash, signature)."""
+    from regista._signing import sign_event
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    ev_id = uuid.uuid4()
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=datetime.now(UTC),
+        transition="tool_call",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+    return ev_id, env, c_hash, sig
+
+
+def test_bc016_wrong_public_key_fails_verification(tmp_path: Path) -> None:
+    """A valid signature checked against the WRONG witness key is a failure."""
+    import nacl.signing
+
+    key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+
+    signing_sk = nacl.signing.SigningKey.generate()
+    wrong_sk = nacl.signing.SigningKey.generate()
+    witness_sig = signing_sk.sign(env).signature  # signed by signing_sk...
+    witness_id = str(uuid.uuid4())
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=witness_id,
+        witness_pubkey_hex=None,
+        witness_sig_hex=witness_sig.hex(),
+    )
+    report = Verifier(
+        key_set, witness_keys={witness_id: wrong_sk.verify_key.encode()}
+    ).verify_bundle(_finalize_bundle(bundle, tmp_path))
+    assert report.witness_receipts[0].signature_valid is False
+    assert report.witness_receipts[0].unverified is False  # proven bad, not "unchecked"
+    assert report.witness_signature_failures == 1
+    assert not report.all_ok
+
+
+def test_bc016_tampered_event_invalidates_witness_signature(tmp_path: Path) -> None:
+    """A witness signature over the original envelope fails once the event
+    envelope in the bundle is tampered — the receipt is bound to the bytes."""
+    import nacl.signing
+
+    key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_pk = witness_sk.verify_key.encode()
+    witness_sig = witness_sk.sign(env).signature  # valid over the REAL envelope
+    witness_id = str(uuid.uuid4())
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=witness_id,
+        witness_pubkey_hex=None,
+        witness_sig_hex=witness_sig.hex(),
+    )
+    tampered_env = bytearray(env)
+    tampered_env[-1] ^= 0xFF
+    bundle["events"][0]["canonical_envelope"] = bytes(tampered_env).hex()
+
+    report = Verifier(
+        key_set, witness_keys={witness_id: witness_pk}
+    ).verify_bundle(_finalize_bundle(bundle, tmp_path))
+    receipt = report.witness_receipts[0]
+    assert receipt.signature_valid is False
+    assert not report.all_ok
+
+
+def test_bc016_unsupported_witness_type_is_honest_unverified(tmp_path: Path) -> None:
+    """A receipt with a signature whose key scheme cairn cannot verify is
+    UNVERIFIED — not confirmed, not coverage, and the verdict reflects it."""
+    import nacl.signing
+
+    key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_sig = witness_sk.sign(env).signature
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=str(uuid.uuid4()),
+        witness_pubkey_hex=witness_sk.verify_key.encode().hex(),
+        witness_sig_hex=witness_sig.hex(),
+        key_scheme="rsa-pkcs1",  # a scheme cairn has no verifier for
+    )
+    report = Verifier(key_set).verify_bundle(_finalize_bundle(bundle, tmp_path))
+
+    receipt = report.witness_receipts[0]
+    assert receipt.signature_valid is None  # NOT verified...
+    assert receipt.unverified is True       # ...and honestly flagged
+    assert "UNVERIFIED" in (receipt.verification_detail or "")
+    # Excluded from coverage: the active witness is now "missing".
+    assert len(report.witness_coverage_violations) == 1
+    assert report.unverified_witness_receipts == 1
+    # The verdict must not claim success while a witness is unverified.
+    assert not report.all_ok
+
+
+def test_bc016_unset_witness_scheme_with_signature_is_unverified(tmp_path: Path) -> None:
+    """A receipt carrying a signature but no declared key scheme is the original
+    BC-016 hole: it must be UNVERIFIED, never silently confirmed."""
+    import nacl.signing
+
+    key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_sig = witness_sk.sign(env).signature
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=str(uuid.uuid4()),
+        witness_pubkey_hex=None,
+        witness_sig_hex=witness_sig.hex(),
+        key_scheme=None,  # no scheme declared at all
+    )
+    report = Verifier(key_set).verify_bundle(_finalize_bundle(bundle, tmp_path))
+
+    receipt = report.witness_receipts[0]
+    assert receipt.signature_valid is None
+    assert receipt.unverified is True
+    assert not report.all_ok
+
+
+def test_bc016_hmac_witness_is_unverified_when_unpinned(tmp_path: Path) -> None:
+    """WI-043: absence of a pinned key means unverified, not delegated.
+
+    An HMAC witness the operator did NOT pin cannot be corroborated by cairn.
+    Relabeling the scheme to ``hmac-sha256`` with a fabricated blob must yield
+    an UNVERIFIED receipt, a coverage violation, and ``all_ok=False`` — the
+    exact primitive that previously passed silently as delegated coverage.
+    """
+    key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=str(uuid.uuid4()),
+        witness_pubkey_hex=None,
+        witness_sig_hex="ab" * 32,  # a fabricated blob cairn cannot corroborate
+        key_scheme="hmac-sha256",
+    )
+    report = Verifier(key_set).verify_bundle(_finalize_bundle(bundle, tmp_path))
+
+    receipt = report.witness_receipts[0]
+    assert receipt.signature_valid is None
+    assert receipt.unverified is True  # unpinned => unverified, NOT delegated
+    assert report.unverified_witness_receipts == 1
+    assert len(report.witness_coverage_violations) == 1  # excluded from coverage
+    assert not report.all_ok
+
+
+def test_bc016_unpinned_hmac_relabel_with_fabricated_blob_fails(tmp_path: Path) -> None:
+    """Adversarial: the unpinned + hmac-relabel + fabricated-blob attack that
+    previously returned ``all_ok=True`` must now fail the verdict."""
+    key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=str(uuid.uuid4()),
+        witness_pubkey_hex=None,
+        witness_sig_hex="ab" * 32,
+        key_scheme="hmac-sha256",  # relabel away from ed25519
+    )
+    report = Verifier(key_set).verify_bundle(_finalize_bundle(bundle, tmp_path))
+
+    assert report.witness_receipts[0].unverified is True
+    assert len(report.witness_coverage_violations) == 1
+    assert not report.all_ok
+
+
+def test_bc016_unverified_state_surfaces_in_json_report(tmp_path: Path) -> None:
+    """The JSON report carries the per-receipt unverified flag and the count."""
+    import nacl.signing
+
+    key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_sig = witness_sk.sign(env).signature
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=str(uuid.uuid4()),
+        witness_pubkey_hex=witness_sk.verify_key.encode().hex(),
+        witness_sig_hex=witness_sig.hex(),
+        key_scheme="rsa-pkcs1",
+    )
+    report = Verifier(key_set).verify_bundle(_finalize_bundle(bundle, tmp_path))
+    data = Verifier.format_report_json(report)
+    assert data["unverified_witness_receipts"] == 1
+    assert data["witness_receipts"][0]["unverified"] is True
+    assert data["witness_receipts"][0]["signature_valid"] is None
+
+
+def test_bundle_carried_witness_key_is_display_only_not_verified(
+    tmp_path: Path,
+) -> None:
+    """WI-043: a witness public key carried inside the bundle is NOT a trust
+    root.  Even a *correct* Ed25519 signature over the real envelope, checked
+    against the bundle-carried key, must never be reported VERIFIED, never count
+    toward coverage, and never make the verdict pass.  The key may still appear
+    in the registration for display/attribution."""
+    import nacl.signing
+    from regista._signing import sign_event
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    sig, c_hash, env = sign_event(
+        event_id=ev_id,
+        work_item_id=uuid.uuid4(),
+        actor_id="agent-1",
+        key_id="cairn-test-001",
+        event_seq=1,
+        workflow_name="",
+        workflow_version=0,
+        timestamp=now,
+        transition="tool_call",
+        payload={"tool": "Read"},
+        key=key_bytes,
+    )
+
+    witness_id = str(uuid.uuid4())
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_pk = witness_sk.verify_key.encode()
+    witness_sig = witness_sk.sign(env).signature  # genuinely valid
+
+    bundle = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=witness_id,
+        witness_pubkey_hex=witness_pk.hex(),  # key travels INSIDE the bundle only
+        witness_sig_hex=witness_sig.hex(),
+    )
+    report = Verifier(key_set).verify_bundle(_finalize_bundle(bundle, tmp_path))
+
+    receipt = report.witness_receipts[0]
+    assert receipt.signature_valid is None       # never VERIFIED
+    assert receipt.unverified is True            # honestly flagged
+    assert report.unverified_witness_receipts == 1
+    assert len(report.witness_coverage_violations) == 1  # never coverage
+    assert not report.all_ok                     # never makes the verdict pass
+    reg = report.witness_registrations[0]
+    assert reg.public_key == witness_pk.hex()    # still present for display
+
+
+def test_pinned_key_forces_ed25519_despite_spoofed_scheme(
+    tmp_path: Path,
+) -> None:
+    """WI-043 relabel bypass: when a witness key is pinned/enrolled, Ed25519
+    verification MUST run even if the bundle claims a different scheme.  A
+    bundle that relabels an Ed25519 witness as ``hmac-sha256`` cannot skip
+    verification — a valid Ed25519 signature still verifies, and a bad one
+    still fails."""
+    import nacl.signing
+
+    key_bytes = b"supersecret-test-key-32bytes!!"
+    key_set = {"cairn-test-001": key_bytes}
+
+    ev_id, env, c_hash, sig = _bc016_signed_event()
+    witness_sk = nacl.signing.SigningKey.generate()
+    witness_pk = witness_sk.verify_key.encode()
+    wid = str(uuid.uuid4())
+    verifier = Verifier(key_set, witness_keys={wid: witness_pk})
+
+    good = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=wid,
+        witness_pubkey_hex=None,
+        witness_sig_hex=witness_sk.sign(env).signature.hex(),
+        key_scheme="hmac-sha256",  # spoofed — must NOT skip ed25519
+    )
+    report_good = verifier.verify_bundle(_finalize_bundle(good, tmp_path, "good.json"))
+    assert report_good.witness_receipts[0].signature_valid is True
+    assert report_good.witness_receipts[0].unverified is False
+    assert len(report_good.witness_coverage_violations) == 0
+    assert report_good.all_ok
+
+    bad = _make_witness_bundle(
+        ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        witness_id=wid,
+        witness_pubkey_hex=None,
+        witness_sig_hex=(b"\x00" * 64).hex(),
+        key_scheme="hmac-sha256",
+    )
+    report_bad = verifier.verify_bundle(_finalize_bundle(bad, tmp_path, "bad.json"))
+    assert report_bad.witness_receipts[0].signature_valid is False
+    assert not report_bad.all_ok
 
 
 # ----------------------------------------------------------------------
