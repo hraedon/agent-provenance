@@ -38,12 +38,22 @@ def model_family(provider_id: str | None, model_id: str | None) -> str | None:
         return "kimi"
     if model.startswith("glm-") or model == "glm":
         return "glm"
-    if "codex" in model:
-        return "gpt-codex"
-    if model.endswith("-luna") or model == "luna":
-        return "gpt-luna"
-    if model.endswith("-sol") or model == "sol":
-        return "gpt-sol"
+    if "minimax" in model:
+        return "minimax"
+    # The three gpt-5.6 siblings are distinct families, exactly as
+    # opus/sonnet/fable are. Match the sibling name before anything else about
+    # the id, so a harness-qualified id like "gpt-5.6-codex-sol" still resolves
+    # to the model that ran.
+    for sibling in ("luna", "terra", "sol"):
+        if model.endswith(f"-{sibling}") or model == sibling:
+            return f"gpt-{sibling}"
+    # "codex" names a harness, not a model line. An id that carries no sibling
+    # name does not say which model ran, so the honest answer is None — the
+    # observation is recorded with status "unmapped" and finding
+    # "observed_model_lineage_unresolvable" rather than being assigned an
+    # invented family. Returning "gpt-codex" here would have manufactured a
+    # lineage that regista's registry does not accept and that no mind
+    # corresponds to.
     return None
 
 

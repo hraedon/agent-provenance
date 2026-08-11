@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from cairn import CairnAdapter, CairnConfig
 from cairn._model_observation import (
     model_family,
@@ -96,7 +98,10 @@ def test_codex_observer_reads_runtime_turn_context(tmp_path: Path) -> None:
     assert observed is not None
     assert observed.provider_id == "openai"
     assert observed.model_id == "gpt-5.3-codex"
-    assert model_family(observed.provider_id, observed.model_id) == "gpt-codex"
+    # "codex" is a harness, not a model line: the id does not say which of the
+    # gpt siblings ran, so the family is honestly unresolvable rather than an
+    # invented "gpt-codex" (owner decision 2026-08-10).
+    assert model_family(observed.provider_id, observed.model_id) is None
 
 
 def test_observation_bridge_exception_never_blocks(tmp_path: Path) -> None:
@@ -129,3 +134,50 @@ def test_single_model_service_is_named_as_declaration_not_observation() -> None:
 
     assert event.payload["status"] == "declared"
     assert event.payload["finding"] == "model_identity_declared_not_observed"
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    [
+        ("gpt-5.6-sol", "gpt-sol"),
+        ("gpt-5.6-luna", "gpt-luna"),
+        ("gpt-5.6-terra", "gpt-terra"),
+        ("sol", "gpt-sol"),
+        ("terra", "gpt-terra"),
+        ("openai/gpt-5.6-terra", "gpt-terra"),
+        # Harness-qualified: the sibling name still identifies the model.
+        ("gpt-5.6-codex-sol", "gpt-sol"),
+        # Harness only — does not say which sibling ran.
+        ("gpt-5.6-codex", None),
+        ("codex", None),
+        ("minimax-m3", "minimax"),
+        ("MiniMax-M3", "minimax"),
+    ],
+)
+def test_gpt_siblings_and_minimax_map_to_registry_families(
+    model_id: str, expected: str | None
+) -> None:
+    assert model_family(None, model_id) == expected
+
+
+def test_every_mapped_family_is_a_regista_registry_family() -> None:
+    """cairn must never mint a lineage regista would refuse at ingress.
+
+    The two live in different repos behind SUITE.lock, so nothing but this test
+    stops the mapper's range from drifting out of the registry's domain.
+    """
+    regista_families = {
+        "claude-haiku", "claude-opus", "claude-sonnet", "deepseek", "fable",
+        "glm", "gpt-luna", "gpt-sol", "gpt-terra", "kimi", "longcat",
+        "minimax", "nemotron", "qwen",
+    }
+    probes = [
+        "claude-opus-5", "claude-sonnet-4-8", "claude-haiku-4-5", "opus-5",
+        "sonnet-4", "haiku-4-5", "claude-fable-5", "nemotron-3-ultra",
+        "deepseek-v4-flash", "longcat-2", "qwen3.8-max-preview", "kimi-k3",
+        "glm-5.2", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra",
+        "minimax-m3", "opencode-deepseek-v4-flash",
+    ]
+    mapped = {model_family(None, p) for p in probes}
+    assert None not in mapped, "a probe id failed to map"
+    assert mapped <= regista_families, mapped - regista_families
