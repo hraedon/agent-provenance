@@ -37,6 +37,15 @@ import integrations.hermes as hermes
 def _isolate_plugin(monkeypatch):
     """Reset module state + ensure CAIRN_DISABLE is unset for every test."""
     monkeypatch.delenv("CAIRN_DISABLE", raising=False)
+    for name in (
+        "CAIRN_SINGLE_MODEL_SERVICE",
+        "CAIRN_HERMES_MODEL",
+        "CAIRN_HERMES_PROVIDER",
+        "HERMES_MODEL",
+        "HERMES_PROVIDER",
+        "CAIRN_MODEL_LINEAGE",
+    ):
+        monkeypatch.delenv(name, raising=False)
     hermes.reset_for_tests()
     yield
     hermes.reset_for_tests()
@@ -220,7 +229,7 @@ def test_session_start_attests_and_captures_session_id(wired):
     assert hermes._SESSION_ID == sid
 
     events = wired.sub.read_events(work_item_id=uuid.UUID(sid))
-    assert len(events) == 1
+    assert len(events) == 2
     ev = events[0]
     assert ev.transition == "session_attestation"
     assert ev.entity_kind == "session"
@@ -232,6 +241,9 @@ def test_session_start_attests_and_captures_session_id(wired):
     # (built inside the adapter), never a placeholder.
     assert ev.on_behalf_of["session_id"] == sid
     assert ev.on_behalf_of.get("session_id") != "pending"
+    observation = events[1]
+    assert observation.transition == "model_observation"
+    assert (observation.payload or {})["status"] == "unavailable"
 
 
 def test_session_start_normalizes_non_uuid_session_id(wired):
@@ -245,8 +257,28 @@ def test_session_start_normalizes_non_uuid_session_id(wired):
 
     # The persisted attestation uses the normalized id.
     events = wired.sub.read_events(work_item_id=uuid.UUID(normalized))
-    assert len(events) == 1
+    assert len(events) == 2
     assert (events[0].payload or {})["session_id"] == normalized
+
+
+def test_single_model_service_environment_is_explicitly_declared(
+    wired,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    monkeypatch.setenv("CAIRN_SINGLE_MODEL_SERVICE", "1")
+    monkeypatch.setenv("CAIRN_HERMES_MODEL", "deepseek-v4-flash")
+    monkeypatch.setenv("CAIRN_HERMES_PROVIDER", "provider")
+    monkeypatch.setenv("CAIRN_MODEL_LINEAGE", "deepseek")
+
+    hermes.on_session_start(session_id=sid)
+
+    events = wired.sub.read_events(work_item_id=uuid.UUID(sid))
+    observation = next(event for event in events if event.transition == "model_observation")
+    payload = observation.payload or {}
+    assert payload["status"] == "declared"
+    assert payload["observation_basis"] == "single_model_service_declaration"
+    assert payload["finding"] == "model_identity_declared_not_observed"
 
 
 def test_session_end_clears_work_items_and_session_id(wired, monkeypatch):

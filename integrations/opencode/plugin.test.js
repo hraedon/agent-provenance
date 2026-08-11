@@ -345,6 +345,14 @@ function readRecord(recordFile) {
   return readFileSync(recordFile, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
 }
 
+async function waitForObservation(recordFile) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (readRecord(recordFile).some((call) => call.action === "model_observation")) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("model observation bridge call did not complete");
+}
+
 describe("WI-011: plugin event handler attests session.started", () => {
   test("session.started invokes attest_session with the session id and harness", async () => {
     const sub = mkdtempSync(join(tmpdir(), "cairn-evstart-"));
@@ -425,6 +433,108 @@ describe("WI-011: plugin event handler attests session.started", () => {
       process.env.CAIRN_BRIDGE_PATH = savedBridge;
       if (savedAttest === undefined) delete process.env.CAIRN_ATTEST_ON_START;
       else process.env.CAIRN_ATTEST_ON_START = savedAttest;
+      rmSync(sub, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("WI-045: OpenCode records the dispatched model", () => {
+  test("configured model A dispatching model B captures B", async () => {
+    const sub = mkdtempSync(join(tmpdir(), "cairn-model-"));
+    const recordFile = join(sub, "record.jsonl");
+    const bridge = join(sub, "rec.mjs");
+    writeRecordingBridge(bridge, recordFile);
+    const savedBridge = process.env.CAIRN_BRIDGE_PATH;
+    process.env.CAIRN_BRIDGE_PATH = bridge;
+    try {
+      const plugin = await cairnPlugin({ client: mkClient([]), stateDir: sub });
+      await plugin["chat.message"](
+        {
+          sessionID: "sess-model",
+          agent: "adversarial-reviewer-nemotron",
+          model: { providerID: "provider-a", modelID: "nemotron-3-ultra" },
+        },
+        { message: {}, parts: [] },
+      );
+      const actual = {
+        type: "message.updated",
+        properties: {
+          info: {
+            id: "msg-1",
+            sessionID: "sess-model",
+            role: "assistant",
+            providerID: "provider-b",
+            modelID: "glm-5.2",
+            agent: "adversarial-reviewer-nemotron",
+          },
+        },
+      };
+      await plugin.event({ event: actual });
+      await plugin.event({ event: actual });
+      await waitForObservation(recordFile);
+
+      const observations = readRecord(recordFile).filter(
+        (call) => call.action === "model_observation",
+      );
+      expect(observations).toHaveLength(1);
+      expect(observations[0].observed_provider_id).toBe("provider-b");
+      expect(observations[0].observed_model_id).toBe("glm-5.2");
+      expect(observations[0].requested_provider_id).toBe("provider-a");
+      expect(observations[0].requested_model_id).toBe("nemotron-3-ultra");
+      expect(observations[0].observation_id).toBeTruthy();
+      expect(observations[0].observed_model_id).not.toContain(
+        observations[0].agent ?? "adversarial-reviewer-nemotron",
+      );
+
+      const reloaded = await cairnPlugin({ client: mkClient([]), stateDir: sub });
+      await reloaded.event({ event: actual });
+      const afterReload = readRecord(recordFile).filter(
+        (call) => call.action === "model_observation",
+      );
+      expect(afterReload).toHaveLength(1);
+      expect(afterReload[0].observation_id).toBe(observations[0].observation_id);
+    } finally {
+      process.env.CAIRN_BRIDGE_PATH = savedBridge;
+      rmSync(sub, { recursive: true, force: true });
+    }
+  });
+
+  test("model observation never waits for the bridge", async () => {
+    const sub = mkdtempSync(join(tmpdir(), "cairn-model-nonblocking-"));
+    const recordFile = join(sub, "record.jsonl");
+    const bridge = join(sub, "slow.mjs");
+    writeBridge(
+      bridge,
+      `import { readFileSync, appendFileSync } from "node:fs";
+const msg = JSON.parse(readFileSync(0, "utf8"));
+setTimeout(() => {
+  appendFileSync(${JSON.stringify(recordFile)}, JSON.stringify(msg) + "\\n");
+  process.stdout.write(JSON.stringify({ status: "ok", event_id: "ev" }) + "\\n");
+}, 300);`,
+    );
+    const savedBridge = process.env.CAIRN_BRIDGE_PATH;
+    process.env.CAIRN_BRIDGE_PATH = bridge;
+    try {
+      const plugin = await cairnPlugin({ client: mkClient([]), stateDir: sub });
+      const started = performance.now();
+      await plugin.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              id: "msg-slow",
+              sessionID: "sess-slow",
+              role: "assistant",
+              providerID: "provider",
+              modelID: "glm-5.2",
+            },
+          },
+        },
+      });
+      expect(performance.now() - started).toBeLessThan(150);
+      await waitForObservation(recordFile);
+    } finally {
+      process.env.CAIRN_BRIDGE_PATH = savedBridge;
       rmSync(sub, { recursive: true, force: true });
     }
   });

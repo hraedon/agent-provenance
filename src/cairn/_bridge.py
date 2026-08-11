@@ -177,6 +177,7 @@ def main() -> None:
         "subagent_start",
         "subagent_stop",
         "compaction",
+        "model_observation",
     ):
         sys.stderr.write(f"cairn_bridge: unknown action {action!r}\n")
         sys.exit(1)
@@ -273,6 +274,36 @@ def _dispatch(
             harness_config_digests=msg.get("harness_config_digests"),
         )
         return {"status": "ok", "event_id": str(event.event_id)}
+
+    if action == "model_observation":
+        observation_id = msg.get("observation_id")
+        model_event_id = (
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"cairn:model-observation:{session_id}:{observation_id}",
+            )
+            if isinstance(observation_id, str) and observation_id
+            else None
+        )
+        event = adapter.record_model_observation(
+            session_id=session_id,
+            source=msg.get("source", f"{harness_name}.unknown"),
+            observation_basis=msg.get("observation_basis", "runtime_metadata"),
+            observed_provider_id=msg.get("observed_provider_id"),
+            observed_model_id=msg.get("observed_model_id"),
+            requested_provider_id=msg.get("requested_provider_id"),
+            requested_model_id=msg.get("requested_model_id"),
+            declared_model_lineage=msg.get("declared_model_lineage"),
+            event_id=model_event_id,
+        )
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        return {
+            "status": "ok",
+            "event_id": str(event.event_id),
+            "observation_status": payload.get("status"),
+            "observed_model_lineage": payload.get("observed_model_lineage"),
+            "finding": payload.get("finding"),
+        }
 
     subagent = msg.get("subagent")
     if not (isinstance(subagent, dict) and subagent.get("agent_id")):

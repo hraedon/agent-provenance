@@ -120,7 +120,7 @@ def test_pre_then_post_pairs_by_tool_use_id(monkeypatch, tmp_path):
     _feed(monkeypatch, post)
     ch.handle_post()
 
-    end = bridge.calls[1]
+    end = next(call for call in bridge.calls if call["action"] == "end")
     assert end["action"] == "end"
     assert end["work_item_id"] == "wi-42"
     assert end["result_summary"]["exit_code"] == 0
@@ -131,6 +131,23 @@ def test_pre_then_post_pairs_by_tool_use_id(monkeypatch, tmp_path):
     assert "file1" not in json.dumps(end)
     # State file consumed on end.
     assert list((tmp_path / "sessions" / "s1").glob("*.json")) == []
+
+
+def test_model_observation_scans_once_per_turn(monkeypatch, tmp_path):
+    bridge = _stub_bridge(monkeypatch, {"status": "ok", "observation_status": "observed"})
+    calls = []
+    monkeypatch.setattr(
+        ch,
+        "observe_codex_rollout",
+        lambda *_args, **_kwargs: calls.append("scan") or None,
+    )
+    payload = {"session_id": "s1", "turn_id": "turn-1"}
+
+    ch._record_model_observation(payload)
+    ch._record_model_observation(payload)
+
+    assert calls == ["scan"]
+    assert [call["action"] for call in bridge.calls] == ["model_observation"]
 
 
 def test_codex_never_writes_raw_capture_payloads(monkeypatch, tmp_path):
@@ -157,7 +174,7 @@ def test_post_nonzero_exit_from_structured_response(monkeypatch, tmp_path):
         "tool_response": {"output": "boom", "exit_code": 3},
     })
     ch.handle_post()
-    end = bridge.calls[0]
+    end = next(call for call in bridge.calls if call["action"] == "end")
     assert end["result_summary"]["exit_code"] == 3
     assert end["error"].startswith("tool call failed (response sha256:")
     assert "boom" not in end["error"]
