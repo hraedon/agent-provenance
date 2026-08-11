@@ -19,6 +19,22 @@ class _RecordingStore:
         return SimpleNamespace(event_id=uuid.uuid4(), payload=kwargs["payload"])
 
 
+# Machine-readable evidence-basis marker for every check this probe emits.
+# All three checks here exercise the capture *code path*
+# (CairnAdapter.record_model_observation / submit_model_observation) against
+# hardcoded synthetic inputs constructed in-process — they never read an
+# installed harness's runtime metadata (no OpenCode message.updated event, no
+# Claude transcript, no Codex rollout). That is a genuine gap: a check can
+# pass here on a box where the OpenCode plugin is not installed at all, even
+# though agent-suite's genesis gate treats these as required, gating checks.
+# This field lets a consumer (or a human reading `cairn invariants probe
+# --json`) tell fixture-backed evidence apart from a live measurement without
+# us renaming the frozen check ids agent-suite already depends on
+# (cairn.runtime_model_observed, cairn.unavailable_model_named,
+# cairn.observation_failure_nonblocking).
+PROBE_EVIDENCE_BASIS = "fixture"
+
+
 def evaluate_runtime_dispatch(payload: dict[str, Any]) -> dict[str, Any]:
     passed = (
         payload.get("observed_provider_id") == "provider-b"
@@ -34,7 +50,12 @@ def evaluate_runtime_dispatch(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": "cairn.runtime_model_observed",
         "status": "pass" if passed else "fail",
-        "detail": "configured model A dispatching model B is recorded as B",
+        "detail": (
+            "synthetic fixture (provider-a/nemotron-3-ultra dispatching to "
+            "provider-b/glm-5.2) run through the capture code path; this "
+            "does not observe an installed harness"
+        ),
+        "basis": PROBE_EVIDENCE_BASIS,
     }
 
 
@@ -49,7 +70,12 @@ def evaluate_unavailable_observation(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": "cairn.unavailable_model_named",
         "status": "pass" if passed else "fail",
-        "detail": "missing runtime model metadata is explicit, never inferred",
+        "detail": (
+            "synthetic fixture with no observed model metadata run through "
+            "the capture code path; this does not observe an installed "
+            "harness"
+        ),
+        "basis": PROBE_EVIDENCE_BASIS,
     }
 
 
@@ -74,7 +100,12 @@ def _fail_open_check() -> dict[str, Any]:
     return {
         "id": "cairn.observation_failure_nonblocking",
         "status": "pass" if passed else "fail",
-        "detail": "capture failure returns normally and records degradation",
+        "detail": (
+            "synthetic fixture with no bridge/harness run through the "
+            "capture code path to confirm it returns normally and records "
+            "degradation; this does not observe an installed harness"
+        ),
+        "basis": PROBE_EVIDENCE_BASIS,
     }
 
 
