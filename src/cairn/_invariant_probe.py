@@ -7,7 +7,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from ._model_observation import submit_model_observation
-from .adapter import CairnAdapter, CairnConfig
+from .adapter import CairnAdapter
+from .schema import CairnConfig
 
 
 class _RecordingStore:
