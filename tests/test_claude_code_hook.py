@@ -29,6 +29,7 @@ from cairn._claude_hook import (
     _resolve_settings_digest,
     _safe_session_id,
     _state_dir,
+    handle_message_display,
     handle_post,
     handle_post_compact,
     handle_pre,
@@ -117,6 +118,40 @@ def test_handle_pre_creates_state(mock_bridge: MagicMock, state_dir: Path) -> No
     assert state_file.exists()
     state = json.loads(state_file.read_text())
     assert state["work_item_id"] == wi_id
+
+
+@patch("cairn._claude_hook._run_bridge")
+def test_message_display_observes_model_from_transcript(
+    mock_bridge: MagicMock,
+    tmp_path: Path,
+) -> None:
+    mock_bridge.return_value = {"status": "ok"}
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": "test-session",
+                "message": {"model": "claude-sonnet-4-5-20250929"},
+            }
+        )
+        + "\n"
+    )
+    hook_input = json.dumps(
+        {
+            "session_id": "test-session",
+            "transcript_path": str(transcript),
+            "message": "response",
+        }
+    )
+
+    with patch("sys.stdin", StringIO(hook_input)):
+        handle_message_display()
+
+    model_call = mock_bridge.call_args_list[0].args[0]
+    assert model_call["action"] == "model_observation"
+    assert model_call["observed_provider_id"] == "anthropic"
+    assert model_call["observed_model_id"] == "claude-sonnet-4-5-20250929"
 
 
 @patch("cairn._claude_hook._run_bridge")

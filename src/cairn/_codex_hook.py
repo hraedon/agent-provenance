@@ -68,6 +68,7 @@ from ._claude_hook import (
     _state_dir,
 )
 from ._hook_selftest import is_selftest, selftest_line
+from ._model_observation import observe_codex_rollout, submit_model_observation
 
 # hook_event_name -> install action token (and back). Only events Cairn handles
 # are registered; SessionStart and tool events attest, while Stop performs
@@ -214,6 +215,44 @@ def _config_digest() -> str | None:
     return f"sha256:{digest.hexdigest()}"
 
 
+def _record_model_observation(hook_input: dict[str, Any]) -> None:
+    session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
+    turn_id = hook_input.get("turn_id")
+    marker = _state_dir(session_id) / "model-observation.state"
+    if isinstance(turn_id, str) and marker.is_file():
+        try:
+            previous = json.loads(marker.read_text())
+        except (json.JSONDecodeError, OSError):
+            previous = None
+        if isinstance(previous, dict) and previous.get("observation_turn_id") == turn_id:
+            return
+    codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    rollout_root = os.environ.get("CAIRN_CODEX_SESSIONS", str(codex_home / "sessions"))
+    observed = observe_codex_rollout(
+        rollout_root,
+        session_id,
+        turn_id if isinstance(turn_id, str) else None,
+    )
+    payload: dict[str, Any] = {
+        "source": "codex.rollout.turn_context",
+        "observed_provider_id": observed.provider_id if observed else None,
+        "observed_model_id": observed.model_id if observed else None,
+        "observation_turn_id": turn_id if isinstance(turn_id, str) else None,
+    }
+    if os.environ.get("CODEX_MODEL"):
+        payload["requested_model_id"] = os.environ["CODEX_MODEL"]
+    if os.environ.get("CAIRN_SINGLE_MODEL_SERVICE"):
+        payload["declared_model_lineage"] = os.environ.get("CAIRN_MODEL_LINEAGE")
+    submit_model_observation(
+        session_id,
+        payload,
+        _run_bridge,
+        _state_dir,
+        _mark_degraded,
+        action="codex:model_observation",
+    )
+
+
 def handle_session_start() -> None:
     _, hook_input = _read_input()
     session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
@@ -288,6 +327,7 @@ def handle_pre() -> None:
 def handle_post() -> None:
     _, hook_input = _read_input()
     session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
+    _record_model_observation(hook_input)
     tool_name = hook_input.get("tool_name", _FALLBACK_TOOL_NAME)
     tool_input = hook_input.get("tool_input", {})
     if not isinstance(tool_input, dict):
@@ -371,6 +411,7 @@ def handle_stop() -> None:
     JSON response. Never requests continuation (Decision 5)."""
     _, hook_input = _read_input()
     session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
+    _record_model_observation(hook_input)
     try:
         state = _state_dir(session_id)
         if state.exists():

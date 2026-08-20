@@ -324,6 +324,30 @@ def main() -> None:
     """Cairn — Cryptographic provenance for agentic workflows."""
 
 
+@main.group()
+def invariants() -> None:
+    """Run evidentiary invariant probes."""
+
+
+@invariants.command("probe")
+@click.option("--json", "json_mode", is_flag=True, help="Emit JSON output")
+def invariants_probe(json_mode: bool) -> None:
+    """Exercise observed-model and fail-open capture behavior."""
+    import structlog
+
+    from ._invariant_probe import invariant_probe_report
+
+    structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
+    report = invariant_probe_report()
+    if json_mode:
+        click.echo(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        for check in report["checks"]:
+            click.echo(f"[{check['status'].upper()}] {check['id']}: {check['detail']}")
+    if not report["ok"]:
+        raise click.exceptions.Exit(1)
+
+
 @main.command()
 @click.option("--bundle-path", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--keys", required=True, type=click.Path(exists=True, path_type=Path))

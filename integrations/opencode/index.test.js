@@ -1,5 +1,12 @@
 import { expect, test, describe } from "bun:test";
-import { mkdtempSync, rmSync, readFileSync, existsSync, statSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  readFileSync,
+  existsSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -136,6 +143,17 @@ describe("markDegraded", () => {
       const bEntry = JSON.parse(readFileSync(bLog, "utf8").trim());
       expect(aEntry.detail).toBe("A failure");
       expect(bEntry.detail).toBe("B failure");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("never throws when the degradation path is unwritable", () => {
+    const root = freshRoot();
+    const file = join(root, "not-a-directory");
+    try {
+      writeFileSync(file, "occupied");
+      expect(() => markDegraded("sess", "model", "capture failed", file)).not.toThrow();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -127,6 +127,44 @@ def test_attest_scope(
 
 @patch("cairn._bridge.Regista")
 @patch("cairn._bridge.CairnAdapter")
+def test_model_observation_has_restart_stable_event_id(
+    mock_adapter_cls: Any,
+    mock_regista_cls: Any,
+    _valid_env: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    adapter = mock_adapter_cls.return_value
+    event = _make_mock_event()
+    event.payload = {"status": "mismatch", "observed_model_lineage": "glm"}
+    adapter.record_model_observation.return_value = event
+    observation_id = '["test-session","provider-b","glm-5.2"]'
+
+    rc, out, _err = _run_bridge(
+        json.dumps(
+            {
+                "action": "model_observation",
+                "session_id": "test-session",
+                "source": "opencode.message.updated",
+                "observation_id": observation_id,
+                "observed_provider_id": "provider-b",
+                "observed_model_id": "glm-5.2",
+            }
+        ),
+        capsys=capsys,
+    )
+
+    assert rc == 0
+    assert json.loads(out)["observation_status"] == "mismatch"
+    normalized_session = str(uuid.uuid5(uuid.NAMESPACE_URL, "test-session"))
+    expected = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"cairn:model-observation:{normalized_session}:{observation_id}",
+    )
+    assert adapter.record_model_observation.call_args.kwargs["event_id"] == expected
+
+
+@patch("cairn._bridge.Regista")
+@patch("cairn._bridge.CairnAdapter")
 def test_begin(
     mock_adapter_cls: Any,
     mock_regista_cls: Any,

@@ -45,11 +45,13 @@ from ._content_crypto import (
     recorded_content_encryption_stance,
     withhold_content_fields,
 )
+from ._model_observation import model_family
 from .schema import (
     AssistantMessagePayload,
     CairnConfig,
     CompactionPayload,
     FileDigest,
+    ModelObservationPayload,
     ResultSummary,
     ScopeAttestationPayload,
     SessionAttestationPayload,
@@ -628,6 +630,83 @@ class CairnAdapter:
             event_id=event_id,
         )
         log.info("cairn.transcript_attestation", session_id=session_id, actor=actor)
+        return event
+
+    def record_model_observation(
+        self,
+        session_id: str,
+        *,
+        source: str,
+        observation_basis: str = "runtime_metadata",
+        observed_provider_id: str | None = None,
+        observed_model_id: str | None = None,
+        requested_provider_id: str | None = None,
+        requested_model_id: str | None = None,
+        declared_model_lineage: str | None = None,
+        on_behalf_of: dict[str, Any] | None = None,
+        actor_id: str | None = None,
+        event_id: uuid.UUID | None = None,
+    ) -> Any:
+        if observation_basis not in {
+            "runtime_metadata",
+            "single_model_service_declaration",
+            "unavailable",
+        }:
+            raise ValueError(f"unknown model observation basis: {observation_basis}")
+        actor = actor_id or self._actor_id
+        delegation = on_behalf_of or self._on_behalf_of
+        observed_lineage = model_family(observed_provider_id, observed_model_id)
+        requested_lineage = model_family(requested_provider_id, requested_model_id)
+        declared_lineage = declared_model_lineage or requested_lineage
+        status = "observed"
+        finding = None
+        if not observed_model_id:
+            status = "unavailable"
+            finding = "model_observation_unavailable"
+            observation_basis = "unavailable"
+        elif observation_basis == "single_model_service_declaration":
+            status = "declared"
+            finding = "model_identity_declared_not_observed"
+        elif observed_lineage is None:
+            status = "unmapped"
+            finding = "observed_model_lineage_unresolvable"
+        elif declared_lineage is not None and declared_lineage != observed_lineage:
+            status = "mismatch"
+            finding = "declared_observed_lineage_mismatch"
+        elif declared_lineage is not None:
+            status = "matched"
+        else:
+            finding = "requested_model_unavailable"
+        payload = ModelObservationPayload(
+            status=status,
+            source=source,
+            observation_basis=observation_basis,
+            observed_provider_id=observed_provider_id,
+            observed_model_id=observed_model_id,
+            observed_model_lineage=observed_lineage,
+            requested_provider_id=requested_provider_id,
+            requested_model_id=requested_model_id,
+            declared_model_lineage=declared_lineage,
+            finding=finding,
+        ).to_dict()
+        entity_id = uuid.UUID(session_id) if isinstance(session_id, str) else session_id
+        event = self._sub.append_event(
+            work_item_id=entity_id,
+            actor_id=actor,
+            actor_kind=self._actor_kind,
+            actor_metadata={"role": "agent", "phase": "model_observation"},
+            transition="model_observation",
+            payload=payload,
+            on_behalf_of=delegation,
+            entity_kind="session",
+            event_id=event_id,
+        )
+        log.info(
+            "cairn.model_observation",
+            session_id=session_id,
+            status=status,
+            finding=finding,
+        )
         return event
 
     # ----------------------------------------------------------------------
