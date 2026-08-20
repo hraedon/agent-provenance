@@ -25,15 +25,20 @@ Mirrored from agent-suite (verified against it 2026-08-20, WI-045):
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import os
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
+from cairn._cli import main
 from cairn._invariant_probe import (
     evaluate_runtime_dispatch,
     evaluate_unavailable_observation,
@@ -78,6 +83,60 @@ requires_console_script = pytest.mark.skipif(
     not _CAIRN.is_file(),
     reason=f"cairn console script not installed at {_CAIRN} (needs `pip install -e .`)",
 )
+
+
+def test_subprocess_contract_lane_is_installed_and_therefore_ran() -> None:
+    """WI-026-style meta-guard: the subprocess lane must not vanish quietly.
+
+    Every ``@requires_console_script`` test above is the *only* in-repo check of
+    the things that can only be observed out-of-process: stdout carrying exactly
+    one JSON document, the process exit code, and the ``--help`` usage line the
+    gate's preflight matcher reads. If the console script is absent they all
+    skip, pytest still exits 0, and a green build enforces none of it — the same
+    fails-open shape as the 2026-07-24 ``importorskip`` bug.
+
+    So the presence of the script is asserted here rather than merely
+    conditioned on. This test carries no skip marker and calls no ``skip``: on a
+    checkout where the lane cannot run it fails, loudly, instead of leaving an
+    'all green' build that proved nothing about the gate's real entry point.
+    ``scripts/dev-install.py`` (``make dev``, and CI's install step) installs
+    ``-e .``, so the script is present wherever the suite is meant to run.
+    """
+    assert _CAIRN.is_file(), (
+        f"cairn console script missing at {_CAIRN}, so every subprocess "
+        f"genesis-gate contract test in this module would be bypassed and the "
+        f"contract lane would enforce nothing. Install the project into this "
+        f"interpreter's environment (`python scripts/dev-install.py`, or "
+        f"`pip install -e .`) and re-run."
+    )
+
+
+def test_the_contract_lane_guard_cannot_itself_be_bypassed() -> None:
+    """Arming proof for the guard above: it has no escape hatch.
+
+    A meta-guard that could skip would reintroduce exactly the hazard it
+    exists to close, and that regression is a one-word edit (adding
+    ``@requires_console_script`` to it). This pins the guard as unconditional.
+    """
+    guard = test_subprocess_contract_lane_is_installed_and_therefore_ran
+    assert not getattr(guard, "pytestmark", []), (
+        "the contract-lane guard acquired a pytest mark; a skipif on it would "
+        "make it skip in exactly the situation it exists to detect"
+    )
+
+    # Parsed, not string-scanned: this module's prose names `skip` and
+    # `requires_console_script` all over, so a substring check would either
+    # false-positive on a docstring or have to be loosened until it proved
+    # nothing. The AST sees only the decorators and the calls.
+    parsed = ast.parse(textwrap.dedent(inspect.getsource(guard))).body[0]
+    assert isinstance(parsed, ast.FunctionDef)
+    assert not parsed.decorator_list, ast.unparse(parsed.decorator_list[0])
+    called = {
+        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        for node in ast.walk(parsed)
+        if isinstance(node, ast.Call)
+    }
+    assert not called & {"skip", "importorskip", "xfail", "exit"}, sorted(called)
 
 
 def _run_cli(*args: str) -> subprocess.CompletedProcess[str]:
@@ -180,6 +239,92 @@ def test_genesis_gate_contract_help_exposes_the_probe_to_preflight() -> None:
     # Both streams, because the matcher considers both.
     normalized = " ".join(f"{completed.stdout}\n{completed.stderr}".split()).lower()
     assert re.search(GATE_HELP_USAGE_PATTERN, normalized), normalized[:400]
+
+
+def _patch_report(monkeypatch: pytest.MonkeyPatch, report: dict[str, object]) -> None:
+    """Make the CLI's probe return ``report``.
+
+    ``_cli.invariants_probe`` does ``from ._invariant_probe import
+    invariant_probe_report`` *inside the command body*, so the name is bound at
+    call time from the defining module and there is no ``cairn._cli`` attribute
+    to patch. ``cairn._invariant_probe.invariant_probe_report`` is the only
+    target that works — patching ``cairn._cli`` would raise AttributeError, and
+    a ``raising=False`` version of it would silently do nothing while the test
+    still passed against the real (passing) probe.
+    """
+    monkeypatch.setattr("cairn._invariant_probe.invariant_probe_report", lambda: report)
+
+
+def _failing_report() -> dict[str, object]:
+    return {
+        "component": "cairn",
+        "ok": False,
+        "probe_version": GATE_PROBE_REPORT_VERSION,
+        "evidence_basis": "fixture",
+        "checks": [
+            {
+                "id": "cairn.runtime_model_observed",
+                "status": "fail",
+                "detail": "synthetic failure injected by the test",
+            }
+        ],
+    }
+
+
+def test_cli_exits_1_and_still_prints_the_report_when_the_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing probe must exit nonzero, not just print ``"ok": false``.
+
+    agent-suite's gate reads *both* signals and downgrades to FAIL when they
+    disagree, so the ``if not report["ok"]: raise Exit(1)`` branch in
+    ``_cli.invariants_probe`` is load-bearing. Nothing covered it before: the
+    in-process contract test only sees a passing report, and the subprocess
+    tests can only observe the live probe, which passes — so mutating that
+    branch to ``if False:`` survived the whole suite.
+    """
+    _patch_report(monkeypatch, _failing_report())
+
+    result = CliRunner().invoke(main, ["invariants", "probe", "--json"])
+
+    assert result.exit_code == 1, (result.exit_code, result.output)
+    body = json.loads(result.stdout)
+    assert body["ok"] is False
+    assert body["component"] == "cairn"
+    assert [check["status"] for check in body["checks"]] == ["fail"]
+
+
+def test_cli_exits_1_on_a_failing_probe_in_text_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exit code is the report's verdict, not a side effect of ``--json``."""
+    _patch_report(monkeypatch, _failing_report())
+
+    result = CliRunner().invoke(main, ["invariants", "probe"])
+
+    assert result.exit_code == 1, (result.exit_code, result.output)
+    assert "[FAIL] cairn.runtime_model_observed" in result.stdout
+
+
+def test_cli_exits_0_when_the_probe_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Positive control, in-process so it cannot skip.
+
+    Without this, ``if not report["ok"]`` could be mutated to ``if True:`` — a
+    probe that always exits 1 — and only the skippable subprocess lane would
+    notice.
+    """
+    passing = {
+        "component": "cairn",
+        "ok": True,
+        "probe_version": GATE_PROBE_REPORT_VERSION,
+        "checks": [{"id": "cairn.runtime_model_observed", "status": "pass", "detail": "ok"}],
+    }
+    _patch_report(monkeypatch, passing)
+
+    result = CliRunner().invoke(main, ["invariants", "probe", "--json"])
+
+    assert result.exit_code == 0, (result.exit_code, result.output)
+    assert json.loads(result.stdout)["ok"] is True
 
 
 def test_behavioral_probe_passes() -> None:

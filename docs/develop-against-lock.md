@@ -89,7 +89,8 @@ The genesis gate invokes `cairn` from `PATH`, i.e. the uv **tool** venv at
 trap:
 
 ```bash
-uv tool install --force .           # DO NOT: ignores the <0.6 cap
+uv tool install --force .           # DO NOT: ignores the <0.6 cap, and
+                                    # installs the spine EDITABLE from ../regista
 ```
 
 From the canonical clone, `[tool.uv.sources]` makes uv install whatever version
@@ -101,14 +102,31 @@ installed as `9.9.9`. The cap is deliberate (it holds until cairn's
 `on_behalf_of` port), so this quietly produces a tool venv the cap exists to
 prevent.
 
+Worse than a wrong pin: the sources mapping sets `editable = true`, so the spine
+is installed **editable** and the tool venv does not hold a copy of regista at
+all — it holds a `.pth` pointing at `../regista/src`. Re-verified 2026-08-20 in a
+throwaway `UV_TOOL_DIR`: the installed `regista_hraedon-0.6.0.dist-info/
+direct_url.json` reads `{"dir_info":{"editable":true}}` and
+`_editable_impl_regista_hraedon.pth` contains the sibling's `src` path. (cairn
+itself installs normally — only the spine is editable.) So the tool the genesis
+gate runs is not a fixed artifact: every uncommitted edit, branch switch, or
+`git checkout` in the sibling clone changes the spine the gate is measuring,
+retroactively and with nothing recorded. `cairn --version` will not show it, and
+a gate result cannot be attributed to a spine version after the fact.
+
 Upgrade the installed tool by building a wheel and installing *that* — wheel
 metadata carries the cap but not the `[tool.uv.sources]` override, so the spine
-resolves from PyPI. Safe to run from inside the project directory:
+resolves from PyPI as a pinned, non-editable release. Safe to run from inside the
+project directory:
 
 ```bash
 uv build --wheel
-uv tool install --force dist/cairn-0.1.0-py3-none-any.whl
+uv tool install --force "$(ls dist/cairn-*.whl)"
 ```
+
+The glob matters: hardcoding a filename rots at the next version bump, and
+`uv build --wheel` leaves older wheels in `dist/`, so `ls` must resolve to
+exactly one file — clear `dist/` first (`rm -rf dist`) if it does not.
 
 To pin the spine to `SUITE.lock`'s `[spine].version` rather than letting the
 resolver take the newest release under the cap (they coincide at `0.5.5` today,
@@ -116,7 +134,7 @@ but would diverge the moment a `0.5.6` publishes):
 
 ```bash
 uv tool install --force --with 'regista-hraedon[encryption]==0.5.5' \
-  dist/cairn-0.1.0-py3-none-any.whl
+  "$(ls dist/cairn-*.whl)"
 ```
 
 `uv tool install --force --no-sources .` also honors the cap and needs no wheel;
