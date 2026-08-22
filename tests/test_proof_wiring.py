@@ -50,18 +50,20 @@ def _insert_session_attestation(
         "harnesses": [{"name": "claude", "version": harness_version}],
         "scope_statement": "In scope: claude.",
     }
+    # v6 has no writer-level on_behalf_of (refused at the funnel); the
+    # delegation context is signed payload content, exactly as the adapter
+    # records it. ``on_behalf_of=None`` fixtures mean "no chain in the payload".
     if on_behalf_of is _UNSET:
-        obo = {"principal_id": "human:test", "session_id": session_id}
-    else:
-        obo = on_behalf_of
+        payload["on_behalf_of"] = {"principal_id": "human:test", "session_id": session_id}
+    elif on_behalf_of is not None:
+        payload["on_behalf_of"] = on_behalf_of
     return regista_instance.append_event(
         work_item_id=uuid.UUID(session_id),
-        actor_id="agent-1",
+        actor_id="agent:worker",
         actor_metadata={"role": "agent", "phase": "session_attestation"},
         transition="session_attestation",
         payload=payload,
-        on_behalf_of=obo,
-        entity_kind="session",
+        entity_kind="note",
     )
 
 
@@ -78,11 +80,13 @@ def _insert_tool_call_end(
     wi, _ = regista_instance.create_work_item(
         workflow_name=workflow_name,
         work_item_type="tool_call",
-        actor_id="agent-1",
+        actor_id="agent:worker",
         actor_metadata={"role": "agent", "phase": "begin"},
         custom_fields={"tool": tool, "status": "running"},
     )
 
+    # v6: the delegation chain lives in the signed payload (there is no
+    # writer-level on_behalf_of); ``on_behalf_of=None`` omits it.
     if on_behalf_of is _UNSET:
         obo = {"principal_id": "human:test", "session_id": session_id}
     else:
@@ -93,6 +97,8 @@ def _insert_tool_call_end(
         "tool_args_hash": "sha256:abc",
         "harness": {"name": "claude", "version": "2.1.200"},
     }
+    if obo is not None:
+        begin_payload["on_behalf_of"] = obo
     if file_paths:
         begin_payload["files"] = [{"path": p} for p in file_paths]
         begin_payload["tool_args_redacted"] = {"tool": tool, "file_paths": file_paths}
@@ -100,10 +106,9 @@ def _insert_tool_call_end(
     regista_instance.transition(
         work_item_id=wi.work_item_id,
         transition_name="tool_call_begin",
-        actor_id="agent-1",
+        actor_id="agent:worker",
         actor_metadata={"role": "agent", "phase": "begin"},
         payload=begin_payload,
-        on_behalf_of=obo,
     )
 
     end_payload: dict[str, Any] = {
@@ -111,6 +116,8 @@ def _insert_tool_call_end(
         "tool_args_hash": "sha256:abc",
         "harness": {"name": "claude", "version": "2.1.200"},
     }
+    if obo is not None:
+        end_payload["on_behalf_of"] = obo
     if stdout_digest is not None:
         end_payload["result_summary"] = {"stdout_digest": stdout_digest}
     if file_paths:
@@ -120,10 +127,9 @@ def _insert_tool_call_end(
     return regista_instance.transition(
         work_item_id=wi.work_item_id,
         transition_name="tool_call_end",
-        actor_id="agent-1",
+        actor_id="agent:worker",
         actor_metadata={"role": "agent", "phase": "end"},
         payload=end_payload,
-        on_behalf_of=obo,
     )
 
 
@@ -169,12 +175,14 @@ def test_query_events_round_trips_into_proof_event(
 
     sa = session_events[0]
     assert sa.entity_id == session_id
-    assert sa.entity_kind == "session"
+    # v6 writes session-scoped events as the note entity
+    assert sa.entity_kind == "note"
     assert sa.payload is not None
     assert "harnesses" in sa.payload
     assert sa.payload["harnesses"][0]["version"] == "2.1.200"
-    assert sa.on_behalf_of is not None
-    assert sa.on_behalf_of["session_id"] == session_id
+    # The delegation context is payload content under v6 (no writer-level
+    # on_behalf_of field exists).
+    assert (sa.payload or {}).get("on_behalf_of", {}).get("session_id") == session_id
 
     te = tool_end_events[0]
     assert te.entity_kind == "work_item"
@@ -183,8 +191,7 @@ def test_query_events_round_trips_into_proof_event(
     assert te.payload["result_summary"]["stdout_digest"] == _sha256(file_content)
     assert te.payload["files"][0]["path"] == file_path
     assert te.payload["harness"]["name"] == "claude"
-    assert te.on_behalf_of is not None
-    assert te.on_behalf_of["session_id"] == session_id
+    assert (te.payload or {}).get("on_behalf_of", {}).get("session_id") == session_id
 
     found_session = find_session_attestation(events, baseline_seq, "test.txt")
     assert found_session == session_id
@@ -259,6 +266,8 @@ def test_query_events_handles_null_on_behalf_of(
         sql_value = row[0]
     conn.close()
 
+    # v6 rows never carry on_behalf_of (the writer refuses it); NULL is the
+    # only value this column can hold in a clean epoch.
     assert sql_value is None, (
         f"Expected NULL on_behalf_of in DB, got: {sql_value}"
     )
@@ -272,6 +281,8 @@ def test_query_events_handles_null_on_behalf_of(
     tool_end_events = [e for e in events if e.transition == "tool_call_end"]
     assert len(tool_end_events) == 1
     assert tool_end_events[0].on_behalf_of is None
+    # ...and the payload deliberately carries no chain either for this fixture
+    assert "on_behalf_of" not in (tool_end_events[0].payload or {})
 
 
 # -----------------------------------------------------------------------
@@ -284,7 +295,7 @@ def test_run_canonical_verifier_with_clean_bundle(
     workflow_registered: None,
     dsn: str,
     project: str,
-    hmac_keys: Path,
+    v6_keyset,
     tmp_path: Path,
 ) -> None:
     session_id = str(uuid.uuid4())
@@ -306,16 +317,29 @@ def test_run_canonical_verifier_with_clean_bundle(
         file_paths=[file_path],
     )
 
-    hmac_keys.chmod(0o600)
-
     report, detail = run_canonical_verifier(
-        dsn, project, str(hmac_keys), tmp_path, since,
+        dsn, project, v6_keyset.path, tmp_path, since,
     )
 
     if report is None:
         pytest.skip(f"cairn CLI subprocess unavailable or failed: {detail}")
 
-    assert report.all_ok, f"Expected clean verifier report, got: {detail}"
+    # The honest aggregate under v6: every ordinary event fully verifies
+    # against the bundle's own referent material, and the ONE unverified
+    # event is the genesis, whose authority is the external trust-domain
+    # enrolment — a gap the bundle cannot close, reported by name rather
+    # than smoothed into "ok" (which is why all_ok is False and `cairn
+    # verify` exits 1 on it).
+    assert report.signature_failed == 0, detail
+    assert report.ok >= 1, detail
+    assert report.unverified_events >= 1, (
+        f"expected the v6 genesis gap to be reported unverified, got: {detail}"
+    )
+    assert not report.all_ok, (
+        "an unverified event must fail the aggregate verdict: "
+        f"{report.unverified_events} unverified present"
+    )
+    assert "UNVERIFIED" in detail or "unverified" in detail
 
 
 # -----------------------------------------------------------------------

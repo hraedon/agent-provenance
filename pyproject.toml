@@ -24,7 +24,9 @@ dependencies = [
     # encryption ON by default, so a default install that cannot import the
     # cipher captures nothing (fail-closed, WI-037) while doctor used to say
     # ok — observed on this estate the day WI-037 shipped (WI-040).
-    "regista-hraedon[encryption]>=0.5.1,<0.6",
+    # 0.7.1 ships the public offline verification surface
+    # (regista.verification) that cairn's verifier imports at runtime.
+    "regista-hraedon[encryption]>=0.7.1,<0.8",
     "rfc8785>=0.1.4",
     "structlog>=24.1",
     "click>=8.1",

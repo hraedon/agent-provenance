@@ -37,7 +37,29 @@ _CONFIG_ENV_VARS = [
     "CAIRN_CODEX_SESSIONS",
     "CAIRN_MAX_ATTESTATION_AGE_HOURS",
     "CLAUDE_PROJECT_DIR",
+    # v6 process producer identity (regista resolves it from the process
+    # environment, and regista.testing's epoch helpers set it directly in
+    # os.environ — outside monkeypatch). Without a per-test restore, a
+    # producer configured by one test silently signs every later test's
+    # events (the same isolation agent-notes' conftest enforces).
+    "REGISTA_PRODUCER_HARNESS",
+    "REGISTA_PRODUCER_HARNESS_VERSION",
+    "REGISTA_PRODUCER_MODEL",
+    "REGISTA_PRODUCER_MODEL_LINEAGE",
 ]
+
+# The canonical principals cairn's tests write as. regista 0.7's v6 epoch
+# requires every signing actor to be a canonical principal (kind:subject)
+# whose key the project has accepted, so the fixture keyset carries one
+# throwaway Ed25519 key per principal and open_v6_epoch accepts exactly
+# these — no more (an acceptance is authority, not a fixture convenience).
+CAIRN_TEST_PRINCIPALS: tuple[str, ...] = (
+    "service:cairn",   # adapter default actor
+    "human:test",      # test_cairn / hermes / integrity adapters
+    "human:test-user",  # test_client principal
+    "human:owner",     # attestation payloads / delegation principals
+    "agent:worker",    # direct writer calls (proof wiring)
+)
 
 
 @pytest.fixture(autouse=True)
@@ -94,26 +116,45 @@ def project() -> str:
 
 
 @pytest.fixture
-def regista_instance(dsn: str, project: str, hmac_keys: Path):
-    """Create a fresh Postgres-backed regista project for each test.
+def v6_keyset(tmp_path: Path):
+    """A throwaway Ed25519 v6 keyset covering exactly the test principals.
+
+    regista 0.7's public consumer-testing surface (AMENDMENTS §5): the file
+    is written by ``make_v6_keyset`` and doubles as the handle's key path.
+    """
+    from regista.testing import make_v6_keyset
+
+    return make_v6_keyset(tmp_path, principals=CAIRN_TEST_PRINCIPALS)
+
+
+@pytest.fixture
+def regista_instance(dsn: str, project: str, v6_keyset):
+    """Create a fresh Postgres-backed regista project with an open v6 epoch.
 
     Skips fast when Postgres is unreachable or the role is unavailable —
     regista's pool retries auth failures indefinitely, so a pre-check keeps
     the suite from hanging (WI-001).
+
+    The epoch (genesis + exactly the ``CAIRN_TEST_PRINCIPALS`` acceptances)
+    is opened through regista's public testing helper; constructing the
+    handle never opens one implicitly.
     """
     from regista import Regista
+    from regista.testing import open_v6_epoch
 
     if not postgres_reachable(dsn):
         pytest.skip("Postgres not available; set REGISTA_TEST_DSN to run")
     sub = Regista.create_project(
         dsn=dsn,
         project=project,
-        hmac_key_path=str(hmac_keys),
+        hmac_key_path=v6_keyset.path,
     )
+    open_v6_epoch(sub, v6_keyset, principals=CAIRN_TEST_PRINCIPALS)
     yield sub
     sub.close()
 
 
 @pytest.fixture
 def workflow_registered(regista_instance) -> None:
+    """Register cairn's workflow as a signed v6 workflow_registered event."""
     regista_instance.register_workflow_file("workflows/cairn_agent_actions.yaml")

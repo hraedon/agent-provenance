@@ -32,15 +32,15 @@ distribution = "regista-hraedon"
 repo = "hraedon/regista"
 # The released PyPI version this cairn release develops + tests against.
 # Must equal agent-suite/SUITE.lock [components.regista].version.
-version = "0.5.5"
+version = "0.7.1"
 # The git SHA of regista this cairn release was tested against == the umbrella's
-# [components.regista].revision (the v0.5.5 tag).
+# [components.regista].revision (the v0.7.1 tag).
 # Resolve the local sibling with: git -C ../regista checkout <sha>
-sha = "375f1a1b4b808d4693493a8e98e7bfbe4bb0d278"
-describe = "v0.5.5"
+sha = "8dd7b3464b0316f0f3a36e46dee64e36ceac6dbf"
+describe = "v0.7.1"
 # Mirrors the floor declared in pyproject.toml (the published lower bound); the
 # exact version to develop against is `version` above, not this floor.
-pyproject_floor = "regista-hraedon>=0.5.1,<0.6"
+pyproject_floor = "regista-hraedon>=0.7.1,<0.8"
 
 # Harness wiring (cairn install-harness):
 #   claude   — ~/.claude/settings.json hooks + env

@@ -15,19 +15,25 @@ import json
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
 import click
+from regista import VerificationPolicy, make_verification_policy
 
 from . import __version__ as _cairn_version
 from .schema import check_key_file_permissions
 from .verifier import Verifier
 
+_ARCHIVE_LEGACY_ENVELOPE_VERSIONS = ("v1", "v2", "v3", "v4")
+
 TRUST_MODEL_CAVEAT = (
-    "Ed25519 and HMAC-SHA256 supported; RFC 3161 timestamping available via "
-    "'cairn timestamp'. FIM-class positioning is a working hypothesis "
-    "(README §4.1), not auditor-validated."
+    "Ed25519 and HMAC-SHA256 supported. RFC 3161 timestamping was removed with "
+    "regista 0.6+ (the batch Merkle construction witnessed no content); "
+    "historical TSA batches in bundles are reported as stated, never verified. "
+    "FIM-class positioning is a working hypothesis (README §4.1), not "
+    "auditor-validated."
 )
 
 README_PATH = Path(__file__).resolve().parent.parent.parent / "README.md"
@@ -157,6 +163,27 @@ def _load_key_metadata(keys_path: Path) -> dict[str, dict[str, Any]]:
         if meta:
             key_metadata[key_id] = meta
     return key_metadata
+
+
+def _verification_policy(
+    project_instance_id: str | None,
+    trust_domain_id: str | None,
+    cutover_checkpoint_event_hash: str | None,
+) -> VerificationPolicy:
+    """Construct the explicit operator policy; never source pins from a bundle."""
+
+    from ._config import resolve_verification_pins
+
+    configured = resolve_verification_pins()
+    return make_verification_policy(
+        project_instance_id=project_instance_id or configured["project_instance_id"],
+        trust_domain_id=trust_domain_id or configured["trust_domain_id"],
+        cutover_checkpoint_event_hash=(
+            cutover_checkpoint_event_hash
+            or configured["cutover_checkpoint_event_hash"]
+        ),
+        accepted_legacy_envelope_versions=_ARCHIVE_LEGACY_ENVELOPE_VERSIONS,
+    )
 
 
 _LAST_BUNDLE_HASH_FILE = ".cairn_last_bundle_hash"
@@ -336,12 +363,6 @@ def main() -> None:
     help="Report format: text (human-readable), JSON, or self-contained HTML",
 )
 @click.option(
-    "--tsa-cert",
-    type=click.Path(exists=True, path_type=Path),
-    default=None,
-    help="Trusted TSA certificate (PEM or DER) for timestamp signature verification (BC-229).",
-)
-@click.option(
     "--witness-keys",
     type=click.Path(exists=True, path_type=Path),
     default=None,
@@ -367,16 +388,36 @@ def main() -> None:
     "Sessions found there with no events in the bundle are reported as "
     "silence gaps (Plan 009 WI-4.1). Not available with --since/--until.",
 )
+@click.option(
+    "--project-instance-id",
+    default=None,
+    help="External project_instance_id pin (overrides CAIRN_PROJECT_INSTANCE_ID).",
+)
+@click.option(
+    "--trust-domain-id",
+    default=None,
+    help="External trust_domain_id pin (overrides CAIRN_TRUST_DOMAIN_ID).",
+)
+@click.option(
+    "--cutover-checkpoint-event-hash",
+    default=None,
+    help=(
+        "External cutover checkpoint event-hash pin "
+        "(overrides CAIRN_CUTOVER_CHECKPOINT_EVENT_HASH)."
+    ),
+)
 def verify(
     bundle_path: Path,
     keys: Path,
     output: Path | None,
     fmt: str,
-    tsa_cert: Path | None,
     witness_keys: Path | None,
     since: str | None,
     until: str | None,
     harness_sessions: Path | None,
+    project_instance_id: str | None,
+    trust_domain_id: str | None,
+    cutover_checkpoint_event_hash: str | None,
 ) -> None:
     """Verify a signed Cairn bundle and emit an auditor-ready report."""
     for w in check_key_file_permissions(str(keys)):
@@ -392,8 +433,12 @@ def verify(
     verifier = Verifier(
         key_set,
         key_metadata=key_metadata,
-        tsa_cert_path=str(tsa_cert) if tsa_cert else None,
         witness_keys=witness_key_set,
+        policy=_verification_policy(
+            project_instance_id,
+            trust_domain_id,
+            cutover_checkpoint_event_hash,
+        ),
     )
 
     if since or until:
@@ -445,6 +490,24 @@ def verify(
 @click.option("--keys", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--output", type=click.Path(path_type=Path), default=None)
 @click.option(
+    "--project-instance-id",
+    default=None,
+    help="External project_instance_id pin (overrides CAIRN_PROJECT_INSTANCE_ID).",
+)
+@click.option(
+    "--trust-domain-id",
+    default=None,
+    help="External trust_domain_id pin (overrides CAIRN_TRUST_DOMAIN_ID).",
+)
+@click.option(
+    "--cutover-checkpoint-event-hash",
+    default=None,
+    help=(
+        "External cutover checkpoint event-hash pin "
+        "(overrides CAIRN_CUTOVER_CHECKPOINT_EVENT_HASH)."
+    ),
+)
+@click.option(
     "--format",
     "fmt",
     type=click.Choice(["text", "json", "html"]),
@@ -455,6 +518,9 @@ def verify_chain(
     bundles: tuple[Path, ...],
     keys: Path,
     output: Path | None,
+    project_instance_id: str | None,
+    trust_domain_id: str | None,
+    cutover_checkpoint_event_hash: str | None,
     fmt: str,
 ) -> None:
     """Verify a chain of bundles linked by previous_bundle_hash."""
@@ -464,7 +530,15 @@ def verify_chain(
     key_set = _load_key_set(keys)
     key_metadata = _load_key_metadata(keys)
 
-    verifier = Verifier(key_set, key_metadata=key_metadata)
+    verifier = Verifier(
+        key_set,
+        key_metadata=key_metadata,
+        policy=_verification_policy(
+            project_instance_id,
+            trust_domain_id,
+            cutover_checkpoint_event_hash,
+        ),
+    )
     report = verifier.verify_bundle_chain(list(bundles))
 
     if fmt == "json":
@@ -553,6 +627,31 @@ def export(
             "source_dsn_host": source_host,
         }
 
+        # BundleReferents derives completeness from these sequence markers.
+        # A timestamp window without honest global-sequence bounds would be
+        # inferred as COMPLETE_STORE, which is stronger than the export proved.
+        # Refuse such an artifact rather than inventing bounds for an empty or
+        # legacy event set whose global_seq is absent.
+        if since is not None or until is not None:
+            global_seqs = [ev.global_seq for ev in events if ev.global_seq is not None]
+            if not events or len(global_seqs) != len(events):
+                raise click.ClickException(
+                    "A timestamp-windowed export requires every exported event "
+                    "to have a global_seq; refusing to write a bundle with an "
+                    "unverifiable completeness claim."
+                )
+            unique_seqs = set(global_seqs)
+            lower = min(unique_seqs)
+            upper = max(unique_seqs)
+            if len(unique_seqs) != upper - lower + 1:
+                raise click.ClickException(
+                    "A timestamp-windowed export selected a non-contiguous global "
+                    "sequence range; refusing to label sparse material as a "
+                    "contiguous audit window."
+                )
+            manifest["since_seq"] = lower
+            manifest["until_seq"] = upper
+
         effective_prev_hash: str | None = None
         if previous_bundle is not None:
             effective_prev_hash = _read_previous_bundle_hash(previous_bundle)
@@ -577,21 +676,11 @@ def export(
         }
 
         exported_event_ids = {str(ev.event_id) for ev in events}
-        try:
-            confirmed_batches = sub.timestamping.list_batches(status="confirmed")
-            covering_batches = []
-            for batch in confirmed_batches:
-                batch_event_ids = {str(eid) for eid in batch.event_ids}
-                if batch_event_ids & exported_event_ids:
-                    covering_batches.append(batch.to_dict())
-            if covering_batches:
-                bundle["timestamp_batches"] = covering_batches
-        except Exception as exc:
-            click.echo(
-                f"Warning: failed to load timestamp batches — "
-                f"bundle will not contain timestamp data: {exc}",
-                err=True,
-            )
+        # regista removed the RFC 3161 timestamping subsystem outright in 0.6.0
+        # (the batch Merkle tree committed to uuid.bytes and witnessed no
+        # content), so there is no `sub.timestamping` to read and no new TSA
+        # batch can exist. Historical bundles keep their own
+        # `timestamp_batches` section; `cairn verify` reports it as stated.
 
         # Include witness registrations and confirmed receipts
         try:
@@ -609,17 +698,21 @@ def export(
 
                 witness_receipts = []
                 for ev_id in exported_event_ids:
-                    receipts = sub.witnesses.receipts(event_id=ev_id, status="confirmed")
+                    receipts = sub.witnesses.receipts(
+                        event_id=uuid.UUID(ev_id), status="confirmed"
+                    )
                     for r in receipts:
+                        confirmed_at = r.get("confirmed_at")
+                        witness_signature = r.get("witness_signature")
                         witness_receipts.append({
                             "event_id": str(r.get("event_id", "")),
                             "witness_id": str(r.get("witness_id", "")),
                             "status": r.get("status"),
-                            "confirmed_at": r.get("confirmed_at").isoformat()
-                            if r.get("confirmed_at")
+                            "confirmed_at": confirmed_at.isoformat()
+                            if confirmed_at
                             else None,
-                            "witness_signature": r.get("witness_signature").hex()
-                            if r.get("witness_signature")
+                            "witness_signature": witness_signature.hex()
+                            if witness_signature
                             else None,
                         })
                 if witness_receipts:
@@ -636,15 +729,13 @@ def export(
 
         bundle["manifest"]["bundle_hash"] = digest
         bundle["manifest"]["bundle_hash_covers"] = (
-            "manifest (minus bundle_hash) + events + timestamp_batches (if present) "
+            "manifest (minus bundle_hash) + events "
             "+ witness_registrations + witness_receipts, canonical JSON"
         )
 
-        ts_count = len(bundle.get("timestamp_batches", []))
-        ts_note = f", {ts_count} TSA timestamp batches" if ts_count else ""
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(bundle, indent=2))
-        click.echo(f"Exported {len(events)} events{ts_note} to {output}")
+        click.echo(f"Exported {len(events)} events to {output}")
         _save_last_bundle_hash(output.parent, digest)
     finally:
         sub.close()
@@ -757,59 +848,6 @@ def diff(older: Path, newer: Path, output: Path | None, fmt: str) -> None:
         click.echo(f"Diff written to {output}")
     else:
         click.echo(result, nl=False)
-
-
-@main.command()
-@click.option("--dsn", required=True, help="Postgres DSN")
-@click.option("--project", required=True, help="Regista project name")
-@click.option("--keys", required=True, type=click.Path(exists=True, path_type=Path))
-@click.option("--tsa-url", required=True, help="RFC 3161 TSA endpoint URL")
-@click.option("--batch-size", default=1000, help="Max events per batch")
-@click.option("--hash-algo", default="sha256", help="Hash algorithm (sha256/sha384/sha512)")
-def timestamp(
-    dsn: str,
-    project: str,
-    keys: Path,
-    tsa_url: str,
-    batch_size: int,
-    hash_algo: str,
-) -> None:
-    """Submit event batches to an RFC 3161 TSA for timestamping.
-
-    Connects to regista, computes a Merkle root over unbaptized events,
-    submits it to the configured TSA, and stores the resulting token.
-    Requires asn1crypto: pip install regista[timestamping]
-    """
-    _check_key_permissions_strict(keys)
-
-    from regista import Regista
-    from regista._timestamping import TSAConfig
-
-    sub = Regista(dsn=dsn, project=project, hmac_key_path=str(keys))
-
-    tsa_config = TSAConfig(
-        tsa_url=tsa_url,
-        batch_size=batch_size,
-        hash_algorithm=hash_algo,
-    )
-    sub.timestamping.set_config(tsa_config)
-
-    try:
-        batch = sub.timestamping.trigger()
-        if batch is None:
-            click.echo("No unbaptized events to timestamp.")
-        else:
-            click.echo(f"Timestamped batch {batch.batch_id}")
-            click.echo(f"  Events      : {len(batch.event_ids)}")
-            click.echo(f"  Merkle root : {batch.merkle_root.hex()[:32]}...")
-            click.echo(f"  Status      : {batch.status}")
-            if batch.tsa_timestamp:
-                click.echo(f"  TSA time    : {batch.tsa_timestamp}")
-    except Exception as exc:
-        click.echo(f"Timestamping failed: {exc}", err=True)
-        raise SystemExit(1) from exc
-    finally:
-        sub.close()
 
 
 @main.command("install-harness")

@@ -28,6 +28,7 @@ Exit code 0 = proof passed; non-zero = proof failed.
 
 from __future__ import annotations
 
+import argparse
 import datetime
 import json
 import re
@@ -93,10 +94,35 @@ def _detect_claude_version() -> str:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Run Cairn's live provenance proof")
+    parser.add_argument(
+        "--project-instance-id",
+        default=None,
+        help="external project_instance_id pin (or CAIRN_PROJECT_INSTANCE_ID)",
+    )
+    parser.add_argument(
+        "--trust-domain-id",
+        default=None,
+        help="external trust_domain_id pin (or CAIRN_TRUST_DOMAIN_ID)",
+    )
+    parser.add_argument(
+        "--cutover-checkpoint-event-hash",
+        default=None,
+        help=(
+            "external cutover checkpoint event-hash pin "
+            "(or CAIRN_CUTOVER_CHECKPOINT_EVENT_HASH)"
+        ),
+    )
+    args = parser.parse_args()
     config = _get_config()
     dsn = config["REGISTA_DSN"]
     key_path = config.get("REGISTA_KEY_PATH", "")
     project = config.get("CAIRN_PROJECT", "agent_provenance")
+    project_instance_id = args.project_instance_id or config.get("CAIRN_PROJECT_INSTANCE_ID")
+    trust_domain_id = args.trust_domain_id or config.get("CAIRN_TRUST_DOMAIN_ID")
+    checkpoint_hash = args.cutover_checkpoint_event_hash or config.get(
+        "CAIRN_CUTOVER_CHECKPOINT_EVENT_HASH"
+    )
     expected_hv = _detect_claude_version()
 
     correlation_id = str(uuid.uuid4())
@@ -171,7 +197,14 @@ def main() -> int:
         print()
         print("[3/4] Running canonical verifier (cairn export + verify)...")
         verifier_report, verifier_detail = run_canonical_verifier(
-            dsn, project, key_path, tmpdir, since_timestamp
+            dsn,
+            project,
+            key_path,
+            tmpdir,
+            since_timestamp,
+            project_instance_id=project_instance_id,
+            trust_domain_id=trust_domain_id,
+            cutover_checkpoint_event_hash=checkpoint_hash,
         )
         print(f"  {verifier_detail}")
 

@@ -194,6 +194,13 @@ def main() -> None:
     except ValueError:
         session_id = str(uuid.uuid5(uuid.NAMESPACE_URL, session_id))
 
+    # The missing-config guard above is the real check; this one exists so the
+    # construction below is honestly non-Optional at runtime too (an assert
+    # would vanish under python -O, which is not a guarantee a signer gets to
+    # lose).
+    if dsn is None or project is None:
+        sys.stderr.write("cairn_bridge: DSN and project must both be configured\n")
+        sys.exit(1)
     sub = Regista(dsn=dsn, project=project, hmac_key_path=_resolve_key_path(cfg))
     adapter = CairnAdapter(
         sub,

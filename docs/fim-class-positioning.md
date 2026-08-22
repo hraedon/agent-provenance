@@ -215,7 +215,8 @@ signing. It is mitigated by:
 - Key access restricted to the service account (mode `0600`)
 - Key rotation events creating an auditable chain
 - Ed25519 asymmetric signing available for operator-forgery resistance
-- RFC 3161 trusted timestamping available for backdating defense
+- No trusted-time guarantee: RFC 3161 timestamping was removed with regista
+  0.6+ (the batch Merkle construction witnessed no content)
 
 ### 5.2 Missing Events
 
@@ -281,7 +282,7 @@ teams as:
 | Control description template | Complete (§4) |
 | Auditor validation | **Open** — highest-leverage research item |
 | Asymmetric signing (Ed25519) | **Landed** (regista BC-196, Plan 011) |
-| RFC 3161 timestamping | **Landed** (regista Plan 012; TSA sig verify pending BC-229) |
+| RFC 3161 timestamping | **Removed** — regista deleted the subsystem in 0.6.0 (the Merkle construction witnessed no content) |
 | Witness federation | Roadmap |
 
 ---

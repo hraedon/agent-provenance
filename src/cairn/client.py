@@ -261,7 +261,8 @@ class CairnClient:
     ) -> Any:
         """Record a session-level attestation event.
 
-        Uses entity_kind="session" for structural distinctness from tool calls.
+        Uses the v6 ``note`` entity kind for structural distinctness from tool
+        calls (pre-v6 stores wrote these as entity_kind="session").
 
         Args:
             harnesses: List of harness dicts with ``name`` and ``version``.

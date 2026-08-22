@@ -68,14 +68,21 @@ class AssuranceLevel:
 
 @dataclass(frozen=True)
 class KeyRotationEntry:
-    """A key rotation event detected in the log."""
+    """A key rotation event detected in the log.
+
+    ``signature_valid`` is ``True`` (verified under the predecessor key),
+    ``False`` (proven not to verify — a forged rotation claim), or ``None``
+    (the verdict could not be established from the presented material, e.g. a
+    v6 event whose referents the verifier was not handed — an evidentiary
+    gap, never reported as a forgery).
+    """
 
     event_id: str
     work_item_id: str
     predecessor_key_id: str
     successor_key_id: str
     rotated_at: str | None
-    signature_valid: bool
+    signature_valid: bool | None
     detail: str | None = None
 
 
@@ -86,7 +93,12 @@ class VerificationEntry:
     event_seq: int
     timestamp: str
     transition: str | None
-    result: str  # "ok" | "signature_failed" | "hash_mismatch" | "revoked_key" | "unknown_key"
+    # "ok" | "signature_failed" | "hash_mismatch" | "revoked_key" |
+    # "unknown_key" | "unverified" (cryptographically intact but the verdict is
+    # not established from the presented material — e.g. a v6 event whose
+    # key-binding referents are not in the bundle; an evidentiary gap, not a
+    # proven forgery)
+    result: str
     detail: str | None = None
 
 
@@ -429,6 +441,10 @@ class ContentCoverageGap:
 class VerificationReport:
     total_events: int = 0
     ok: int = 0
+    #: Events whose signatures verified but whose full verdict could not be
+    #: established from the presented material (v6 referent gaps offline).
+    #: Counted separately from failures: not proven is not proven false.
+    unverified_events: int = 0
     signature_failed: int = 0
     hash_mismatch: int = 0
     revoked_key: int = 0
@@ -459,10 +475,24 @@ class VerificationReport:
     bundle_hash_detail: str | None = None
     previous_bundle_hash: str | None = None
     chain_integrity_ok: bool | None = None
+    # Values emitted by the canonical verifier and preserved by proof-runner
+    # parsing.  They are separate from the locally reconstructed counters:
+    # a lossy consumer must never turn a canonical exit-1 into a pass.
+    canonical_all_ok: bool | None = None
+    canonical_aggregate_verdict: str | None = None
 
     @property
     def key_rotation_failures(self) -> int:
-        return sum(1 for kr in self.key_rotations if not kr.signature_valid)
+        return sum(1 for kr in self.key_rotations if kr.signature_valid is False)
+
+    @property
+    def unverified_key_rotations(self) -> int:
+        """Rotations whose signature could not be established from this material.
+
+        Distinct from :attr:`key_rotation_failures` (a proven forgery): an
+        unverified rotation is an evidentiary gap, reported by name.
+        """
+        return sum(1 for kr in self.key_rotations if kr.signature_valid is None)
 
     @property
     def key_revocation_failures(self) -> int:
@@ -471,10 +501,6 @@ class VerificationReport:
     @property
     def delegation_chain_failures(self) -> int:
         return sum(1 for dc in self.delegation_chains if not dc.validation_ok)
-
-    @property
-    def tsa_signature_failures(self) -> int:
-        return sum(1 for tb in self.timestamp_batches if tb.verified is False)
 
     @property
     def witness_signature_failures(self) -> int:
@@ -492,16 +518,35 @@ class VerificationReport:
 
     @property
     def all_ok(self) -> bool:
+        # An unverified event fails the aggregate. This is deliberately
+        # fail-closed: "not proven" is not "ok", and an audit gate that
+        # reports success while part of the log was never established would
+        # be the exact smoothing this verdict exists to prevent. The report
+        # names every unverified event and why, so the nonzero exit is a
+        # decision an operator can act on, not a mystery.
+        # A canonical failure is authoritative even when this consumer did
+        # not reconstruct the finding family that caused it.  A canonical
+        # ``True`` remains subject to locally reconstructed checks so an
+        # inconsistent or older report cannot hide a finding this consumer
+        # does understand.
+        if self.canonical_all_ok is False:
+            return False
+
         bundle_ok = self.bundle_hash_ok is not False
         chain_ok = self.chain_integrity_ok is not False
         return (
-            self.signature_failed == 0
+            self.unverified_events == 0
+            # An unestablished rotation is not a proven forgery, but the
+            # aggregate gate does not pass on it either: the rotation claim
+            # was never verified, and the old boolean path counted exactly
+            # this case as a failure. Same strictness, honest classification.
+            and self.unverified_key_rotations == 0
+            and self.signature_failed == 0
             and self.hash_mismatch == 0
             and self.revoked_key == 0
             and self.key_rotation_failures == 0
             and self.key_revocation_failures == 0
             and self.delegation_chain_failures == 0
-            and self.tsa_signature_failures == 0
             and self.witness_signature_failures == 0
             and self.unverified_witness_receipts == 0
             and len(self.witness_coverage_violations) == 0
@@ -517,3 +562,11 @@ class VerificationReport:
             and bundle_ok
             and chain_ok
         )
+
+    @property
+    def aggregate_verdict(self) -> str:
+        """The explicit aggregate verdict used by the proof gate."""
+
+        if self.canonical_aggregate_verdict is not None:
+            return self.canonical_aggregate_verdict
+        return "pass" if self.all_ok else "fail"

@@ -28,11 +28,36 @@ Usage::
         result_summary={"exit_code": 0},
         files=["/projects/foo/bar.py"],
     )
+
+regista 0.7 (v6 epoch) notes:
+
+* The project must be provisioned before the adapter can write: a v6 genesis,
+  a ``principal_key_accepted`` for the signing principal, and a signed
+  ``workflow_registered`` for ``cairn_agent_actions``.  Provisioning is an
+  operator action (suite bootstrap); the adapter never opens an epoch or
+  registers a workflow implicitly.
+* The signing actor must be a canonical regista principal (``kind:subject``)
+  whose key the project has accepted.  The adapter's default actor is the
+  ``service:cairn`` principal; when ``on_behalf_of`` carries a principal, that
+  principal signs (its key must be accepted by the project).
+* ``on_behalf_of`` has no v6 envelope field: regista refuses it at the writer
+  (``INVALID_ARGUMENT``).  The delegation context is recorded inside the signed
+  *payload* (cairn's own schema carries it), which is where these tests and the
+  verifier read it.
+* Session-scoped events are written as ``entity_kind="note"`` — the v6 closed
+  registry's non-work-item, UUID-addressed, independently readable entity
+  (regista 0.7.0 AMENDMENTS §1).  Pre-v6 artifacts with ``entity_kind="session"``
+  remain verifiable by the read-only verifier.
+* The signed producer identity is process-level (``REGISTA_PRODUCER_*``); the
+  adapter seeds the harness half from its :class:`CairnConfig` when the process
+  has not declared one.  Model lineage lives only in the producer, never in
+  ``actor_metadata`` (regista refuses producer fields there).
 """
 
 from __future__ import annotations
 
 import datetime
+import os
 import uuid
 from typing import Any
 
@@ -68,6 +93,39 @@ from .schema import (
 
 log = structlog.get_logger()
 
+# The v6 entity kind for session-scoped events. regista 0.7's closed registry
+# has no "session" kind; ``note`` is the non-work-item, UUID-addressed,
+# independently readable entity (AMENDMENTS §1), which is exactly the role the
+# session log plays. Historical rows written as "session" by pre-v6 cairn stay
+# verifiable by the read-only verifier.
+SESSION_ENTITY_KIND = "note"
+
+# Environment variables the v6 writer resolves the process producer from
+# (``regista.resolve_producer``'s documented contract names). Seeding them here
+# is cairn's only channel: the public write API resolves the producer from the
+# process environment and accepts no per-call producer argument, by design —
+# the producer is a property of the running process, not of a business call.
+_PRODUCER_ENV_HARNESS = "REGISTA_PRODUCER_HARNESS"
+_PRODUCER_ENV_HARNESS_VERSION = "REGISTA_PRODUCER_HARNESS_VERSION"
+
+
+def _ensure_producer_env(config: CairnConfig) -> None:
+    """Seed the harness half of the v6 producer identity from the adapter config.
+
+    An unset producer is a refusal at every write (``LOAD_BEARING_FIELD_MISSING``)
+    — regista deliberately provides no default, because an invented harness name
+    would be a signed falsehood. The falsehood to avoid here is the mirror
+    image: silently *overwriting* a producer the operator already declared for
+    this process. So: fill the harness fields only when they are unset, and
+    never touch ``REGISTA_PRODUCER_MODEL`` / ``REGISTA_PRODUCER_MODEL_LINEAGE``
+    (cairn does not know the model; setting exactly one of the pair is itself a
+    refusal, and that is the operator's signal to fix their environment).
+    """
+    if not os.environ.get(_PRODUCER_ENV_HARNESS):
+        os.environ[_PRODUCER_ENV_HARNESS] = config.harness_name
+    if not os.environ.get(_PRODUCER_ENV_HARNESS_VERSION):
+        os.environ[_PRODUCER_ENV_HARNESS_VERSION] = config.harness_version
+
 
 class CairnAdapter:
     """Bridge between agent harnesses and the regista event log."""
@@ -77,6 +135,10 @@ class CairnAdapter:
     DEFAULT_WORKFLOW = "cairn_agent_actions"
     DEFAULT_WORK_ITEM_TYPE = "tool_call"
     DEFAULT_ACTOR_KIND = "agent"
+    # Canonical v6 principal for the cairn service itself (``kind:subject`` —
+    # bare names are refused by the v6 envelope grammar). Used only when no
+    # ``on_behalf_of`` principal and no explicit actor are supplied.
+    DEFAULT_ACTOR_ID = "service:cairn"
 
     def __init__(
         self,
@@ -97,15 +159,18 @@ class CairnAdapter:
             work_item_type: Work-item type to use for created work items.
             actor_id: Default actor identifier (falls back to principal_id).
             actor_kind: Default actor kind (``agent``, ``human``, ``system``).
-            on_behalf_of: Default delegation chain applied to every event.
+            on_behalf_of: Default delegation chain recorded in every payload.
         """
         self._sub = regista
         self._config = config
         self._workflow = workflow_name
         self._work_item_type = work_item_type
-        self._actor_id = actor_id or (on_behalf_of["principal_id"] if on_behalf_of else "cairn")
+        self._actor_id = actor_id or (
+            on_behalf_of["principal_id"] if on_behalf_of else self.DEFAULT_ACTOR_ID
+        )
         self._actor_kind = actor_kind
         self._on_behalf_of = on_behalf_of
+        _ensure_producer_env(config)
 
     # ------------------------------------------------------------------
     # Scope attestation (signed first-class event)
@@ -188,7 +253,6 @@ class CairnAdapter:
             actor_kind=self._actor_kind,
             actor_metadata={"role": "agent", "phase": "attestation"},
             payload={"tool": "scope_attestation", "tool_args_hash": ""},
-            on_behalf_of={"principal_id": principal_id},
         )
 
         event = self._sub.transition(
@@ -198,7 +262,6 @@ class CairnAdapter:
             actor_kind=self._actor_kind,
             actor_metadata={"role": "agent", "phase": "attestation"},
             payload=payload,
-            on_behalf_of={"principal_id": principal_id},
         )
 
         log.info(
@@ -226,8 +289,9 @@ class CairnAdapter:
     ) -> Any:
         """Record a session-level attestation as a non-work-item entity.
 
-        Uses entity_kind="session" so the attestation is structurally distinct
-        from tool-call events (BC-005). No work item is created.
+        Uses the v6 ``note`` entity kind (the closed registry's UUID-addressed
+        non-work-item entity) so the attestation is structurally distinct from
+        tool-call events (BC-005). No work item is created.
 
         Args:
             principal_id: Human principal on whose behalf this session runs.
@@ -265,6 +329,10 @@ class CairnAdapter:
             content_capture=content_capture,
             content_encryption=content_encryption,
             redaction_policy=redaction_policy,
+            on_behalf_of={
+                "principal_id": principal_id,
+                "session_id": session_id,
+            },
         ).to_dict()
 
         try:
@@ -281,8 +349,7 @@ class CairnAdapter:
             actor_metadata={"role": "agent", "phase": "session_attestation"},
             transition="session_attestation",
             payload=payload,
-            on_behalf_of={"principal_id": principal_id, "session_id": session_id},
-            entity_kind="session",
+            entity_kind=SESSION_ENTITY_KIND,
             event_id=event_id,
         )
 
@@ -372,7 +439,6 @@ class CairnAdapter:
             actor_kind=self._actor_kind,
             actor_metadata={"role": "agent", "phase": "begin"},
             payload=payload,
-            on_behalf_of=delegation,
         )
 
         if parent_action_event_id:
@@ -447,7 +513,6 @@ class CairnAdapter:
             actor_kind=self._actor_kind,
             actor_metadata={"role": "agent", "phase": "end"},
             payload=payload,
-            on_behalf_of=delegation,
         )
 
         log.info(
@@ -525,8 +590,7 @@ class CairnAdapter:
             actor_metadata={"role": "agent", "phase": "user_message"},
             transition="user_message",
             payload=payload,
-            on_behalf_of=delegation,
-            entity_kind="session",
+            entity_kind=SESSION_ENTITY_KIND,
             event_id=event_id,
         )
         log.info("cairn.user_message", session_id=session_id, actor=actor)
@@ -573,8 +637,7 @@ class CairnAdapter:
             actor_metadata={"role": "agent", "phase": "assistant_message"},
             transition="assistant_message",
             payload=payload,
-            on_behalf_of=delegation,
-            entity_kind="session",
+            entity_kind=SESSION_ENTITY_KIND,
             event_id=event_id,
         )
         log.info("cairn.assistant_message", session_id=session_id, actor=actor)
@@ -623,8 +686,7 @@ class CairnAdapter:
             actor_metadata={"role": "agent", "phase": "transcript_attestation"},
             transition="transcript_attestation",
             payload=payload,
-            on_behalf_of=delegation,
-            entity_kind="session",
+            entity_kind=SESSION_ENTITY_KIND,
             event_id=event_id,
         )
         log.info("cairn.transcript_attestation", session_id=session_id, actor=actor)
@@ -668,8 +730,7 @@ class CairnAdapter:
             actor_metadata={"role": "agent", "phase": "subagent_start"},
             transition="subagent_start",
             payload=payload,
-            on_behalf_of=delegation,
-            entity_kind="session",
+            entity_kind=SESSION_ENTITY_KIND,
             event_id=event_id,
         )
         log.info("cairn.subagent_start", session_id=session_id, agent_id=agent_id, actor=actor)
@@ -716,8 +777,7 @@ class CairnAdapter:
             actor_metadata={"role": "agent", "phase": "subagent_stop"},
             transition="subagent_stop",
             payload=payload,
-            on_behalf_of=delegation,
-            entity_kind="session",
+            entity_kind=SESSION_ENTITY_KIND,
             event_id=event_id,
         )
         log.info("cairn.subagent_stop", session_id=session_id, agent_id=agent_id, actor=actor)
@@ -765,8 +825,7 @@ class CairnAdapter:
             actor_metadata={"role": "agent", "phase": "compaction"},
             transition="compaction",
             payload=payload,
-            on_behalf_of=delegation,
-            entity_kind="session",
+            entity_kind=SESSION_ENTITY_KIND,
             event_id=event_id,
         )
         log.info("cairn.compaction", session_id=session_id, trigger=trigger, actor=actor)

@@ -72,11 +72,14 @@ regista:
   now a first-class field on events, validated by regista's contract layer.
   Includes `principal_id`, `session_id`, `authenticated_at`, `scope`,
   and `expires_at`.
-- **BC-198** — **Partially landed**. RFC 3161 trusted timestamping (Plan 012)
-  and witness federation (Plan 013) are implemented in regista.
-  `cairn timestamp` submits Merkle-rooted event batches to a TSA.
-  TSA signature verification against a trust anchor (BC-229) is not yet
-  implemented. OpenTimestamps anchoring is not yet implemented.
+- **BC-198** — **Removed**. RFC 3161 trusted timestamping was implemented in
+  regista Plan 012 but deleted outright in regista 0.6.0: the batch Merkle
+  tree committed to `uuid.bytes` and therefore witnessed no content, and the
+  verification path returned positive verdicts without a trust anchor. cairn's
+  `timestamp` command and TSA token verification were removed with it; bundles
+  exported from pre-0.6 stores still carry their `timestamp_batches` section,
+  reported as stated and never claimed verified. Witness federation (Plan 013)
+  remains. OpenTimestamps anchoring was never implemented.
 
 These are regista-level concerns; this project consumes regista's
 guarantees and shouldn't reimplement them. As they land, this project's
@@ -92,9 +95,9 @@ layers 3-4 are now available as regista's primitives have landed.
 2. **Delegation chain** in the event payload: `principal_id`, `session_id`,
    `authenticated_at`, `scope`. Signed as part of canonical JSON. — **v1,
    available** (regista BC-197, Plan 010).
-3. **RFC 3161 trusted-timestamp tokens** on event batches. Cheap defense
-   against the operator backdating events with their own key. — **available**
-   (regista Plan 012; `cairn timestamp` command).
+3. **RFC 3161 trusted-timestamp tokens** on event batches. — **removed**:
+   regista deleted the subsystem in 0.6.0 (the Merkle construction witnessed
+   no content); no trusted-time guarantee is offered in its place.
 4. **Asymmetric signing** (Ed25519) so auditors verify with a public key
    instead of holding the signing secret. — **available** (regista BC-196,
    Plan 011).

@@ -377,7 +377,10 @@ def _probe_session_attestation(sub: Any, probe: _StoreProbe) -> None:
         return
     probe.session_scoped = True
     for event in events or []:
-        if getattr(event, "entity_kind", "work_item") != "session":
+        # "note" is the v6 entity kind for session-scoped events (regista 0.7's
+        # closed registry); "session" is the pre-v6 spelling, still produced by
+        # older stores.
+        if getattr(event, "entity_kind", "work_item") not in ("session", "note"):
             continue
         ts = getattr(event, "timestamp", None)
         if ts is None:
