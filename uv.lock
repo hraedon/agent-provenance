@@ -942,7 +942,7 @@ wheels = [
 
 [[package]]
 name = "regista-hraedon"
-version = "0.5.4"
+version = "0.7.1"
 source = { editable = "../regista" }
 dependencies = [
     { name = "jsonschema" },
@@ -966,7 +966,6 @@ vault = [
 [package.metadata]
 requires-dist = [
     { name = "agent-suite-conformance", marker = "python_full_version >= '3.12' and extra == 'dev'", specifier = "==1.0.0" },
-    { name = "asn1crypto", marker = "extra == 'timestamping'", specifier = ">=1.5" },
     { name = "azure-identity", marker = "extra == 'azure'", specifier = ">=1.16" },
     { name = "azure-keyvault-secrets", marker = "extra == 'azure'", specifier = ">=4.8" },
     { name = "cryptography", marker = "extra == 'encryption'", specifier = ">=42.0" },
@@ -976,7 +975,6 @@ requires-dist = [
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.100" },
     { name = "jsonschema", specifier = ">=4.21" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
-    { name = "opentimestamps", marker = "extra == 'anchoring'", specifier = ">=0.4" },
     { name = "prometheus-client", specifier = ">=0.20" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
     { name = "psycopg-pool", specifier = ">=3.2,<4" },
@@ -995,7 +993,7 @@ requires-dist = [
     { name = "types-pyyaml", marker = "extra == 'dev'" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'sidecar'", specifier = ">=0.30" },
 ]
-provides-extras = ["dev", "sidecar", "ed25519", "encryption", "vendor-check", "timestamping", "anchoring", "vault", "azure", "windows"]
+provides-extras = ["dev", "sidecar", "ed25519", "encryption", "vendor-check", "vault", "azure", "windows"]
 
 [[package]]
 name = "requests"

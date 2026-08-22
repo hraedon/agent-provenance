@@ -548,15 +548,19 @@ def test_failed_attempt_never_annotates_foreign_marker(monkeypatch, cfg, capsys)
 # ---------------------------------------------------------------------------
 
 
-def test_integrity_verifies_production_scale_chain(monkeypatch, cfg, capsys):
+def test_integrity_verifies_production_scale_chain(monkeypatch, cfg, capsys, tmp_path):
     """End-to-end: a chain with thousands of signed events replays and
     verifies through ``cairn integrity``, while doctor never pays that cost."""
-    from regista.testing import InMemoryRegista
+    from conftest import CAIRN_TEST_PRINCIPALS
+    from regista.testing import InMemoryRegista, make_v6_keyset, open_v6_epoch
 
     from cairn import CairnAdapter, CairnConfig
 
     monkeypatch.setenv("CAIRN_TEST_SECRET", "0" * 64)
-    sub = InMemoryRegista(project="cairn_scale", hmac_key_path=cfg.key_path)
+    keyset = make_v6_keyset(tmp_path, principals=CAIRN_TEST_PRINCIPALS)
+    sub = InMemoryRegista(project="cairn_scale", hmac_key_path=keyset.path)
+    open_v6_epoch(sub, keyset, principals=CAIRN_TEST_PRINCIPALS)
+    sub.register_workflow_file("workflows/cairn_agent_actions.yaml")
     adapter = CairnAdapter(
         sub,
         config=CairnConfig("test-harness", "0.0"),
@@ -784,90 +788,62 @@ def test_key_file_with_no_active_key_fails(cfg, tmp_path):
 
 
 @pytest.fixture
-def unattributable_store(tmp_path):
-    """A real chain signed by a key this project never registered.
+def v6_postgres_store(tmp_path):
+    """A real Postgres-backed v6 project with a healthy attributable chain.
 
-    Reproduces the qual-linux state: the signer selects the principal's active
-    Ed25519 key, but nothing in *this* project's ``principal_keys`` names that
-    actor, so ``regista bundle verify`` rejects every event. Reached in practice
-    by provisioning the principal in a different project against the same key
-    file (regista WI-223).
+    Provisioned exactly as the suite bootstrap would: a v6 keyset, an opened
+    epoch accepting the cairn test principals, cairn's workflow registered as
+    a signed event, and a tool-call chain written through the adapter.
+
+    WI-036 history: this replaces the ``unattributable_store`` fixture, which
+    built a chain signed by an Ed25519 key the project never registered — a
+    real pre-v6 defect (reached by provisioning the principal in a different
+    project against the same key file, regista WI-223). regista's v6 epoch
+    makes that state unwritable: every append must resolve a preceding
+    key-binding anchor (``KEY_BINDING_UNRESOLVED`` refusal at write time), and
+    a v6 event's principal binding is established by the acceptance chain,
+    never by the ``principal_keys`` projection. The write-refusal half is
+    pinned by ``test_integrity_unaccepted_principal_is_refused_at_write_time``
+    below; this fixture pins the positive half — a legitimately written v6
+    chain verifies end to end.
     """
-    import base64
-
+    from conftest import CAIRN_TEST_PRINCIPALS
     from regista import Regista
-    from regista.testing import drop_project_schema
+    from regista.testing import (
+        drop_project_schema,
+        make_v6_keyset,
+        open_v6_epoch,
+    )
+
+    from cairn import CairnAdapter, CairnConfig
 
     dsn = resolve_test_dsn()
     if not postgres_reachable(dsn):
         pytest.skip("Postgres not available; set REGISTA_TEST_DSN to run")
 
-    import nacl.signing
-
-    sk = nacl.signing.SigningKey.generate()
-    priv = tmp_path / "actor.key"
-    priv.write_bytes(bytes(sk))
-    priv.chmod(0o600)
-
-    principal_id = f"wi036_agent_{uuid.uuid4().hex[:8]}"
-    project = f"wi036_{uuid.uuid4().hex[:8]}"
-    key_path = tmp_path / "unregistered-keys.json"
-    key_path.write_text(
-        json.dumps(
-            {
-                "keys": [
-                    {
-                        "key_id": "bootstrap-hmac",
-                        "secret": "dGVzdA==",
-                        "encoding": "base64",
-                        "status": "active",
-                    },
-                    {
-                        "key_id": f"pk_{uuid.uuid4().hex[:8]}",
-                        "scheme": "ed25519",
-                        "principal_id": principal_id,
-                        "secret_ref": f"file:{priv}",
-                        "public_key": base64.b64encode(
-                            bytes(sk.verify_key)
-                        ).decode("ascii"),
-                        "role": "actor",
-                        "status": "active",
-                    },
-                ]
-            }
-        )
-    )
-
-    Regista.create_project(dsn=dsn, project=project, hmac_key_path=str(key_path))
-    sub = Regista(dsn=dsn, project=project, hmac_key_path=str(key_path))
+    keyset = make_v6_keyset(tmp_path, principals=CAIRN_TEST_PRINCIPALS)
+    project = f"cairn_v6_{uuid.uuid4().hex[:8]}"
+    Regista.create_project(dsn=dsn, project=project, hmac_key_path=keyset.path)
+    sub = Regista(dsn=dsn, project=project, hmac_key_path=keyset.path)
     try:
+        open_v6_epoch(sub, keyset, principals=CAIRN_TEST_PRINCIPALS)
         sub.register_workflow_file("workflows/cairn_agent_actions.yaml")
-        # Deliberately NO register_principal_key for this project.
-        wi, _evt = sub.create_work_item(
-            workflow_name="cairn_agent_actions",
-            work_item_type="tool_call",
-            actor_id=principal_id,
-            actor_metadata={"role": "agent"},
-            custom_fields={"tool": "Bash", "status": "running"},
+        adapter = CairnAdapter(
+            sub,
+            config=CairnConfig("test-harness", "0.0"),
+            on_behalf_of={
+                "principal_id": "human:test",
+                "session_id": str(uuid.uuid4()),
+            },
         )
-        sub.transition(
-            work_item_id=wi.work_item_id,
-            transition_name="tool_call_begin",
-            actor_id=principal_id,
-            actor_metadata={"role": "agent"},
-        )
-        events = sub.read_events(work_item_id=wi.work_item_id)
-        assert events, "expected a signed chain"
-        assert all(e.scheme_id == "ed25519" for e in events), (
-            f"fixture precondition: expected an Ed25519-signed chain, got "
-            f"{[e.scheme_id for e in events]}"
-        )
+        wi = adapter.begin_tool_call(tool="Read", tool_args={"path": "/tmp/x"})
+        adapter.end_tool_call(wi.work_item_id, result_summary={"exit_code": 0})
     finally:
         sub.close()
 
     cfg = CairnEnvConfig(
         dsn=dsn,
-        key_path=str(key_path),
+        key_path=keyset.path,
         key_ref=None,
         project=project,
         state_dir=str(tmp_path / "state"),
@@ -879,28 +855,65 @@ def unattributable_store(tmp_path):
         drop_project_schema(dsn, project)
 
 
-def test_integrity_rejects_an_unattributable_postgres_chain(
-    monkeypatch, unattributable_store, capsys
+def test_integrity_unaccepted_principal_is_refused_at_write_time(tmp_path):
+    """The WI-036 defect class is unwritable in a v6 epoch.
+
+    Pre-v6, a key this project never registered could sign a durable chain
+    that every verifier then rejected as unattributable. The v6 writer refuses
+    the append itself when no preceding key-binding anchor accepts the
+    (principal, key) pair — the unattributable chain can no longer exist.
+    """
+    from regista import ErrorCode, Regista, RegistaError
+    from regista.testing import drop_project_schema, make_v6_keyset, open_v6_epoch
+
+    dsn = resolve_test_dsn()
+    if not postgres_reachable(dsn):
+        pytest.skip("Postgres not available; set REGISTA_TEST_DSN to run")
+
+    # A keyset whose "agent:rogue" principal was NEVER accepted by the project.
+    keyset = make_v6_keyset(tmp_path, principals=("agent:rogue",))
+    project = f"cairn_v6_{uuid.uuid4().hex[:8]}"
+    Regista.create_project(dsn=dsn, project=project, hmac_key_path=keyset.path)
+    sub = Regista(dsn=dsn, project=project, hmac_key_path=keyset.path)
+    try:
+        open_v6_epoch(sub, keyset, principals=())  # genesis, no acceptances
+        sub.register_workflow_file("workflows/cairn_agent_actions.yaml")
+        with pytest.raises(RegistaError) as excinfo:
+            sub.create_work_item(
+                workflow_name="cairn_agent_actions",
+                work_item_type="tool_call",
+                actor_id="agent:rogue",
+                actor_metadata={"role": "agent"},
+                custom_fields={"tool": "Bash", "status": "running"},
+            )
+        assert excinfo.value.code == ErrorCode.KEY_BINDING_UNRESOLVED
+    finally:
+        sub.close()
+        drop_project_schema(dsn, project)
+
+
+def test_integrity_verifies_a_healthy_v6_postgres_chain(
+    monkeypatch, v6_postgres_store, capsys
 ):
-    """End to end, no stubs: `cairn integrity` against a real chain whose events
-    are signed by a key this project never registered must exit nonzero, and
-    `cairn doctor` must report the failure it recorded (WI-036)."""
-    cfg = unattributable_store
+    """End to end, no stubs: `cairn integrity` against a real v6 chain exits
+    zero with binding verified through the acceptance chain, and `cairn
+    doctor` reports the recorded verdict without replaying."""
+    cfg = v6_postgres_store
     monkeypatch.setattr(doctor_mod, "resolve_config", lambda: cfg)
 
     rc = run_integrity(json_output=True)
     out = json.loads(capsys.readouterr().out)
-    assert rc == 1, out
-    assert out["chain_state"] == "unattributable", out
+    assert rc == 0, out
+    assert out["chain_state"] == "verified", out
     assert out["principal_binding_verified"] is True
-    assert out["principal_binding_failures"] > 0
 
-    rc = run_doctor(json_output=True)
+    # Doctor's overall exit aggregates unrelated environment checks (harness
+    # wiring, hook self-tests), so this test pins the chain verdict itself.
+    run_doctor(json_output=True)
     report = _doctor_report(capsys)
     check = _find_check(report, "chain_integrity")
-    assert check["status"] == "fail", report
-    assert report["regista"]["chain_ok"] is False
-    assert rc == 1
+    assert check["status"] == "ok", report
+    assert report["regista"]["chain_ok"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -219,6 +219,42 @@ class ToolCallEnd:
 ToolCallEvent = ToolCallBegin | ToolCallEnd
 
 
+def delegation_chain_of(ev: Any) -> dict[str, Any] | None:
+    """The event's delegation chain, from whichever carrier this row has.
+
+    Two carriers, both signed, one shape:
+
+    * pre-v6 rows carry the chain as the writer-level ``on_behalf_of`` column
+      (signed by the v1-v5 envelopes);
+    * v6 rows have no such column (regista refuses it at the writer) and carry
+      the *same* cairn schema object inside the signed payload, under the
+      ``on_behalf_of`` key the ``ToolCallBegin``/``ToolCallEnd``/session
+      payloads have always used.
+
+    A chain is recognized ONLY when it minimally looks like one — a mapping
+    with a non-empty ``principal_id`` string. Arbitrary payload content under
+    the same key therefore reads as "no chain" (and downstream validation
+    marks it missing) rather than being mistaken for a delegation the event
+    never carried. This is the single reader for both carriers; a second
+    hand-rolled one is how a row field and a payload field drift apart.
+    """
+    row_chain = getattr(ev, "on_behalf_of", None)
+    if isinstance(row_chain, dict):
+        principal = row_chain.get("principal_id")
+        if isinstance(principal, str) and principal:
+            return row_chain
+        # A malformed row chain is data, not a chain: fall through to the
+        # payload carrier, and if that is absent the event has no chain.
+    payload = getattr(ev, "payload", None)
+    if isinstance(payload, dict):
+        payload_chain = payload.get("on_behalf_of")
+        if isinstance(payload_chain, dict):
+            principal = payload_chain.get("principal_id")
+            if isinstance(principal, str) and principal:
+                return payload_chain
+    return None
+
+
 def hash_payload(payload: dict[str, Any]) -> str:
     """SHA-256 over RFC 8785 canonical JSON."""
     return hashlib.sha256(canonicalize(payload)).hexdigest()
@@ -331,6 +367,10 @@ class SessionAttestationPayload:
     content_capture: bool = False
     content_encryption: str = CONTENT_ENCRYPTION_OFF
     redaction_policy: str | None = None
+    # The delegation context (human principal + session chain) is signed
+    # payload content: regista's v6 envelope has no on_behalf_of field, so the
+    # payload — not the writer call — is where the session attribution lives.
+    on_behalf_of: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -347,6 +387,8 @@ class SessionAttestationPayload:
         d["content_encryption"] = self.content_encryption
         if self.redaction_policy is not None:
             d["redaction_policy"] = self.redaction_policy
+        if self.on_behalf_of is not None:
+            d["on_behalf_of"] = self.on_behalf_of
         return d
 
     @classmethod
@@ -362,6 +404,7 @@ class SessionAttestationPayload:
             content_capture=data.get("content_capture", False),
             content_encryption=data.get("content_encryption", CONTENT_ENCRYPTION_OFF),
             redaction_policy=data.get("redaction_policy"),
+            on_behalf_of=data.get("on_behalf_of"),
         )
 
 

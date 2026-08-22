@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from conftest import CAIRN_TEST_PRINCIPALS
 from regista import Regista
 
 from cairn import CairnAdapter, CairnConfig
@@ -693,7 +694,7 @@ def test_verify_bundle_chain_valid(hmac_keys: Path, tmp_path: Path) -> None:
     from regista._signing import sign_event
     from regista._types import Event
 
-    def make_event(seq: int) -> Event:
+    def make_event(seq: int, prev_global: bytes | None = None) -> Event:
         ev_id = uuid.uuid4()
         wi_id = uuid.uuid4()
         now = datetime.now(UTC)
@@ -709,6 +710,7 @@ def test_verify_bundle_chain_valid(hmac_keys: Path, tmp_path: Path) -> None:
             transition="tool_call_begin",
             payload={"tool": "Read"},
             key=key_bytes,
+            prev_global_event_hash=prev_global,
         )
         return Event(
             event_id=ev_id,
@@ -726,6 +728,7 @@ def test_verify_bundle_chain_valid(hmac_keys: Path, tmp_path: Path) -> None:
             payload_canonical_hash=c_hash,
             signature=sig,
             canonical_envelope=env,
+            prev_global_event_hash=prev_global,
         )
 
     # Bundle 1
@@ -743,8 +746,10 @@ def test_verify_bundle_chain_valid(hmac_keys: Path, tmp_path: Path) -> None:
         bytes(ev1.canonical_envelope) + bytes(ev1.signature)
     ).digest()
 
-    # Bundle 2 (references bundle 1, event chains to ev1)
-    ev2 = replace(make_event(1), prev_global_event_hash=ev1_hash)
+    # Bundle 2 (references bundle 1, event chains to ev1). The chain link is
+    # SIGNED into ev2's envelope (strict verification reconciles the row
+    # against the signed bytes — a row-only injection would be a forged field).
+    ev2 = make_event(1, prev_global=ev1_hash)
     manifest2: dict = {"events_count": 1, "previous_bundle_hash": hash1}
     bundle2: dict = {"manifest": manifest2, "events": [ev2.to_dict()]}
     canonical2 = json.dumps(bundle2, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -771,7 +776,7 @@ def test_verify_bundle_chain_broken(hmac_keys: Path, tmp_path: Path) -> None:
     from regista._signing import sign_event
     from regista._types import Event
 
-    def make_event(seq: int) -> Event:
+    def make_event(seq: int, prev_global: bytes | None = None) -> Event:
         ev_id = uuid.uuid4()
         wi_id = uuid.uuid4()
         now = datetime.now(UTC)
@@ -787,6 +792,7 @@ def test_verify_bundle_chain_broken(hmac_keys: Path, tmp_path: Path) -> None:
             transition="tool_call_begin",
             payload={"tool": "Read"},
             key=key_bytes,
+            prev_global_event_hash=prev_global,
         )
         return Event(
             event_id=ev_id,
@@ -804,6 +810,7 @@ def test_verify_bundle_chain_broken(hmac_keys: Path, tmp_path: Path) -> None:
             payload_canonical_hash=c_hash,
             signature=sig,
             canonical_envelope=env,
+            prev_global_event_hash=prev_global,
         )
 
     # Bundle 1
@@ -1792,11 +1799,14 @@ def test_mixed_hmac_ed25519_bundle() -> None:
 
     now = datetime.now(UTC)
 
-    # HMAC event
+    # HMAC event (the row must carry the same ids the envelope signed —
+    # strict verification reconciles the two and a fresh uuid.uuid4() per
+    # side is a forged row)
     hmac_ev_id = uuid.uuid4()
+    hmac_wi_id = uuid.uuid4()
     hmac_sig, hmac_chash, hmac_env = sign_event(
         event_id=hmac_ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=hmac_wi_id,
         actor_id="agent-1",
         key_id="hmac-key-001",
         event_seq=0,
@@ -1809,7 +1819,7 @@ def test_mixed_hmac_ed25519_bundle() -> None:
     )
     hmac_event = Event(
         event_id=hmac_ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=hmac_wi_id,
         event_seq=0,
         actor_id="agent-1",
         actor_kind="agent",
@@ -1828,9 +1838,10 @@ def test_mixed_hmac_ed25519_bundle() -> None:
 
     # Ed25519 event
     ed_ev_id = uuid.uuid4()
+    ed_wi_id = uuid.uuid4()
     ed_sig, ed_chash, ed_env = sign_event(
         event_id=ed_ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=ed_wi_id,
         actor_id="agent-2",
         key_id="ed25519-key-001",
         event_seq=0,
@@ -1844,7 +1855,7 @@ def test_mixed_hmac_ed25519_bundle() -> None:
     )
     ed_event = Event(
         event_id=ed_ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=ed_wi_id,
         event_seq=0,
         actor_id="agent-2",
         actor_kind="agent",
@@ -2083,9 +2094,10 @@ def test_scheme_counts_in_report(hmac_keys: Path) -> None:
     events = []
     for i in range(3):
         ev_id = uuid.uuid4()
+        wi_id = uuid.uuid4()
         sig, c_hash, env = sign_event(
             event_id=ev_id,
-            work_item_id=uuid.uuid4(),
+            work_item_id=wi_id,
             actor_id="agent-1",
             key_id="cairn-test-001",
             event_seq=i,
@@ -2099,7 +2111,7 @@ def test_scheme_counts_in_report(hmac_keys: Path) -> None:
         events.append(
             Event(
                 event_id=ev_id,
-                work_item_id=uuid.uuid4(),
+                work_item_id=wi_id,
                 event_seq=i,
                 actor_id="agent-1",
                 actor_kind="agent",
@@ -2134,10 +2146,11 @@ def test_verify_bundle_with_timestamp_batches(tmp_path: Path) -> None:
     key_set = {"cairn-test-001": key_bytes}
 
     ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
     now = datetime.now(UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
         event_seq=0,
@@ -2150,7 +2163,7 @@ def test_verify_bundle_with_timestamp_batches(tmp_path: Path) -> None:
     )
     ev = Event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         event_seq=0,
         actor_id="agent-1",
         actor_kind="agent",
@@ -2208,10 +2221,11 @@ def test_verify_bundle_without_timestamp_batches(tmp_path: Path) -> None:
     key_set = {"cairn-test-001": key_bytes}
 
     ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
     now = datetime.now(UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
         event_seq=0,
@@ -2224,7 +2238,7 @@ def test_verify_bundle_without_timestamp_batches(tmp_path: Path) -> None:
     )
     ev = Event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         event_seq=0,
         actor_id="agent-1",
         actor_kind="agent",
@@ -2253,6 +2267,328 @@ def test_verify_bundle_without_timestamp_batches(tmp_path: Path) -> None:
     report = verifier.verify_bundle(bundle_path)
     assert report.all_ok
     assert report.timestamp_batches == []
+
+
+def test_tsa_temporal_ordering_only_checks_covered_events(
+    hmac_keys: Path, tmp_path: Path
+) -> None:
+    """BC-020: TSA temporal ordering only flags events covered by the batch.
+
+    Events whose ``event_id`` is in the batch's ``event_ids`` list are checked
+    against the TSA timestamp + tolerance.  Events NOT in the list are skipped,
+    even if their timestamp exceeds the deadline.
+    """
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
+
+    from datetime import UTC, datetime, timedelta
+
+    # TSA timestamp is at 12:00; tolerance is 5 minutes → deadline 12:05.
+    tsa_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    # Both events are at 12:10 — well past the 5-minute tolerance.
+    ev_time = tsa_time + timedelta(minutes=10)
+
+    ev_covered = _make_signed_event(
+        key_bytes,
+        event_seq=0,
+        transition="tool_call_begin",
+        payload={"tool": "Read"},
+        timestamp=ev_time,
+    )
+    ev_uncovered = _make_signed_event(
+        key_bytes,
+        event_seq=1,
+        transition="tool_call_end",
+        payload={"tool": "Read"},
+        timestamp=ev_time,
+    )
+
+    ts_batch_id = str(uuid.uuid4())
+    bundle: dict = {
+        "manifest": {"events_count": 2},
+        "events": [ev_covered.to_dict(), ev_uncovered.to_dict()],
+        "timestamp_batches": [
+            {
+                "batch_id": ts_batch_id,
+                # Only ev_covered is in the batch's coverage.
+                "event_ids": [str(ev_covered.event_id)],
+                "merkle_root": "a" * 64,
+                "status": "confirmed",
+                "tsa_timestamp": tsa_time.isoformat(),
+            }
+        ],
+    }
+    manifest = bundle["manifest"]
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    manifest["bundle_hash"] = digest
+
+    bundle_path = tmp_path / "bundle_bc020.json"
+    bundle_path.write_text(json.dumps(bundle, indent=2))
+
+    verifier = Verifier(key_set)
+    report = verifier.verify_bundle(bundle_path)
+
+    tsa_violations = [
+        t for t in report.temporal_violations if t.kind == "event_after_tsa"
+    ]
+    # Exactly one violation — for the covered event only.
+    assert len(tsa_violations) == 1, (
+        f"Expected 1 TSA temporal violation (for covered event), "
+        f"got {len(tsa_violations)}: {[(v.event_id, v.detail) for v in tsa_violations]}"
+    )
+    assert tsa_violations[0].event_id == str(ev_covered.event_id)
+    # The uncovered event must NOT appear in any TSA violation.
+    assert tsa_violations[0].event_id != str(ev_uncovered.event_id)
+
+    # Verify event_ids are populated on the batch entry.
+    assert report.timestamp_batches[0].event_ids == (str(ev_covered.event_id),)
+
+
+
+# ---------------------------------------------------------------------------
+# v6 offline verification through bundle referents (regista 0.7.1 public
+# surface) — the remediation for "the offline verifier never supplied bundle
+# referents, so all v6 events were unverifiable"
+# ---------------------------------------------------------------------------
+
+
+def _v6_public_key_file(keyset, tmp_path: Path) -> Path:
+    """A verifier key file carrying only the keyset's Ed25519 public keys."""
+    entries = [
+        {
+            "key_id": key.key_id,
+            "scheme": "ed25519",
+            "public_key": key.public_key_b64,
+            "encoding": "base64",
+        }
+        for key in keyset.keys.values()
+    ]
+    key_file = tmp_path / "v6-public-keys.json"
+    key_file.write_text(json.dumps({"keys": entries}))
+    key_file.chmod(0o600)
+    return key_file
+
+
+def _v6_bundle(tmp_path: Path, events: list, manifest_extra: dict | None = None) -> Path:
+    """Write a bundle of v6 events with a correct bundle_hash."""
+    manifest: dict = {"events_count": len(events), **(manifest_extra or {})}
+    bundle: dict = {
+        "manifest": manifest,
+        "events": [ev.to_dict() for ev in events],
+    }
+    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    manifest["bundle_hash"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    path = tmp_path / "v6-bundle.json"
+    path.write_text(json.dumps(bundle, indent=2))
+    return path
+
+
+def _v6_epoch_bundle_events(v6_keyset, *, include_chain: bool = True):
+    """A healthy in-memory v6 epoch plus (optionally) its chain events.
+
+    Returns ``(all_events, ordinary_events)`` — the ordinary events are the
+    adapter-written tool-call stream; the chain events are genesis, key
+    acceptances and the workflow registration.
+    """
+    from regista.testing import InMemoryRegista, open_v6_epoch
+
+    from cairn import CairnAdapter, CairnConfig
+
+    sub = InMemoryRegista(project="cairn_v6_verify", hmac_key_path=v6_keyset.path)
+    open_v6_epoch(sub, v6_keyset, principals=CAIRN_TEST_PRINCIPALS)
+    sub.register_workflow_file("workflows/cairn_agent_actions.yaml")
+    adapter = CairnAdapter(
+        sub,
+        config=CairnConfig("opencode", "0.1.0"),
+        on_behalf_of={
+            "principal_id": "human:test",
+            "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        },
+    )
+    wi = adapter.begin_tool_call(tool="Edit", tool_args={"filePath": "/tmp/x"})
+    adapter.end_tool_call(wi.work_item_id, result_summary={"exit_code": 0})
+
+    events = list(sub.read_events(limit=100))
+    chain_transitions = {
+        "project_initialized",
+        "principal_key_accepted",
+        "workflow_registered",
+    }
+    if include_chain:
+        return events, [e for e in events if e.transition not in chain_transitions]
+    ordinary = [e for e in events if e.transition not in chain_transitions]
+    return ordinary, ordinary
+
+
+def test_v6_bundle_events_verify_through_bundle_referents(v6_keyset, tmp_path: Path) -> None:
+    """The core remediation: a v6 bundle IS its own referent material.
+
+    Every ordinary event fully authenticates (anchor, workflow registration
+    and epoch position resolve inside the bundle); the ONE unverified event
+    is the genesis, whose authority is the external trust-domain enrolment —
+    reported by name, never smoothed into "ok".
+    """
+    events, ordinary = _v6_epoch_bundle_events(v6_keyset)
+    assert len(ordinary) >= 3  # created + begin + end from the adapter
+
+    key_data = json.loads(_v6_public_key_file(v6_keyset, tmp_path).read_text())
+    key_set = {
+        e["key_id"]: base64.b64decode(e["public_key"]) for e in key_data["keys"]
+    }
+
+    bundle_path = _v6_bundle(tmp_path, events)
+    report = Verifier(key_set).verify_bundle(bundle_path)
+
+    # Everything authenticates except the genesis: acceptances and the
+    # workflow registration anchor on the in-bundle genesis and verify.
+    assert report.signature_failed == 0
+    assert report.ok == len(events) - 1
+    assert report.unverified_events == 1
+    unverified = [e for e in report.entries if e.result == "unverified"]
+    assert len(unverified) == 1
+    assert unverified[0].transition == "project_initialized"
+    assert "bootstrap" in (unverified[0].detail or "").lower()
+    # The evidentiary gap fails the aggregate — "not proven" is not "ok".
+    assert not report.all_ok
+
+    text = Verifier.format_report(report)
+    assert "VERDICT" in text and "FAIL" in text
+    assert "UNVERIFIED EVENTS" in text
+    assert "Evidentiary gap" in text
+
+
+def test_v6_bundle_cli_exits_one_with_unverified_section(v6_keyset, tmp_path: Path) -> None:
+    """The honest exit: `cairn verify` exits 1 while naming the gap."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    events, _ordinary = _v6_epoch_bundle_events(v6_keyset)
+    bundle_path = _v6_bundle(tmp_path, events)
+    keys_path = _v6_public_key_file(v6_keyset, tmp_path)
+
+    result = CliRunner().invoke(
+        main,
+        ["verify", "--bundle-path", str(bundle_path), "--keys", str(keys_path)],
+    )
+    assert result.exit_code == 1, result.output
+    assert "UNVERIFIED EVENTS" in result.output
+    assert "project_initialized" in result.output
+
+
+def test_v6_windowed_bundle_reports_anchor_gap_not_forgery(
+    v6_keyset, tmp_path: Path
+) -> None:
+    """A window that excludes the chain events is an evidentiary gap.
+
+    The tool-call events' signatures verify; their key-binding anchors are
+    outside the window, so they are UNVERIFIED — and critically NOT
+    signature failures. A referent gap is never a proven forgery.
+    """
+    events, _ordinary = _v6_epoch_bundle_events(v6_keyset, include_chain=False)
+    assert events
+
+    key_data = json.loads(_v6_public_key_file(v6_keyset, tmp_path).read_text())
+    key_set = {
+        e["key_id"]: base64.b64decode(e["public_key"]) for e in key_data["keys"]
+    }
+
+    # The manifest declares the window (regista derives completeness from
+    # since_seq/until_seq — the bundle, not the caller, makes the claim).
+    bundle_path = _v6_bundle(tmp_path, events, manifest_extra={"since_seq": 1})
+    report = Verifier(key_set).verify_bundle(bundle_path)
+
+    assert report.signature_failed == 0
+    assert report.unverified_events == len(events)
+    assert not report.all_ok
+    details = [e.detail or "" for e in report.entries]
+    assert all("key_binding" in d or "workflow" in d or "epoch" in d for d in details)
+
+
+def test_unknown_signing_key_is_unattributable_read_side(
+    v6_keyset, tmp_path: Path
+) -> None:
+    """Read-side unattributable coverage: an event whose key the verifier's
+    key set does not carry is reported unknown_key and fails the aggregate —
+    the chain cannot be attributed to anyone this key set can name."""
+    events, _ordinary = _v6_epoch_bundle_events(v6_keyset)
+    # A key file holding only the BOOTSTRAP key: the tool-call signer is absent.
+    bootstrap_only = tmp_path / "bootstrap-only.json"
+    bootstrap_only.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {
+                        "key_id": v6_keyset.bootstrap.key_id,
+                        "scheme": "ed25519",
+                        "public_key": v6_keyset.bootstrap.public_key_b64,
+                        "encoding": "base64",
+                    }
+                ]
+            }
+        )
+    )
+    bootstrap_only.chmod(0o600)
+    key_data = json.loads(bootstrap_only.read_text())
+    key_set = {
+        e["key_id"]: base64.b64decode(e["public_key"]) for e in key_data["keys"]
+    }
+
+    bundle_path = _v6_bundle(tmp_path, events)
+    report = Verifier(key_set).verify_bundle(bundle_path)
+
+    unknown = [e for e in report.entries if e.result == "unknown_key"]
+    assert unknown, "expected unknown-key entries for the unattributable events"
+    assert all("Unknown key_id" in (e.detail or "") for e in unknown)
+    assert report.revoked_key >= len(unknown)
+    assert not report.all_ok
+
+
+def test_key_rotation_referent_gap_is_unverified_not_failed(v6_keyset) -> None:
+    """A rotation event whose referents were not presented is NOT a forgery.
+
+    The rotation sub-check mirrors the event verdicts: only
+    Applicability.INVALID is a failure (signature_valid=False); an
+    evidentiary gap is signature_valid=None, counted separately and never
+    reported FAILED.
+    """
+    from regista.testing import InMemoryRegista, open_v6_epoch
+
+    sub = InMemoryRegista(project="cairn_v6_rotation", hmac_key_path=v6_keyset.path)
+    open_v6_epoch(sub, v6_keyset, principals=CAIRN_TEST_PRINCIPALS)
+    keyset_key = v6_keyset.key_for("service:cairn")
+    ev = sub.append_event(
+        work_item_id=uuid.uuid4(),
+        actor_id="service:cairn",
+        actor_kind="agent",
+        transition="key_rotation",
+        payload={
+            "tool": "key_rotation",
+            "predecessor_key_id": keyset_key.key_id,
+            "successor_key_id": "pk_next",
+            "rotated_at": None,
+        },
+        entity_kind="note",
+    )
+
+    key_set = {keyset_key.key_id: keyset_key.public_key}
+    # A bare event list presents NO chain material — the honest gap case.
+    report = Verifier(key_set).verify_events([ev])
+
+    assert report.unverified_events == 1
+    assert len(report.key_rotations) == 1
+    kr = report.key_rotations[0]
+    assert kr.signature_valid is None, (
+        "a referent gap must not be classified as a failed rotation signature"
+    )
+    assert report.key_rotation_failures == 0
+    assert report.unverified_key_rotations == 1
+    assert not report.all_ok
+
+    text = Verifier.format_report(report)
+    assert "UNVERIFIED" in text
 
 
 def get_scheme(scheme_id: str):
@@ -2525,83 +2861,6 @@ def test_temporal_ordering_authenticated_after_event(hmac_keys: Path) -> None:
     assert "authenticated_at" in tvs[0].detail
 
 
-def test_tsa_temporal_ordering_only_checks_covered_events(
-    hmac_keys: Path, tmp_path: Path
-) -> None:
-    """BC-020: TSA temporal ordering only flags events covered by the batch.
-
-    Events whose ``event_id`` is in the batch's ``event_ids`` list are checked
-    against the TSA timestamp + tolerance.  Events NOT in the list are skipped,
-    even if their timestamp exceeds the deadline.
-    """
-    key_data = json.loads(hmac_keys.read_text())
-    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
-    key_set = {key_data["keys"][0]["key_id"]: key_bytes}
-
-    from datetime import UTC, datetime, timedelta
-
-    # TSA timestamp is at 12:00; tolerance is 5 minutes → deadline 12:05.
-    tsa_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-    # Both events are at 12:10 — well past the 5-minute tolerance.
-    ev_time = tsa_time + timedelta(minutes=10)
-
-    ev_covered = _make_signed_event(
-        key_bytes,
-        event_seq=0,
-        transition="tool_call_begin",
-        payload={"tool": "Read"},
-        timestamp=ev_time,
-    )
-    ev_uncovered = _make_signed_event(
-        key_bytes,
-        event_seq=1,
-        transition="tool_call_end",
-        payload={"tool": "Read"},
-        timestamp=ev_time,
-    )
-
-    ts_batch_id = str(uuid.uuid4())
-    bundle: dict = {
-        "manifest": {"events_count": 2},
-        "events": [ev_covered.to_dict(), ev_uncovered.to_dict()],
-        "timestamp_batches": [
-            {
-                "batch_id": ts_batch_id,
-                # Only ev_covered is in the batch's coverage.
-                "event_ids": [str(ev_covered.event_id)],
-                "merkle_root": "a" * 64,
-                "status": "confirmed",
-                "tsa_timestamp": tsa_time.isoformat(),
-            }
-        ],
-    }
-    manifest = bundle["manifest"]
-    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
-    manifest["bundle_hash"] = digest
-
-    bundle_path = tmp_path / "bundle_bc020.json"
-    bundle_path.write_text(json.dumps(bundle, indent=2))
-
-    verifier = Verifier(key_set)
-    report = verifier.verify_bundle(bundle_path)
-
-    tsa_violations = [
-        t for t in report.temporal_violations if t.kind == "event_after_tsa"
-    ]
-    # Exactly one violation — for the covered event only.
-    assert len(tsa_violations) == 1, (
-        f"Expected 1 TSA temporal violation (for covered event), "
-        f"got {len(tsa_violations)}: {[(v.event_id, v.detail) for v in tsa_violations]}"
-    )
-    assert tsa_violations[0].event_id == str(ev_covered.event_id)
-    # The uncovered event must NOT appear in any TSA violation.
-    assert tsa_violations[0].event_id != str(ev_uncovered.event_id)
-
-    # Verify event_ids are populated on the batch entry.
-    assert report.timestamp_batches[0].event_ids == (str(ev_covered.event_id),)
-
-
 def test_role_gate_actor_signs_auditor_transition(hmac_keys: Path) -> None:
     """Actor key signing an auditor-only transition is flagged."""
     key_data = json.loads(hmac_keys.read_text())
@@ -2710,266 +2969,6 @@ def test_all_ok_includes_new_checks(hmac_keys: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_signed_tsa_token(merkle_root: bytes, cert, private_key) -> bytes:
-    """Build a minimal CMS-signed TSA token for testing."""
-    import hashlib
-
-    from asn1crypto import cms, core
-    from asn1crypto import tsp as asn1tsp
-    from cryptography.hazmat.primitives import hashes as crypto_hashes
-    from cryptography.hazmat.primitives.asymmetric import padding
-
-    hash_algo = "sha256"
-    digest = hashlib.sha256(merkle_root).digest()
-    tst_info = asn1tsp.TSTInfo(
-        {
-            "version": "v1",
-            "policy": "1.2.3.4.5",
-            "message_imprint": asn1tsp.MessageImprint(
-                {
-                    "hash_algorithm": {"algorithm": hash_algo},
-                    "hashed_message": digest,
-                }
-            ),
-            "serial_number": 1,
-            "gen_time": "20260101000000Z",
-        }
-    )
-    tst_info_der = tst_info.dump()
-
-    encap = cms.EncapsulatedContentInfo({"content_type": "tst_info"})
-    encap["content"] = core.ParsableOctetString(tst_info_der)
-
-    md = hashlib.sha256(tst_info_der).digest()
-    signed_attrs = cms.CMSAttributes(
-        [
-            cms.CMSAttribute({"type": "content_type", "values": ["tst_info"]}),
-            cms.CMSAttribute({"type": "message_digest", "values": [md]}),
-        ]
-    )
-
-    data_to_sign = signed_attrs.untag().dump()
-    signature = private_key.sign(data_to_sign, padding.PKCS1v15(), crypto_hashes.SHA256())
-
-    signer_info = cms.SignerInfo(
-        {
-            "version": "v1",
-            "sid": cms.IssuerAndSerialNumber(
-                {"issuer": cert.issuer, "serial_number": cert.serial_number}
-            ),
-            "digest_algorithm": {"algorithm": "sha256"},
-            "signature_algorithm": {"algorithm": "sha256_rsa"},
-            "signed_attrs": signed_attrs,
-            "signature": signature,
-        }
-    )
-
-    signed = cms.SignedData(
-        {
-            "version": "v3",
-            "digest_algorithms": [{"algorithm": "sha256"}],
-            "encap_content_info": encap,
-            "certificates": [cms.CertificateChoices({"certificate": cert})],
-            "signer_infos": [signer_info],
-        }
-    )
-    ci = cms.ContentInfo({"content_type": "signed_data", "content": signed})
-    return ci.dump()
-
-
-def _generate_test_cert():
-    """Generate a self-signed RSA certificate for testing."""
-    import datetime
-
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.x509.oid import NameOID
-
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test TSA")])
-    now = datetime.datetime.now(datetime.UTC)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now)
-        .not_valid_after(now + datetime.timedelta(days=3650))
-        .sign(key, hashes.SHA256())
-    )
-    return cert, key
-
-
-def test_tsa_signature_verification_with_trust_anchor(tmp_path: Path) -> None:
-    """BC-229: verify_tsa_token_full verifies CMS signature against trust anchor."""
-    from asn1crypto import x509 as asn1_x509
-    from cryptography.hazmat.primitives import serialization
-    from regista._timestamping import TSAConfig, verify_tsa_token_full
-
-    cert_pem, key = _generate_test_cert()
-    cert_der = cert_pem.public_bytes(serialization.Encoding.DER)
-    cert_asn1 = asn1_x509.Certificate.load(cert_der)
-
-    merkle_root = hashlib.sha256(b"test-merkle").digest()
-    token = _build_signed_tsa_token(merkle_root, cert_asn1, key)
-
-    # Write trust anchor to file
-    anchor_path = tmp_path / "tsa-cert.pem"
-    anchor_path.write_bytes(cert_pem.public_bytes(serialization.Encoding.PEM))
-
-    config = TSAConfig(tsa_url="", tsa_cert_path=str(anchor_path))
-    ok, detail = verify_tsa_token_full(token, merkle_root, config)
-    assert ok, f"Expected verification to pass, got: {detail}"
-    assert "verified" in detail.lower() or "ok" in detail.lower()
-
-
-def test_tsa_signature_verification_wrong_anchor(tmp_path: Path) -> None:
-    """BC-229: verify_tsa_token_full rejects token signed by different key."""
-    from asn1crypto import x509 as asn1_x509
-    from cryptography.hazmat.primitives import serialization
-    from regista._timestamping import TSAConfig, verify_tsa_token_full
-
-    cert_pem, key = _generate_test_cert()
-    cert_der = cert_pem.public_bytes(serialization.Encoding.DER)
-    cert_asn1 = asn1_x509.Certificate.load(cert_der)
-
-    merkle_root = hashlib.sha256(b"test-merkle").digest()
-    token = _build_signed_tsa_token(merkle_root, cert_asn1, key)
-
-    # Write a DIFFERENT cert as trust anchor
-    other_cert, _ = _generate_test_cert()
-    anchor_path = tmp_path / "wrong-cert.pem"
-    anchor_path.write_bytes(other_cert.public_bytes(serialization.Encoding.PEM))
-
-    config = TSAConfig(tsa_url="", tsa_cert_path=str(anchor_path))
-    ok, detail = verify_tsa_token_full(token, merkle_root, config)
-    assert not ok, f"Expected verification to fail with wrong anchor, got: {detail}"
-
-
-def test_tsa_no_trust_anchor_skips_signature(tmp_path: Path) -> None:
-    """BC-229: without tsa_cert_path, only message imprint is checked."""
-    from asn1crypto import x509 as asn1_x509
-    from cryptography.hazmat.primitives import serialization
-    from regista._timestamping import TSAConfig, verify_tsa_token_full
-
-    cert_pem, key = _generate_test_cert()
-    cert_der = cert_pem.public_bytes(serialization.Encoding.DER)
-    cert_asn1 = asn1_x509.Certificate.load(cert_der)
-
-    merkle_root = hashlib.sha256(b"test-merkle").digest()
-    token = _build_signed_tsa_token(merkle_root, cert_asn1, key)
-
-    config = TSAConfig(tsa_url="")  # No tsa_cert_path
-    ok, detail = verify_tsa_token_full(token, merkle_root, config)
-    assert ok
-    assert "not checked" in detail.lower() or "imprint" in detail.lower()
-
-
-def test_verifier_timestamp_signature_verification(tmp_path: Path) -> None:
-    """BC-229: Verifier._verify_timestamp_signatures sets verified field."""
-    import datetime
-
-    from asn1crypto import x509 as asn1_x509
-    from cryptography.hazmat.primitives import serialization
-    from regista._signing import sign_event
-    from regista._types import Event
-
-    key_bytes = b"supersecret-test-key-32bytes!!"
-    key_set = {"cairn-test-001": key_bytes}
-
-    # Generate TSA cert
-    cert_pem, tsa_key = _generate_test_cert()
-    cert_der = cert_pem.public_bytes(serialization.Encoding.DER)
-    cert_asn1 = asn1_x509.Certificate.load(cert_der)
-
-    # BC-015: the TSA token must be signed over the Merkle root recomputed
-    # from the bundle's actual events (the event UUIDs the batch covers), not
-    # an arbitrary root.  Compute that root the same way regista does.
-    from regista._timestamping import compute_merkle_root
-
-    ev_id = uuid.uuid4()
-    merkle_root = compute_merkle_root([ev_id])
-    merkle_root_hex = merkle_root.hex()
-    token = _build_signed_tsa_token(merkle_root, cert_asn1, tsa_key)
-    token_hex = token.hex()
-
-    # Write trust anchor
-    anchor_path = tmp_path / "tsa-cert.pem"
-    anchor_path.write_bytes(cert_pem.public_bytes(serialization.Encoding.PEM))
-
-    # Build a signed event
-    now = datetime.datetime.now(datetime.UTC)
-    sig, c_hash, env = sign_event(
-        event_id=ev_id,
-        work_item_id=uuid.uuid4(),
-        actor_id="agent-1",
-        key_id="cairn-test-001",
-        event_seq=0,
-        workflow_name="cairn_agent_actions",
-        workflow_version=1,
-        timestamp=now,
-        transition="tool_call_begin",
-        payload={"tool": "Read"},
-        key=key_bytes,
-    )
-    ev = Event(
-        event_id=ev_id,
-        work_item_id=uuid.uuid4(),
-        event_seq=0,
-        actor_id="agent-1",
-        actor_kind="agent",
-        actor_metadata=None,
-        key_id="cairn-test-001",
-        workflow_name="cairn_agent_actions",
-        workflow_version=1,
-        timestamp=now,
-        transition="tool_call_begin",
-        payload={"tool": "Read"},
-        payload_canonical_hash=c_hash,
-        signature=sig,
-        canonical_envelope=env,
-    )
-
-    ts_batch_id = str(uuid.uuid4())
-    manifest: dict = {"events_count": 1}
-    bundle: dict = {
-        "manifest": manifest,
-        "events": [ev.to_dict()],
-        "timestamp_batches": [
-            {
-                "batch_id": ts_batch_id,
-                "event_ids": [str(ev_id)],
-                "merkle_root": merkle_root_hex,
-                "status": "confirmed",
-                "tsa_timestamp": now.isoformat(),
-                "tsa_token": token_hex,
-            }
-        ],
-    }
-    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
-    manifest["bundle_hash"] = digest
-
-    bundle_path = tmp_path / "bundle_ts_verify.json"
-    bundle_path.write_text(json.dumps(bundle, indent=2))
-
-    # Verify WITH trust anchor
-    verifier = Verifier(key_set, tsa_cert_path=str(anchor_path))
-    report = verifier.verify_bundle(bundle_path)
-    assert report.all_ok
-    assert len(report.timestamp_batches) == 1
-    assert report.timestamp_batches[0].verified is True
-    assert report.timestamp_batches[0].verification_detail is not None
-
-    # Verify WITHOUT trust anchor — verified should be None
-    verifier_no_anchor = Verifier(key_set)
-    report_no_anchor = verifier_no_anchor.verify_bundle(bundle_path)
-    assert report_no_anchor.all_ok
-    assert report_no_anchor.timestamp_batches[0].verified is None
-
-
 def test_witness_coverage_check(tmp_path: Path) -> None:
     """Verifier detects events missing witness receipts."""
     from datetime import UTC, datetime
@@ -2981,10 +2980,11 @@ def test_witness_coverage_check(tmp_path: Path) -> None:
     key_set = {"cairn-test-001": key_bytes}
 
     ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
     now = datetime.now(UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
         event_seq=0,
@@ -2997,7 +2997,7 @@ def test_witness_coverage_check(tmp_path: Path) -> None:
     )
     ev = Event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         event_seq=0,
         actor_id="agent-1",
         actor_kind="agent",
@@ -3317,102 +3317,6 @@ def test_bc013_principal_mismatch_caught(hmac_keys: Path) -> None:
     assert not report.all_ok
 
 
-def test_bc015_tsa_token_over_wrong_root_rejected(tmp_path: Path) -> None:
-    """BC-015: a genuine TSA token whose signed Merkle root does NOT match the
-    root recomputed from the bundle's events is rejected (anti-backdating /
-    token-reuse defense)."""
-    import datetime as _dt
-
-    from asn1crypto import x509 as asn1_x509
-    from cryptography.hazmat.primitives import serialization
-    from regista._signing import sign_event
-    from regista._timestamping import compute_merkle_root
-    from regista._types import Event
-
-    key_bytes = b"supersecret-test-key-32bytes!!"
-    key_set = {"cairn-test-001": key_bytes}
-
-    cert_pem, tsa_key = _generate_test_cert()
-    cert_der = cert_pem.public_bytes(serialization.Encoding.DER)
-    cert_asn1 = asn1_x509.Certificate.load(cert_der)
-    anchor_path = tmp_path / "tsa-cert.pem"
-    anchor_path.write_bytes(cert_pem.public_bytes(serialization.Encoding.PEM))
-
-    # The operator holds a GENUINE token for some OTHER (honest) batch whose
-    # root is over a different event set.
-    honest_other_id = uuid.uuid4()
-    honest_root = compute_merkle_root([honest_other_id])
-    token = _build_signed_tsa_token(honest_root, cert_asn1, tsa_key)
-    token_hex = token.hex()
-
-    # The forged bundle contains a DIFFERENT event but copies the genuine token
-    # and its honest root into the timestamp batch.
-    ev_id = uuid.uuid4()
-    now = _dt.datetime.now(_dt.UTC)
-    sig, c_hash, env = sign_event(
-        event_id=ev_id,
-        work_item_id=uuid.uuid4(),
-        actor_id="agent-1",
-        key_id="cairn-test-001",
-        event_seq=0,
-        workflow_name="cairn_agent_actions",
-        workflow_version=1,
-        timestamp=now,
-        transition="tool_call_begin",
-        payload={"tool": "Read"},
-        key=key_bytes,
-    )
-    ev = Event(
-        event_id=ev_id,
-        work_item_id=uuid.uuid4(),
-        event_seq=0,
-        actor_id="agent-1",
-        actor_kind="agent",
-        actor_metadata=None,
-        key_id="cairn-test-001",
-        workflow_name="cairn_agent_actions",
-        workflow_version=1,
-        timestamp=now,
-        transition="tool_call_begin",
-        payload={"tool": "Read"},
-        payload_canonical_hash=c_hash,
-        signature=sig,
-        canonical_envelope=env,
-    )
-
-    manifest: dict = {"events_count": 1}
-    bundle: dict = {
-        "manifest": manifest,
-        "events": [ev.to_dict()],
-        "timestamp_batches": [
-            {
-                "batch_id": str(uuid.uuid4()),
-                # Batch claims to cover the bundle's event...
-                "event_ids": [str(ev_id)],
-                # ...but the root + token are the honest batch's (over a
-                # different event).
-                "merkle_root": honest_root.hex(),
-                "status": "confirmed",
-                "tsa_timestamp": now.isoformat(),
-                "tsa_token": token_hex,
-            }
-        ],
-    }
-    canonical = json.dumps(bundle, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    manifest["bundle_hash"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
-
-    bundle_path = tmp_path / "forged_ts.json"
-    bundle_path.write_text(json.dumps(bundle, indent=2))
-
-    verifier = Verifier(key_set, tsa_cert_path=str(anchor_path))
-    report = verifier.verify_bundle(bundle_path)
-
-    assert len(report.timestamp_batches) == 1
-    assert report.timestamp_batches[0].verified is False
-    assert report.tsa_signature_failures == 1
-    assert not report.all_ok
-
-
 def test_bc017_cli_enforces_revocation(tmp_path: Path) -> None:
     """BC-017: through the CLI verify path, an event signed AFTER its key's
     revocation is now caught because the CLI builds key_metadata from the key
@@ -3616,7 +3520,9 @@ class _FakeRegista:
         pass
 
 
-def _make_exportable_event(key_bytes: bytes, seq: int = 0):
+def _make_exportable_event(
+    key_bytes: bytes, seq: int = 0, *, global_seq: int | None = None
+):
     from datetime import UTC, datetime
 
     from regista._signing import sign_event
@@ -3637,6 +3543,7 @@ def _make_exportable_event(key_bytes: bytes, seq: int = 0):
         transition="tool_call_begin",
         payload={"tool": "Read"},
         key=key_bytes,
+        global_seq=global_seq,
     )
     return Event(
         event_id=ev_id,
@@ -3654,6 +3561,7 @@ def _make_exportable_event(key_bytes: bytes, seq: int = 0):
         payload_canonical_hash=c_hash,
         signature=sig,
         canonical_envelope=env,
+        global_seq=global_seq,
     )
 
 
@@ -3784,16 +3692,87 @@ def test_export_chain_link_verify_chain_accepts(
     assert report.all_ok
 
 
+def test_timestamp_window_export_marks_and_verifies_contiguous_range(
+    hmac_keys: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """The production export path must not claim a partial window is complete."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    global _fake_regista_events
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    os.chmod(hmac_keys, 0o600)
+    monkeypatch.setattr("regista.Regista", _FakeRegista)
+    _fake_regista_events = [
+        _make_exportable_event(key_bytes, seq=0, global_seq=5),
+        _make_exportable_event(key_bytes, seq=0, global_seq=6),
+    ]
+
+    bundle_path = tmp_path / "window.json"
+    runner = CliRunner()
+    exported = runner.invoke(
+        main,
+        [
+            "export",
+            "--dsn", "postgresql://fake",
+            "--project", "p",
+            "--keys", str(hmac_keys),
+            "--output", str(bundle_path),
+            "--since", "2026-01-01T00:00:00+00:00",
+        ],
+    )
+    assert exported.exit_code == 0, exported.output
+    manifest = json.loads(bundle_path.read_text())["manifest"]
+    assert manifest["since_seq"] == 5
+    assert manifest["until_seq"] == 6
+
+    verified = runner.invoke(
+        main,
+        ["verify", "--bundle-path", str(bundle_path), "--keys", str(hmac_keys)],
+    )
+    assert verified.exit_code == 0, verified.output
+
+
+def test_timestamp_window_export_refuses_sparse_global_sequence(
+    hmac_keys: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """A timestamp selection with sequence holes is not a contiguous range."""
+    from click.testing import CliRunner
+
+    from cairn._cli import main
+
+    global _fake_regista_events
+    key_data = json.loads(hmac_keys.read_text())
+    key_bytes = key_data["keys"][0]["secret"].encode("utf-8")
+    os.chmod(hmac_keys, 0o600)
+    monkeypatch.setattr("regista.Regista", _FakeRegista)
+    _fake_regista_events = [
+        _make_exportable_event(key_bytes, seq=0, global_seq=5),
+        _make_exportable_event(key_bytes, seq=0, global_seq=7),
+    ]
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "export",
+            "--dsn", "postgresql://fake",
+            "--project", "p",
+            "--keys", str(hmac_keys),
+            "--output", str(tmp_path / "sparse.json"),
+            "--since", "2026-01-01T00:00:00+00:00",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "non-contiguous global sequence range" in result.output
+
+
 # ----------------------------------------------------------------------
-# BC-021: export warns on timestamp/witness load failures
+# BC-021: export warns on witness load failures
+# (RFC 3161 timestamp batches are gone with regista 0.6+: the subsystem was
+#  removed outright, so export no longer reads it and there is no warning path.)
 # ----------------------------------------------------------------------
-
-
-class _FailingTimestamping:
-    """Fake timestamping sub-object that raises on list_batches."""
-
-    def list_batches(self, status=None):
-        raise RuntimeError("timestamp DB connection lost")
 
 
 class _FailingWitnesses:
@@ -3804,43 +3783,6 @@ class _FailingWitnesses:
 
     def receipts(self, **kwargs):
         return []
-
-
-def test_bc021_export_warns_on_timestamp_load_failure(
-    hmac_keys: Path, tmp_path: Path, monkeypatch
-) -> None:
-    """BC-021: export emits a stderr warning when timestamp batch loading fails."""
-    from click.testing import CliRunner
-
-    from cairn._cli import main
-
-    global _fake_regista_events
-    os.chmod(hmac_keys, 0o600)
-
-    class _FakeRegistaTsFail(_FakeRegista):
-        def __init__(self, *a, **kw):
-            super().__init__(*a, **kw)
-            self.timestamping = _FailingTimestamping()
-
-    monkeypatch.setattr("regista.Regista", _FakeRegistaTsFail)
-    _fake_regista_events = []
-
-    runner = CliRunner()
-    output_path = tmp_path / "bundle.json"
-    result = runner.invoke(
-        main,
-        [
-            "export",
-            "--dsn", "postgresql://fake",
-            "--project", "p",
-            "--keys", str(hmac_keys),
-            "--output", str(output_path),
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    assert "failed to load timestamp batches" in result.output
-    assert "bundle will not contain timestamp data" in result.output
-    assert "timestamp DB connection lost" in result.output
 
 
 def test_bc021_export_warns_on_witness_load_failure(
@@ -4737,13 +4679,19 @@ def test_session_attestation_in_html_report() -> None:
     assert "human:owner" in html
 
 
-def test_session_attestation_adapter_with_in_memory() -> None:
-    """Adapter.attest_session() creates a session-entity event via InMemoryRegista."""
-    from regista.testing import InMemoryRegista
+def test_session_attestation_adapter_with_in_memory(v6_keyset) -> None:
+    """Adapter.attest_session() creates a note-entity event via InMemoryRegista.
+
+    The in-memory backend is provisioned exactly like the Postgres one: a v6
+    keyset, an opened epoch accepting the signing principal, and cairn's
+    workflow registered (a signed event — admission gate 1)."""
+    from regista.testing import InMemoryRegista, open_v6_epoch
 
     from cairn import CairnAdapter, CairnConfig
 
-    sub = InMemoryRegista(project="cairn_test_session")
+    sub = InMemoryRegista(project="cairn_test_session", hmac_key_path=v6_keyset.path)
+    open_v6_epoch(sub, v6_keyset, principals=CAIRN_TEST_PRINCIPALS)
+    sub.register_workflow_file("workflows/cairn_agent_actions.yaml")
     adapter = CairnAdapter(
         sub,
         config=CairnConfig("opencode", "0.1.0"),
@@ -4764,23 +4712,27 @@ def test_session_attestation_adapter_with_in_memory() -> None:
 
     assert event is not None
     assert event.transition == "session_attestation"
-    assert event.entity_kind == "session"
+    # v6's closed registry has no "session" kind: session-scoped events are
+    # written as the note entity (AMENDMENTS §1).
+    assert event.entity_kind == "note"
     payload = event.payload or {}
     assert payload["version"] == "1"
     assert payload["principal_id"] == "human:test"
     assert payload["session_id"] == session_id
     assert payload["scope_statement"] == "In scope: opencode."
     assert event.entity_id == uuid.UUID(session_id)
-    assert event.workflow_name == ""
+    assert not event.workflow_name
 
 
-def test_session_attestation_multiple_events_same_entity() -> None:
+def test_session_attestation_multiple_events_same_entity(v6_keyset) -> None:
     """Multiple session attestations on the same entity get incremental event_seq."""
-    from regista.testing import InMemoryRegista
+    from regista.testing import InMemoryRegista, open_v6_epoch
 
     from cairn import CairnAdapter, CairnConfig
 
-    sub = InMemoryRegista(project="cairn_test_multi")
+    sub = InMemoryRegista(project="cairn_test_multi", hmac_key_path=v6_keyset.path)
+    open_v6_epoch(sub, v6_keyset, principals=CAIRN_TEST_PRINCIPALS)
+    sub.register_workflow_file("workflows/cairn_agent_actions.yaml")
     adapter = CairnAdapter(
         sub,
         config=CairnConfig("opencode", "0.1.0"),
@@ -4809,8 +4761,8 @@ def test_session_attestation_multiple_events_same_entity() -> None:
 
     assert ev1.event_seq == 1
     assert ev2.event_seq == 2
-    assert ev1.entity_kind == "session"
-    assert ev2.entity_kind == "session"
+    assert ev1.entity_kind == "note"
+    assert ev2.entity_kind == "note"
     assert ev1.entity_id == ev2.entity_id == uuid.UUID(session_id)
 
 
@@ -5187,31 +5139,36 @@ def test_session_attestation_rejects_invalid_entity_kind() -> None:
 def _make_witness_bundle(
     *,
     ev_id: uuid.UUID,
+    wi_id: uuid.UUID,
     env: bytes,
     c_hash: bytes,
     sig: bytes,
+    timestamp: datetime,
     witness_id: str,
     witness_pubkey_hex: str | None,
     witness_sig_hex: str | None,
     key_scheme: str = "ed25519",
     include_registration: bool = True,
 ) -> dict:
-    """Build a minimal bundle with one event and one witness receipt."""
-    from datetime import UTC, datetime
+    """Build a minimal bundle with one event and one witness receipt.
 
+    The row must carry the same identity the caller signed into ``env``
+    (strict verification reconciles row columns against the signed envelope),
+    so ``wi_id``/``timestamp`` are the caller's signed values, not fresh ones.
+    """
     from regista._types import Event
 
     ev = Event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         event_seq=1,
         actor_id="agent-1",
         actor_kind="agent",
-        actor_metadata={},
+        actor_metadata=None,
         key_id="cairn-test-001",
         workflow_name="",
         workflow_version=0,
-        timestamp=datetime.now(UTC),
+        timestamp=timestamp,
         transition="tool_call",
         payload={"tool": "Read"},
         payload_canonical_hash=c_hash,
@@ -5269,10 +5226,11 @@ def test_bc016_valid_witness_signature_verified(tmp_path: Path) -> None:
     key_set = {"cairn-test-001": key_bytes}
 
     ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
     now = datetime.now(UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
         event_seq=1,
@@ -5291,6 +5249,7 @@ def test_bc016_valid_witness_signature_verified(tmp_path: Path) -> None:
 
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=witness_id,
         witness_pubkey_hex=None,
         witness_sig_hex=witness_sig.hex(),
@@ -5316,10 +5275,11 @@ def test_bc016_invalid_witness_signature_detected(tmp_path: Path) -> None:
     key_set = {"cairn-test-001": key_bytes}
 
     ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
     now = datetime.now(UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
         event_seq=1,
@@ -5338,6 +5298,7 @@ def test_bc016_invalid_witness_signature_detected(tmp_path: Path) -> None:
 
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=witness_id,
         witness_pubkey_hex=None,
         witness_sig_hex=bad_sig.hex(),
@@ -5362,10 +5323,11 @@ def test_bc016_invalid_signature_does_not_count_as_coverage(tmp_path: Path) -> N
     key_set = {"cairn-test-001": key_bytes}
 
     ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
     now = datetime.now(UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
         event_seq=1,
@@ -5384,6 +5346,7 @@ def test_bc016_invalid_signature_does_not_count_as_coverage(tmp_path: Path) -> N
 
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=witness_id,
         witness_pubkey_hex=None,
         witness_sig_hex=bad_sig.hex(),
@@ -5406,10 +5369,11 @@ def test_bc016_missing_signature_for_ed25519_witness(tmp_path: Path) -> None:
     key_set = {"cairn-test-001": key_bytes}
 
     ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
     now = datetime.now(UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
         event_seq=1,
@@ -5424,6 +5388,7 @@ def test_bc016_missing_signature_for_ed25519_witness(tmp_path: Path) -> None:
     witness_id = str(uuid.uuid4())
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=witness_id,
         witness_pubkey_hex=None,
         witness_sig_hex=None,
@@ -5448,10 +5413,11 @@ def test_bc016_external_witness_keys_via_constructor(tmp_path: Path) -> None:
     key_set = {"cairn-test-001": key_bytes}
 
     ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
     now = datetime.now(UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
         event_seq=1,
@@ -5471,6 +5437,7 @@ def test_bc016_external_witness_keys_via_constructor(tmp_path: Path) -> None:
     # Bundle registration has key_scheme but NO public_key
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=witness_id,
         witness_pubkey_hex=None,
         witness_sig_hex=witness_sig.hex(),
@@ -5493,10 +5460,11 @@ def test_bc016_backward_compat_no_key_scheme(tmp_path: Path) -> None:
     key_set = {"cairn-test-001": key_bytes}
 
     ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
     now = datetime.now(UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
         event_seq=1,
@@ -5511,6 +5479,7 @@ def test_bc016_backward_compat_no_key_scheme(tmp_path: Path) -> None:
     witness_id = str(uuid.uuid4())
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=witness_id,
         witness_pubkey_hex=None,
         witness_sig_hex=None,
@@ -5538,10 +5507,11 @@ def test_bc016_witness_signature_in_text_report(tmp_path: Path) -> None:
     key_set = {"cairn-test-001": key_bytes}
 
     ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
     now = datetime.now(UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
         event_seq=1,
@@ -5560,6 +5530,7 @@ def test_bc016_witness_signature_in_text_report(tmp_path: Path) -> None:
 
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=witness_id,
         witness_pubkey_hex=None,
         witness_sig_hex=bad_sig.hex(),
@@ -5586,10 +5557,11 @@ def test_bc016_witness_signature_in_json_report(tmp_path: Path) -> None:
     key_set = {"cairn-test-001": key_bytes}
 
     ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
     now = datetime.now(UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
         event_seq=1,
@@ -5608,6 +5580,7 @@ def test_bc016_witness_signature_in_json_report(tmp_path: Path) -> None:
 
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=witness_id,
         witness_pubkey_hex=None,
         witness_sig_hex=witness_sig.hex(),
@@ -5636,10 +5609,11 @@ def test_bc016_witness_signature_in_html_report(tmp_path: Path) -> None:
     key_set = {"cairn-test-001": key_bytes}
 
     ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
     now = datetime.now(UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
         event_seq=1,
@@ -5658,6 +5632,7 @@ def test_bc016_witness_signature_in_html_report(tmp_path: Path) -> None:
 
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=witness_id,
         witness_pubkey_hex=None,
         witness_sig_hex=bad_sig.hex(),
@@ -5707,26 +5682,33 @@ def test_bc016_export_hex_encodes_witness_public_key(tmp_path: Path) -> None:
 # ----------------------------------------------------------------------
 
 
-def _bc016_signed_event() -> tuple[uuid.UUID, bytes, bytes, bytes]:
-    """A signed event: returns (event_id, envelope, canonical_hash, signature)."""
+def _bc016_signed_event() -> tuple[uuid.UUID, uuid.UUID, bytes, bytes, bytes, datetime]:
+    """A signed event.
+
+    Returns ``(event_id, work_item_id, envelope, canonical_hash, signature,
+    timestamp)`` — the row fields the caller must carry beside the signed
+    bytes, so the bundle's event row reconciles against its own envelope.
+    """
     from regista._signing import sign_event
 
     key_bytes = b"supersecret-test-key-32bytes!!"
     ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
+    now = datetime.now(UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
         event_seq=1,
         workflow_name="",
         workflow_version=0,
-        timestamp=datetime.now(UTC),
+        timestamp=now,
         transition="tool_call",
         payload={"tool": "Read"},
         key=key_bytes,
     )
-    return ev_id, env, c_hash, sig
+    return ev_id, wi_id, env, c_hash, sig, now
 
 
 def test_bc016_wrong_public_key_fails_verification(tmp_path: Path) -> None:
@@ -5734,7 +5716,7 @@ def test_bc016_wrong_public_key_fails_verification(tmp_path: Path) -> None:
     import nacl.signing
 
     key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
-    ev_id, env, c_hash, sig = _bc016_signed_event()
+    ev_id, wi_id, env, c_hash, sig, now = _bc016_signed_event()
 
     signing_sk = nacl.signing.SigningKey.generate()
     wrong_sk = nacl.signing.SigningKey.generate()
@@ -5743,6 +5725,7 @@ def test_bc016_wrong_public_key_fails_verification(tmp_path: Path) -> None:
 
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=witness_id,
         witness_pubkey_hex=None,
         witness_sig_hex=witness_sig.hex(),
@@ -5762,7 +5745,7 @@ def test_bc016_tampered_event_invalidates_witness_signature(tmp_path: Path) -> N
     import nacl.signing
 
     key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
-    ev_id, env, c_hash, sig = _bc016_signed_event()
+    ev_id, wi_id, env, c_hash, sig, now = _bc016_signed_event()
 
     witness_sk = nacl.signing.SigningKey.generate()
     witness_pk = witness_sk.verify_key.encode()
@@ -5771,6 +5754,7 @@ def test_bc016_tampered_event_invalidates_witness_signature(tmp_path: Path) -> N
 
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=witness_id,
         witness_pubkey_hex=None,
         witness_sig_hex=witness_sig.hex(),
@@ -5793,13 +5777,14 @@ def test_bc016_unsupported_witness_type_is_honest_unverified(tmp_path: Path) -> 
     import nacl.signing
 
     key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
-    ev_id, env, c_hash, sig = _bc016_signed_event()
+    ev_id, wi_id, env, c_hash, sig, now = _bc016_signed_event()
 
     witness_sk = nacl.signing.SigningKey.generate()
     witness_sig = witness_sk.sign(env).signature
 
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=str(uuid.uuid4()),
         witness_pubkey_hex=witness_sk.verify_key.encode().hex(),
         witness_sig_hex=witness_sig.hex(),
@@ -5824,13 +5809,14 @@ def test_bc016_unset_witness_scheme_with_signature_is_unverified(tmp_path: Path)
     import nacl.signing
 
     key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
-    ev_id, env, c_hash, sig = _bc016_signed_event()
+    ev_id, wi_id, env, c_hash, sig, now = _bc016_signed_event()
 
     witness_sk = nacl.signing.SigningKey.generate()
     witness_sig = witness_sk.sign(env).signature
 
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=str(uuid.uuid4()),
         witness_pubkey_hex=None,
         witness_sig_hex=witness_sig.hex(),
@@ -5853,10 +5839,11 @@ def test_bc016_hmac_witness_is_unverified_when_unpinned(tmp_path: Path) -> None:
     exact primitive that previously passed silently as delegated coverage.
     """
     key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
-    ev_id, env, c_hash, sig = _bc016_signed_event()
+    ev_id, wi_id, env, c_hash, sig, now = _bc016_signed_event()
 
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=str(uuid.uuid4()),
         witness_pubkey_hex=None,
         witness_sig_hex="ab" * 32,  # a fabricated blob cairn cannot corroborate
@@ -5876,10 +5863,11 @@ def test_bc016_unpinned_hmac_relabel_with_fabricated_blob_fails(tmp_path: Path) 
     """Adversarial: the unpinned + hmac-relabel + fabricated-blob attack that
     previously returned ``all_ok=True`` must now fail the verdict."""
     key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
-    ev_id, env, c_hash, sig = _bc016_signed_event()
+    ev_id, wi_id, env, c_hash, sig, now = _bc016_signed_event()
 
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=str(uuid.uuid4()),
         witness_pubkey_hex=None,
         witness_sig_hex="ab" * 32,
@@ -5897,12 +5885,13 @@ def test_bc016_unverified_state_surfaces_in_json_report(tmp_path: Path) -> None:
     import nacl.signing
 
     key_set = {"cairn-test-001": b"supersecret-test-key-32bytes!!"}
-    ev_id, env, c_hash, sig = _bc016_signed_event()
+    ev_id, wi_id, env, c_hash, sig, now = _bc016_signed_event()
     witness_sk = nacl.signing.SigningKey.generate()
     witness_sig = witness_sk.sign(env).signature
 
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=str(uuid.uuid4()),
         witness_pubkey_hex=witness_sk.verify_key.encode().hex(),
         witness_sig_hex=witness_sig.hex(),
@@ -5930,10 +5919,11 @@ def test_bundle_carried_witness_key_is_display_only_not_verified(
     key_set = {"cairn-test-001": key_bytes}
 
     ev_id = uuid.uuid4()
+    wi_id = uuid.uuid4()
     now = datetime.now(UTC)
     sig, c_hash, env = sign_event(
         event_id=ev_id,
-        work_item_id=uuid.uuid4(),
+        work_item_id=wi_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
         event_seq=1,
@@ -5952,6 +5942,7 @@ def test_bundle_carried_witness_key_is_display_only_not_verified(
 
     bundle = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=witness_id,
         witness_pubkey_hex=witness_pk.hex(),  # key travels INSIDE the bundle only
         witness_sig_hex=witness_sig.hex(),
@@ -5981,7 +5972,7 @@ def test_pinned_key_forces_ed25519_despite_spoofed_scheme(
     key_bytes = b"supersecret-test-key-32bytes!!"
     key_set = {"cairn-test-001": key_bytes}
 
-    ev_id, env, c_hash, sig = _bc016_signed_event()
+    ev_id, wi_id, env, c_hash, sig, now = _bc016_signed_event()
     witness_sk = nacl.signing.SigningKey.generate()
     witness_pk = witness_sk.verify_key.encode()
     wid = str(uuid.uuid4())
@@ -5989,6 +5980,7 @@ def test_pinned_key_forces_ed25519_despite_spoofed_scheme(
 
     good = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=wid,
         witness_pubkey_hex=None,
         witness_sig_hex=witness_sk.sign(env).signature.hex(),
@@ -6002,6 +5994,7 @@ def test_pinned_key_forces_ed25519_despite_spoofed_scheme(
 
     bad = _make_witness_bundle(
         ev_id=ev_id, env=env, c_hash=c_hash, sig=sig,
+        wi_id=wi_id, timestamp=now,
         witness_id=wid,
         witness_pubkey_hex=None,
         witness_sig_hex=(b"\x00" * 64).hex(),
@@ -6505,9 +6498,10 @@ def test_attestation_gap_no_gap_when_attested(hmac_keys: Path) -> None:
     now = datetime.now(UTC)
     session_entity_id = uuid.uuid4()
     session_id_str = str(session_entity_id)
+    sa_ev_id = uuid.uuid4()
 
     sa_sig, sa_hash, sa_env = sign_event(
-        event_id=uuid.uuid4(),
+        event_id=sa_ev_id,
         work_item_id=session_entity_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
@@ -6528,7 +6522,7 @@ def test_attestation_gap_no_gap_when_attested(hmac_keys: Path) -> None:
         entity_kind="session",
     )
     sa_event = Event(
-        event_id=uuid.uuid4(),
+        event_id=sa_ev_id,
         work_item_id=session_entity_id,
         entity_kind="session",
         entity_id=session_entity_id,
@@ -6826,10 +6820,11 @@ def test_attestation_gap_no_false_positive_cross_window(hmac_keys: Path, tmp_pat
     now = datetime.now(UTC)
     session_entity_id = uuid.uuid4()
     session_id_str = str(session_entity_id)
+    sa_ev_id = uuid.uuid4()
 
     # Session attestation is 2 hours ago (OUTSIDE the --since window)
     sa_sig, sa_hash, sa_env = sign_event(
-        event_id=uuid.uuid4(),
+        event_id=sa_ev_id,
         work_item_id=session_entity_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
@@ -6850,7 +6845,7 @@ def test_attestation_gap_no_false_positive_cross_window(hmac_keys: Path, tmp_pat
         entity_kind="session",
     )
     sa_event = Event(
-        event_id=uuid.uuid4(),
+        event_id=sa_ev_id,
         work_item_id=session_entity_id,
         entity_kind="session",
         entity_id=session_entity_id,
@@ -6933,10 +6928,11 @@ def test_attestation_gap_chain_dedup_across_bundles(hmac_keys: Path, tmp_path: P
     now = datetime.now(UTC)
     session_entity_id = uuid.uuid4()
     session_id_str = str(session_entity_id)
+    sa_ev_id = uuid.uuid4()
 
     # Bundle 1: session attestation only
     sa_sig, sa_hash, sa_env = sign_event(
-        event_id=uuid.uuid4(),
+        event_id=sa_ev_id,
         work_item_id=session_entity_id,
         actor_id="agent-1",
         key_id="cairn-test-001",
@@ -6957,7 +6953,7 @@ def test_attestation_gap_chain_dedup_across_bundles(hmac_keys: Path, tmp_path: P
         entity_kind="session",
     )
     sa_event = Event(
-        event_id=uuid.uuid4(),
+        event_id=sa_ev_id,
         work_item_id=session_entity_id,
         entity_kind="session",
         entity_id=session_entity_id,

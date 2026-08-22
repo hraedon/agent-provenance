@@ -101,7 +101,10 @@ def find_session_attestation(
         ev
         for ev in events
         if ev.transition == "session_attestation"
-        and ev.entity_kind == "session"
+        # "note" is the v6 entity kind for session-scoped events (regista
+        # 0.7's closed registry); "session" is the pre-v6 spelling, still
+        # read for historical stores.
+        and ev.entity_kind in ("session", "note")
         and ev.global_seq is not None
         and ev.global_seq > baseline_seq
     ]
@@ -124,17 +127,21 @@ def find_tool_call_ends(
 ) -> list[ProofEvent]:
     """Return tool_call_end events bound to *session_entity_id* after baseline.
 
-    Binding is via ``on_behalf_of.session_id`` matching the session entity_id.
-    Events at or before the baseline sequence are excluded so stale activity
-    cannot satisfy the proof.
+    Binding is via the delegation context naming the session, read through
+    the one shared carrier helper (:func:`cairn.schema.delegation_chain_of`):
+    pre-v6 rows carry it as the writer-level ``on_behalf_of``; v6 rows carry
+    it inside the signed payload. Events at or before the baseline sequence
+    are excluded so stale activity cannot satisfy the proof.
     """
+    from cairn.schema import delegation_chain_of
+
     result: list[ProofEvent] = []
     for ev in events:
         if ev.transition != "tool_call_end":
             continue
         if ev.global_seq is None or ev.global_seq <= baseline_seq:
             continue
-        obo = ev.on_behalf_of or {}
+        obo = delegation_chain_of(ev) or {}
         if obo.get("session_id") == session_entity_id:
             result.append(ev)
     return result

@@ -4,7 +4,7 @@ import tempfile
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 from ._model_observation import submit_model_observation
 from .adapter import CairnAdapter
@@ -112,7 +112,7 @@ def _fail_open_check() -> dict[str, Any]:
 
 def invariant_probe_report() -> dict[str, Any]:
     store = _RecordingStore()
-    adapter = CairnAdapter(store, config=CairnConfig("probe", "1"))
+    adapter = CairnAdapter(cast(Any, store), config=CairnConfig("probe", "1"))
     session_id = str(uuid.uuid4())
     mismatch = adapter.record_model_observation(
         session_id,

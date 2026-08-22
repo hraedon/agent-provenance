@@ -51,11 +51,11 @@ against one, never counts toward coverage, and never makes the verdict pass.
   claim regista's delivery layer vouches for a witness the operator never
   pinned, so a signature-bearing HMAC receipt whose witness is not a trust root
   is reported **unverified** and excluded from coverage.
-- **RFC 3161 timestamp tokens** are a *separate* corroboration path (BC-229 /
-  `_verify_tsa_tokens`): a TSA signs a Merkle root over the bundle's events,
-  checked against a `--tsa-cert` trust anchor. A timestamp token is not a
-  witness receipt; where both exist they reinforce each other, but a missing or
-  failed TSA token does not change a witness receipt's verification state.
+- **RFC 3161 timestamp tokens** were a separate corroboration path. regista
+  removed the timestamping subsystem outright in 0.6.0 (the batch Merkle tree
+  committed to `uuid.bytes` and witnessed no content), so cairn no longer
+  verifies TSA tokens: historical bundles' `timestamp_batches` are reported as
+  stated, never claimed verified.
 
 ## 4. Verification steps (per receipt)
 

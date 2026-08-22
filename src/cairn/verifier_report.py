@@ -45,7 +45,22 @@ def format_report(report: VerificationReport) -> str:
     lines.append("CAIRN VERIFICATION REPORT")
     lines.append("=" * 60)
     lines.append(f"Total events examined     : {report.total_events}")
+    # The verdict line states the aggregate the exit code acts on. An
+    # unverified event fails it: "not proven" is not "ok", and the operator
+    # must see WHICH aggregate failed without parsing the section layout.
+    if report.all_ok:
+        lines.append("  VERDICT                  : PASS (all events fully verified)")
+    elif report.unverified_events or report.unverified_key_rotations:
+        lines.append(
+            f"  VERDICT                  : FAIL — {report.unverified_events} "
+            f"unverified event(s), {report.unverified_key_rotations} unverified "
+            "key rotation(s). Evidentiary gap, not a proven forgery; see "
+            "UNVERIFIED EVENTS."
+        )
+    else:
+        lines.append("  VERDICT                  : FAIL — see findings below")
     lines.append(f"  Signatures OK           : {report.ok}")
+    lines.append(f"  Unverified (gap)        : {report.unverified_events}")
     lines.append(f"  Signature failures      : {report.signature_failed}")
     lines.append(f"  Hash mismatches         : {report.hash_mismatch}")
     lines.append(f"  Revoked / unknown keys  : {report.revoked_key}")
@@ -72,7 +87,8 @@ def format_report(report: VerificationReport) -> str:
     if report.key_rotations:
         kr_failures = report.key_rotation_failures
         lines.append(
-            f"  Key rotations           : {len(report.key_rotations)} ({kr_failures} failed)"
+            f"  Key rotations           : {len(report.key_rotations)} "
+            f"({kr_failures} failed, {report.unverified_key_rotations} unverified)"
         )
     lines.append("")
 
@@ -102,10 +118,23 @@ def format_report(report: VerificationReport) -> str:
         lines.append("FAILED EVENTS")
         lines.append("-" * 40)
         for entry in report.entries:
-            if entry.result != "ok":
+            if entry.result in ("signature_failed", "hash_mismatch", "revoked_key"):
                 lines.append(
                     f"  event {entry.event_id} ({entry.transition}) "
                     f"seq={entry.event_seq}: {entry.result}"
+                )
+                if entry.detail:
+                    lines.append(f"    -> {entry.detail}")
+        lines.append("")
+
+    if report.unverified_events:
+        lines.append("UNVERIFIED EVENTS (evidentiary gap, not a proven forgery)")
+        lines.append("-" * 40)
+        for entry in report.entries:
+            if entry.result == "unverified":
+                lines.append(
+                    f"  event {entry.event_id} ({entry.transition}) "
+                    f"seq={entry.event_seq}: unverified"
                 )
                 if entry.detail:
                     lines.append(f"    -> {entry.detail}")
@@ -189,7 +218,14 @@ def format_report(report: VerificationReport) -> str:
         lines.append("KEY ROTATIONS")
         lines.append("-" * 40)
         for kr in report.key_rotations:
-            status = "OK" if kr.signature_valid else "FAILED"
+            if kr.signature_valid is True:
+                status = "OK"
+            elif kr.signature_valid is False:
+                status = "FAILED"
+            else:
+                # Not proven and not proven false: an evidentiary gap the
+                # presented material cannot close.
+                status = "UNVERIFIED"
             lines.append(f"  event {kr.event_id}")
             lines.append(
                 f"    predecessor: {kr.predecessor_key_id} -> successor: {kr.successor_key_id}"
@@ -245,7 +281,12 @@ def format_report(report: VerificationReport) -> str:
                 if tb.verification_detail:
                     lines.append(f"    -> {tb.verification_detail}")
             elif tb.verified is None and tb.status == "confirmed":
-                lines.append("    signature : NOT CHECKED (no --tsa-cert)")
+                # regista removed the timestamping subsystem outright in 0.6.0;
+                # historical batches are reported as stated, never verified.
+                lines.append(
+                    "    signature : NOT CHECKED (subsystem removed with regista"
+                    " 0.6+; batch reported as stated)"
+                )
         lines.append("")
 
     if report.witness_registrations:
@@ -454,16 +495,26 @@ def format_report(report: VerificationReport) -> str:
 def format_report_json(report: VerificationReport) -> dict[str, Any]:
     """Return a structured JSON-serializable dict for programmatic consumption."""
     manifest = report.key_chain.get("bundle", {})
+    all_ok = report.all_ok
+    aggregate_verdict = report.aggregate_verdict
     return {
+        "canonical_all_ok": all_ok,
+        "aggregate_verdict": aggregate_verdict,
         "summary": {
             "total_events": report.total_events,
             "ok": report.ok,
+            "unverified": report.unverified_events,
             "signature_failed": report.signature_failed,
             "hash_mismatch": report.hash_mismatch,
             "revoked_key": report.revoked_key,
             "bundle_hash_ok": report.bundle_hash_ok,
             "chain_integrity_ok": report.chain_integrity_ok,
-            "all_ok": report.all_ok,
+            # ``all_ok`` is the canonical verifier's explicit aggregate when
+            # this report came from its JSON output.  The duplicated named
+            # field makes that provenance unambiguous to proof-runner clients.
+            "all_ok": all_ok,
+            "canonical_all_ok": all_ok,
+            "aggregate_verdict": aggregate_verdict,
         },
         "entries": [
             {
@@ -880,6 +931,7 @@ def format_report_html(report: VerificationReport) -> str:
             _row("Total events", str(report.total_events)),
             _row("Signatures OK", str(report.ok)),
             _row_color("Signature failures", report.signature_failed),
+            _row("Unverified (gap)", str(report.unverified_events)),
             _row_color("Hash mismatches", report.hash_mismatch),
             _row_color("Revoked / unknown keys", report.revoked_key),
             _row("Bundle integrity", _bundle_status(report.bundle_hash_ok)),
@@ -918,8 +970,13 @@ def format_report_html(report: VerificationReport) -> str:
         ctrl_html += "</div>"
         sections.append(ctrl_html)
 
-    # Failed events
-    failed = [e for e in report.entries if e.result != "ok"]
+    # Failed events. "unverified" entries are an evidentiary gap, not a
+    # failure — they get their own section below, mirroring the text report.
+    failed = [
+        e
+        for e in report.entries
+        if e.result not in ("ok", "unverified")
+    ]
     if failed:
         rows = ""
         cell = "padding:4px 8px"
@@ -948,6 +1005,39 @@ def format_report_html(report: VerificationReport) -> str:
         )
         sections.append(
             '<div class="section"><h2>Failed Events</h2>'
+            '<table style="border-collapse:collapse;width:100%">'
+            f"{hdr}<tbody>{rows}</tbody></table></div>"
+        )
+
+    unverified = [e for e in report.entries if e.result == "unverified"]
+    if unverified:
+        rows = ""
+        cell = "padding:4px 8px"
+        mono = f"{cell};font-family:monospace;font-size:12px"
+        for e in unverified:
+            detail = _esc(e.detail) if e.detail else ""
+            eid = _esc(e.event_id[:16])
+            trans = _esc(e.transition or "")
+            rows += (
+                f"<tr>"
+                f'<td style="{mono}">{eid}...</td>'
+                f'<td style="{cell}">{trans}</td>'
+                f'<td style="{cell};color:#b45309">unverified</td>'
+                f'<td style="{cell};font-size:12px">{detail}</td>'
+                f"</tr>"
+            )
+        th_style = f"{cell};text-align:left"
+        hdr = (
+            '<thead><tr style="background:#f1f5f9">'
+            f'<th style="{th_style}">Event ID</th>'
+            f'<th style="{th_style}">Transition</th>'
+            f'<th style="{th_style}">Result</th>'
+            f'<th style="{th_style}">Detail</th>'
+            "</tr></thead>"
+        )
+        sections.append(
+            '<div class="section"><h2>Unverified Events (evidentiary gap, '
+            'not a proven forgery)</h2>'
             '<table style="border-collapse:collapse;width:100%">'
             f"{hdr}<tbody>{rows}</tbody></table></div>"
         )
@@ -1117,11 +1207,14 @@ def format_report_html(report: VerificationReport) -> str:
         cell = "padding:4px 8px"
         mono = f"{cell};font-family:monospace;font-size:12px"
         for kr in report.key_rotations:
-            sig_html = (
-                '<span style="color:#16a34a;font-weight:bold">OK</span>'
-                if kr.signature_valid
-                else '<span style="color:#dc2626;font-weight:bold">FAILED</span>'
-            )
+            if kr.signature_valid is True:
+                sig_html = '<span style="color:#16a34a;font-weight:bold">OK</span>'
+            elif kr.signature_valid is False:
+                sig_html = '<span style="color:#dc2626;font-weight:bold">FAILED</span>'
+            else:
+                sig_html = (
+                    '<span style="color:#b45309;font-weight:bold">UNVERIFIED</span>'
+                )
             detail = _esc(kr.detail or "")
             rows += (
                 f"<tr>"

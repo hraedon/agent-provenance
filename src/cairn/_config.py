@@ -117,6 +117,28 @@ def content_key_ref_of(key_ref: str | None, key_path: str | None) -> str | None:
     return None
 
 
+def resolve_verification_pins() -> dict[str, str | None]:
+    """Resolve external verification pins from process env or suite.env.
+
+    Bundle fields are deliberately not a source for these values.  The CLI may
+    override each value explicitly; this helper is the config fallback used by
+    the CLI and the live proof runner.
+    """
+
+    suite_env = _load_suite_env()
+
+    def value(name: str) -> str | None:
+        return os.environ.get(name) or suite_env.get(name)
+
+    return {
+        "project_instance_id": value("CAIRN_PROJECT_INSTANCE_ID"),
+        "trust_domain_id": value("CAIRN_TRUST_DOMAIN_ID"),
+        "cutover_checkpoint_event_hash": value(
+            "CAIRN_CUTOVER_CHECKPOINT_EVENT_HASH"
+        ),
+    }
+
+
 @dataclasses.dataclass(frozen=True)
 class ContentSettings:
     """The operator's content-encryption configuration, as configured.

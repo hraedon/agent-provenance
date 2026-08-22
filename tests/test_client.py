@@ -19,11 +19,11 @@ from cairn.client import CairnClient, ToolCallContext
 
 
 @pytest.fixture
-def client(dsn: str, project: str, hmac_keys: Path, workflow_registered: None) -> CairnClient:
+def client(dsn: str, project: str, v6_keyset, workflow_registered: None) -> CairnClient:
     return CairnClient(
         dsn=dsn,
         project=project,
-        key_path=hmac_keys,
+        key_path=v6_keyset.path,
         harness_name="test-agent",
         harness_version="0.1.0",
         principal_id="human:test-user",

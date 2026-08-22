@@ -52,14 +52,15 @@ def _isolate_plugin(monkeypatch):
 
 
 @pytest.fixture
-def wired(monkeypatch):
+def wired(monkeypatch, tmp_path):
     """Wire the plugin to an InMemoryRegista-backed adapter.
 
     Injects ``_ADAPTER`` / ``_REGISTA`` / ``_CFG`` directly into the module
     so ``_get_adapter()`` returns them (its fast path) without calling
     ``resolve_config`` or constructing a live ``Regista``.
     """
-    from regista.testing import InMemoryRegista
+    from conftest import CAIRN_TEST_PRINCIPALS
+    from regista.testing import InMemoryRegista, make_v6_keyset, open_v6_epoch
 
     from cairn import CairnAdapter, CairnConfig
     from cairn._config import CairnEnvConfig
@@ -67,7 +68,12 @@ def wired(monkeypatch):
     hermes.reset_for_tests()
     monkeypatch.delenv("CAIRN_DISABLE", raising=False)
 
-    sub = InMemoryRegista(project="cairn_hermes_test")
+    # Provisioned exactly like the Postgres fixture: v6 keyset, opened epoch
+    # (accepting the test principals), signed workflow registration. The v6
+    # writer refuses unprovisioned writes by design.
+    keyset = make_v6_keyset(tmp_path, principals=CAIRN_TEST_PRINCIPALS)
+    sub = InMemoryRegista(project="cairn_hermes_test", hmac_key_path=keyset.path)
+    open_v6_epoch(sub, keyset, principals=CAIRN_TEST_PRINCIPALS)
     sub.register_workflow_file("workflows/cairn_agent_actions.yaml")
 
     cfg = CairnEnvConfig(
@@ -232,15 +238,16 @@ def test_session_start_attests_and_captures_session_id(wired):
     assert len(events) == 2
     ev = events[0]
     assert ev.transition == "session_attestation"
-    assert ev.entity_kind == "session"
+    assert ev.entity_kind == "note"
     payload = ev.payload or {}
     assert payload["session_id"] == sid
     assert payload["principal_id"] == "human:test"
     assert payload["scope_statement"] == "In scope: hermes."
     # The session attestation's delegation chain carries the real session_id
     # (built inside the adapter), never a placeholder.
-    assert ev.on_behalf_of["session_id"] == sid
-    assert ev.on_behalf_of.get("session_id") != "pending"
+    obo = (ev.payload or {}).get("on_behalf_of") or {}
+    assert obo["session_id"] == sid
+    assert obo.get("session_id") != "pending"
     observation = events[1]
     assert observation.transition == "model_observation"
     assert (observation.payload or {})["status"] == "unavailable"
@@ -332,8 +339,9 @@ def test_pre_post_tool_call_threads_real_session_id_from_kwargs(wired):
     assert len(begin_events) == 1
     begin = begin_events[0]
     # THE bug being fixed: session_id must be the real id, not "pending".
-    assert begin.on_behalf_of["session_id"] == sid
-    assert begin.on_behalf_of.get("session_id") != "pending"
+    obo = (begin.payload or {}).get("on_behalf_of") or {}
+    assert obo["session_id"] == sid
+    assert obo.get("session_id") != "pending"
     # And the payload's copy agrees.
     assert (begin.payload or {})["on_behalf_of"]["session_id"] == sid
 
@@ -352,8 +360,9 @@ def test_pre_post_tool_call_threads_real_session_id_from_kwargs(wired):
     )
     assert len(end_events) == 1
     end = end_events[0]
-    assert end.on_behalf_of["session_id"] == sid
-    assert end.on_behalf_of.get("session_id") != "pending"
+    obo = (end.payload or {}).get("on_behalf_of") or {}
+    assert obo["session_id"] == sid
+    assert obo.get("session_id") != "pending"
 
 
 def test_pre_post_tool_call_uses_captured_session_id_when_kwarg_absent(wired):
@@ -374,7 +383,7 @@ def test_pre_post_tool_call_uses_captured_session_id_when_kwarg_absent(wired):
     begin = wired.sub.read_events(
         work_item_id=work_item_id, transition="tool_call_begin"
     )[0]
-    assert begin.on_behalf_of["session_id"] == sid
+    assert (begin.payload or {})["on_behalf_of"]["session_id"] == sid
 
     hermes.on_post_tool_call(
         tool_name="Write",
@@ -385,7 +394,7 @@ def test_pre_post_tool_call_uses_captured_session_id_when_kwarg_absent(wired):
     end = wired.sub.read_events(
         work_item_id=work_item_id, transition="tool_call_end"
     )[0]
-    assert end.on_behalf_of["session_id"] == sid
+    assert (end.payload or {})["on_behalf_of"]["session_id"] == sid
 
 
 def test_no_pending_session_id_escapes_full_lifecycle(wired):
@@ -467,7 +476,7 @@ def test_post_tool_call_failure_status_records_error(wired):
     )
     assert len(fail_events) == 1
     fail = fail_events[0]
-    assert fail.on_behalf_of["session_id"] == sid
+    assert (fail.payload or {})["on_behalf_of"]["session_id"] == sid
     summary = (fail.payload or {}).get("result_summary") or {}
     assert summary["exit_code"] == 1
 

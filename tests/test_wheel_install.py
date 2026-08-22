@@ -85,14 +85,22 @@ def _build_wheel(tmp_path: Path) -> Path:
     return wheels[0]
 
 
-def _install_wheel(wheel: Path, target: Path, *, with_deps: bool) -> None:
-    """Install *wheel* into *target*, with or without its declared deps."""
+def _install_wheel(
+    wheel: Path, target: Path, *, with_deps: bool, extra_sources: tuple[str, ...] = ()
+) -> None:
+    """Install *wheel* into *target*, with or without its declared deps.
+
+    ``extra_sources`` are appended as explicit requirement specs (e.g. the
+    sibling regista checkout with its extras) so the install resolves them
+    locally instead of from the index.
+    """
+    specs = [str(wheel), *extra_sources]
     if _require_builder() == "pip":
-        cmd = [sys.executable, "-m", "pip", "install", "--target", str(target), str(wheel)]
+        cmd = [sys.executable, "-m", "pip", "install", "--target", str(target), *specs]
         if not with_deps:
             cmd.insert(4, "--no-deps")
     else:
-        cmd = ["uv", "pip", "install", "--target", str(target), str(wheel)]
+        cmd = ["uv", "pip", "install", "--target", str(target), *specs]
         if not with_deps:
             cmd.insert(3, "--no-deps")
     subprocess.run(cmd, check=True)
@@ -185,6 +193,7 @@ def test_wheel_install_conformance_cases_pass(tmp_path: Path) -> None:
     # Install the wheel and its declared runtime dependencies into a clean target
     # directory. This proves the wheel metadata is sufficient for resolution and
     # that the conformance gate does not depend on the editable source layout.
+    #
     _install_wheel(wheel, target, with_deps=True)
 
     # cairn + its runtime dependencies landed in the target directory.

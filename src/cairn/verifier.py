@@ -21,14 +21,41 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import structlog
+from regista import (
+    NO_REFERENTS as _NO_REFERENTS,
+)
+from regista import (
+    Applicability as _Applicability,
+)
+from regista import (
+    EnvelopeVersion as _EnvelopeVersion,
+)
+from regista import (
+    VerificationPolicy as _VerificationPolicy,
+)
+from regista import (
+    VerificationResult as _VerificationResult,
+)
+from regista import (
+    bundle_referents as _bundle_referents,
+)
+from regista import (
+    chain_head_hash as _chain_head_hash,
+)
+from regista import (
+    make_verification_policy as _make_verification_policy,
+)
+from regista import (
+    verify_event_with_referents as _verify_event_with_referents,
+)
 from regista._errors import RegistaError
-from regista._signing import verify_event as _verify_event_impl
 from regista._signing_scheme import get_scheme
 from regista._types import Event
 
+from cairn.schema import delegation_chain_of as _delegation_chain_of
 from cairn.verifier_report import (
     format_diff,
     format_diff_json,
@@ -65,7 +92,19 @@ from cairn.verifier_types import (
 )
 
 _DEFAULT_SCHEME_ID = "hmac-sha256"
-_TSA_TOLERANCE_SECONDS = 300  # 5-minute tolerance for TSA temporal checks
+_TSA_TOLERANCE_SECONDS = 300  # 5-minute tolerance for TSA temporal checks (BC-020)
+
+# Archive policy: pre-v5 envelopes are historical, partially authenticated
+# records. v5 and v6 are never admitted through that path; they must satisfy
+# the full-authentication policy. Keeping this set here makes the archive
+# decision explicit at every Verifier construction rather than inheriting a
+# regista default that may change independently.
+_ARCHIVE_LEGACY_ENVELOPE_VERSIONS = (
+    _EnvelopeVersion.V1,
+    _EnvelopeVersion.V2,
+    _EnvelopeVersion.V3,
+    _EnvelopeVersion.V4,
+)
 
 log = structlog.get_logger()
 
@@ -148,10 +187,10 @@ class Verifier:
         self,
         key_set: dict[str, bytes],
         key_metadata: dict[str, dict[str, Any]] | None = None,
-        tsa_cert_path: str | None = None,
         witness_keys: dict[str, bytes] | None = None,
         max_bundle_size_bytes: int | None = None,
         max_events: int | None = None,
+        policy: _VerificationPolicy | None = None,
     ) -> None:
         """
         Args:
@@ -162,9 +201,6 @@ class Verifier:
             key_metadata: Optional mapping ``key_id → {role, revoked_at, ...}``
                 for key lifecycle enforcement.  When provided, the verifier
                 checks role gates and revocation timestamps.
-            tsa_cert_path: Path to a trusted TSA certificate (PEM or DER).
-                When provided, the verifier will verify CMS signatures on
-                TSA timestamp tokens against this trust anchor (BC-229).
             witness_keys: Optional mapping ``witness_id → Ed25519 public
                 key bytes`` for verifying witness receipt signatures
                 (BC-016).  These are the *enrolled/anchored* witness keys —
@@ -185,8 +221,10 @@ class Verifier:
         """
         self._keys = key_set
         self._key_meta = key_metadata or {}
-        self._tsa_cert_path = tsa_cert_path
         self._witness_keys = witness_keys or {}
+        self._policy = policy or _make_verification_policy(
+            accepted_legacy_envelope_versions=_ARCHIVE_LEGACY_ENVELOPE_VERSIONS,
+        )
         self._bundle_witness_keys: dict[str, bytes] = {}
         self._max_bundle_bytes = (
             max_bundle_size_bytes
@@ -200,9 +238,6 @@ class Verifier:
             raise ValueError("max_bundle_size_bytes must be non-negative")
         if self._max_events < 0:
             raise ValueError("max_events must be non-negative")
-        # Per-batch claimed event_ids, captured during _accumulate_timestamp_batches
-        # so _verify_timestamp_signatures can recompute Merkle roots (BC-015).
-        self._batch_claimed_ids: dict[str, list[str]] = {}
         # Raw witness signatures from the bundle, keyed by (event_id, witness_id).
         # Populated in _accumulate_witness_data, consumed in _verify_witness_signatures.
         self._witness_sig_cache: dict[tuple[str, str], bytes | None] = {}
@@ -212,18 +247,34 @@ class Verifier:
     # ------------------------------------------------------------------
 
     def verify_events(self, events: list[Event]) -> VerificationReport:
-        """Verify a list of regista events and produce a report."""
+        """Verify a list of regista events and produce a report.
+
+        No chain material is presented: a bare event list cannot answer a v6
+        event's referent questions, so v6 events verify their cryptography and
+        are honestly reported ``unverified`` here. Verify a *bundle* (which
+        presents itself as referent material) for full v6 verdicts.
+        """
+        return self._verify_events_with_referents(events, _NO_REFERENTS)
+
+    def _verify_events_with_referents(
+        self,
+        events: list[Event],
+        referents: Any,
+    ) -> VerificationReport:
+        """Verify a list of regista events against caller-presented material."""
         report = VerificationReport()
         report.total_events = len(events)
 
         for ev in events:
-            entry = self._verify_single(ev)
+            entry = self._verify_single(ev, referents)
             report.entries.append(entry)
 
             if entry.result == "ok":
                 report.ok += 1
             elif entry.result == "signature_failed":
                 report.signature_failed += 1
+            elif entry.result == "unverified":
+                report.unverified_events += 1
             elif entry.result == "hash_mismatch":
                 report.hash_mismatch += 1
             elif entry.result in ("revoked_key", "unknown_key"):
@@ -243,7 +294,7 @@ class Verifier:
             self._accumulate_session_attestations(report, ev)
 
             # Detect and verify key rotation events
-            self._accumulate_key_rotations(report, ev)
+            self._accumulate_key_rotations(report, ev, referents)
 
             # Detect key revocation events
             self._accumulate_key_revocations(report, ev)
@@ -392,8 +443,9 @@ class Verifier:
         window but its tool calls fall inside it.
 
         Timestamp-batch signature verification is **skipped** in filtered
-        mode because the Merkle root covers the full batch, not the filtered
-        subset.  TSA temporal ordering is still checked for covered events.
+        mode — no TSA signature is ever verified (regista removed the
+        subsystem in 0.6.0).  TSA temporal ordering is still checked for
+        covered events against the bundle's own stated timestamps.
 
         ``global_seq`` gap violations are suppressed because temporal
         filtering creates expected gaps in the cross-work-item sequence.
@@ -426,7 +478,13 @@ class Verifier:
                 continue
             filtered.append(ev)
 
-        report = self.verify_events(filtered)
+        # Referent material is the FULL bundle, not the filtered subset: a
+        # temporal filter selects which events are re-reported, not which
+        # chain material the verifier may see — the same rule regista's replay
+        # applies (scoping must not turn "the anchor is elsewhere in this
+        # bundle" into "the anchor is missing").
+        referents = _bundle_referents(manifest or {}, events)
+        report = self._verify_events_with_referents(filtered, referents)
         report.bundle_hash_ok = True if hash_verified else None
         report.key_chain["bundle"] = manifest
         report.key_chain["filtered"] = {
@@ -455,18 +513,17 @@ class Verifier:
         report.attestation_gaps.clear()
         self._check_attestation_gaps(filtered, report, attested_sessions=all_attested)
 
-        # Timestamp batches: accumulate for coverage info but mark
-        # signature verification as not-checked — the Merkle root covers
-        # the full batch, not the filtered subset, so a filtered bundle's
-        # TSA tokens cannot be cryptographically bound to its events
-        # (WI-020). Use verified=None (not checked) rather than False
-        # (failed) to distinguish "skipped" from "attempted and failed."
+        # Timestamp batches: accumulate for coverage info only. TSA tokens
+        # are never cryptographically verified — regista removed the
+        # timestamping subsystem outright in 0.6.0 (the batch Merkle tree
+        # committed to uuid.bytes and witnessed no content) — so every batch
+        # is reported as stated with verified=None (never False, which would
+        # claim an attempted-and-failed check that cannot run at all).
         self._accumulate_timestamp_batches(raw, filtered, report)
         _detail = (
-            "TSA signature verification skipped in filtered mode: "
-            "the Merkle root covers the full batch, not the filtered "
-            "subset. Re-verify with an unfiltered bundle to check TSA "
-            "signatures (WI-020)."
+            "TSA signature verification is not performed: the timestamping "
+            "subsystem was removed with regista 0.6+; the batch is reported "
+            "as stated."
         )
         updated_batches = [
             replace(e, verified=None, verification_detail=_detail)
@@ -500,7 +557,14 @@ class Verifier:
             report.key_chain["bundle"] = manifest
             return report
 
-        report = self.verify_events(events)
+        # ONE referent resolver for the whole bundle, built from the manifest
+        # and ALL bundle events (regista's public surface). This is what lets a
+        # v6 event resolve its key-binding anchor, workflow registration and
+        # epoch position inside the bundle: without it every v6 event is
+        # honestly-but-uselessly UNVERIFIABLE, and the verifier said so while
+        # holding the very material that could have answered.
+        referents = _bundle_referents(manifest or {}, events)
+        report = self._verify_events_with_referents(events, referents)
         report.bundle_hash_ok = True if hash_verified else None
         report.key_chain["bundle"] = manifest
 
@@ -517,8 +581,7 @@ class Verifier:
             report.chain_integrity_ok = None
             log.warning("cairn.chain_link_missing")
 
-        raw_tokens = self._accumulate_timestamp_batches(raw, events, report)
-        self._verify_timestamp_signatures(raw_tokens, events, report)
+        self._accumulate_timestamp_batches(raw, events, report)
 
         self._accumulate_witness_data(raw, events, report)
         self._verify_witness_signatures(events, report)
@@ -558,7 +621,7 @@ class Verifier:
         log.error("cairn.bundle_hash_mismatch", stored=stored_hash, computed=computed)
         return False
 
-    def _verify_single(self, ev: Event) -> VerificationEntry:
+    def _verify_single(self, ev: Event, referents: Any) -> VerificationEntry:
         key = self._keys.get(ev.key_id)
         if key is None:
             return VerificationEntry(
@@ -573,7 +636,7 @@ class Verifier:
 
         scheme_id = getattr(ev, "scheme_id", _DEFAULT_SCHEME_ID)
         try:
-            scheme = get_scheme(scheme_id)
+            get_scheme(scheme_id)
         except RegistaError:
             return VerificationEntry(
                 event_id=str(ev.event_id),
@@ -585,30 +648,21 @@ class Verifier:
                 detail=f"Unknown signing scheme: {scheme_id}",
             )
 
-        ok = _verify_event_impl(
-            event_id=ev.event_id,
-            work_item_id=ev.work_item_id,
-            actor_id=ev.actor_id,
-            key_id=ev.key_id,
-            event_seq=ev.event_seq,
-            workflow_name=ev.workflow_name,
-            workflow_version=ev.workflow_version,
-            timestamp=ev.timestamp,
-            transition=ev.transition,
-            payload=ev.payload,
-            signature=ev.signature,
-            canonical_hash=ev.payload_canonical_hash,
-            key=key,
-            stored_envelope=ev.canonical_envelope,
-            on_behalf_of=ev.on_behalf_of,
-            scheme=scheme,
-            prev_event_hash=ev.prev_event_hash,
-            global_seq=ev.global_seq,
-            entity_kind=getattr(ev, "entity_kind", "work_item"),
-            hash_alg=getattr(ev, "hash_alg", "sha-256"),
+        # The one verification primitive, through regista's public surface,
+        # with the FULL row and the caller's referent material. WI-267
+        # strictness comes with it: the stored envelope is the only envelope
+        # and every field the envelope's version signs must agree with the
+        # row (v5 signs actor_kind/actor_metadata; v3+ sign the chain links;
+        # v6 signs its own envelope grammar).
+        result: _VerificationResult = _verify_event_with_referents(
+            ev,
+            key,
+            referents=referents,
+            scheme_id=scheme_id,
+            policy=self._policy,
         )
 
-        if ok:
+        if result.accepted:
             return VerificationEntry(
                 event_id=str(ev.event_id),
                 work_item_id=str(ev.work_item_id),
@@ -618,15 +672,36 @@ class Verifier:
                 result="ok",
             )
 
-        scheme_label = scheme_id.upper()
+        # An INVALID verdict is a proven defect of the artifact — a signature
+        # that does not verify, or a row rewritten under an intact signature.
+        # Anything else (UNVERIFIABLE) is an evidentiary gap: most commonly a
+        # v6 event whose key-binding/workflow referents are OTHER events this
+        # offline verifier was not handed (regista 0.7's offline contract — a
+        # windowed export legitimately cannot resolve them). Not proven is not
+        # proven false: the gap is reported by name, never smoothed into "ok"
+        # and never laundered into a forgery finding.
+        if result.applicability is _Applicability.INVALID:
+            scheme_label = scheme_id.upper()
+            return VerificationEntry(
+                event_id=str(ev.event_id),
+                work_item_id=str(ev.work_item_id),
+                event_seq=ev.event_seq,
+                timestamp=ev.timestamp.isoformat(),
+                transition=ev.transition,
+                result="signature_failed",
+                detail=f"{scheme_label} signature does not verify: {result.summary()}",
+            )
         return VerificationEntry(
             event_id=str(ev.event_id),
             work_item_id=str(ev.work_item_id),
             event_seq=ev.event_seq,
             timestamp=ev.timestamp.isoformat(),
             transition=ev.transition,
-            result="signature_failed",
-            detail=f"{scheme_label} signature does not verify",
+            result="unverified",
+            detail=(
+                "Signature verified but the verdict is not established from this "
+                f"material: {result.summary()}"
+            ),
         )
 
     def _accumulate_file_provenance(self, report: VerificationReport, ev: Event) -> None:
@@ -697,9 +772,15 @@ class Verifier:
         )
 
     def _accumulate_session_attestations(self, report: VerificationReport, ev: Event) -> None:
-        """Collect session-attestation payloads from session-entity events."""
+        """Collect session-attestation payloads from session-entity events.
+
+        Entity kinds: ``note`` is what the v6 adapter writes (the closed v6
+        registry's non-work-item entity, regista 0.7.0 AMENDMENTS §1);
+        ``session`` is the pre-v6 spelling retained so historical artifacts
+        still verify and still count for scope coverage.
+        """
         entity_kind = getattr(ev, "entity_kind", "work_item")
-        if entity_kind != "session":
+        if entity_kind not in ("session", "note"):
             return
         payload = ev.payload or {}
         if "harnesses" not in payload or "scope_statement" not in payload:
@@ -721,7 +802,9 @@ class Verifier:
             )
         )
 
-    def _accumulate_key_rotations(self, report: VerificationReport, ev: Event) -> None:
+    def _accumulate_key_rotations(
+        self, report: VerificationReport, ev: Event, referents: Any
+    ) -> None:
         """Detect key_rotation events and verify predecessor-signed rotation.
 
         A key rotation event has ``tool == "key_rotation"`` in its payload.
@@ -729,9 +812,18 @@ class Verifier:
         that was active before the rotation).  The verifier checks:
 
         1. The predecessor key is known (in the key set).
-        2. The event's signature verifies against the predecessor key.
+        2. The event's signature verifies against the predecessor key,
+           through the same one-primitive path every event uses (full row
+           reconciliation plus the caller's referent material).
         3. The ``predecessor_key_id`` in the payload matches the event's
            ``key_id`` (the key that actually signed it).
+
+        The verdict is three-valued, mirroring the event verdicts: ``False``
+        only for a proven defect (``Applicability.INVALID`` — the signature
+        does not verify, or the row disagrees with it), ``None`` for an
+        evidentiary gap the presented material cannot close (e.g. a v6 event
+        whose referents were not handed over), and ``True`` when verified. A
+        referent gap is NOT a forgery and is never counted as one.
         """
         payload = ev.payload or {}
         if payload.get("tool") != "key_rotation":
@@ -743,56 +835,53 @@ class Verifier:
 
         # Check that the event was signed by the predecessor key
         signed_by = ev.key_id
-        sig_valid = signed_by == pred_id
+        signed_by_predecessor = signed_by == pred_id
 
-        detail = None
-        if not sig_valid:
+        sig_valid: bool | None
+        detail: str | None = None
+        if not signed_by_predecessor:
+            sig_valid = False
             detail = (
                 f"Rotation claims predecessor={pred_id} but event was signed by key_id={signed_by}"
             )
-
-        # If we have the predecessor key in our key set, also verify
-        # the cryptographic signature.  If the predecessor key is NOT
-        # available, mark as unverified — we cannot trust the rotation
-        # without cryptographic proof.
-        if sig_valid and pred_id in self._keys:
-            scheme_id = getattr(ev, "scheme_id", _DEFAULT_SCHEME_ID)
-            try:
-                scheme = get_scheme(scheme_id)
-            except RegistaError:
-                scheme = None
-
-            ok = _verify_event_impl(
-                event_id=ev.event_id,
-                work_item_id=ev.work_item_id,
-                actor_id=ev.actor_id,
-                key_id=ev.key_id,
-                event_seq=ev.event_seq,
-                workflow_name=ev.workflow_name,
-                workflow_version=ev.workflow_version,
-                timestamp=ev.timestamp,
-                transition=ev.transition,
-                payload=ev.payload,
-                signature=ev.signature,
-                canonical_hash=ev.payload_canonical_hash,
-                key=self._keys[pred_id],
-                stored_envelope=ev.canonical_envelope,
-                on_behalf_of=ev.on_behalf_of,
-                scheme=scheme,
-                prev_event_hash=ev.prev_event_hash,
-                global_seq=ev.global_seq,
-            )
-            if not ok:
-                sig_valid = False
-                detail = (
-                    f"Rotation event signature does not verify against predecessor key {pred_id}"
-                )
-        elif sig_valid:
-            sig_valid = False
+        elif pred_id not in self._keys:
+            # No predecessor key material: unverified, not forged.
+            sig_valid = None
             detail = (
                 f"Rotation claims predecessor={pred_id} but predecessor "
                 f"key is not in the verifier's key set — cannot verify"
             )
+        else:
+            scheme_id = getattr(ev, "scheme_id", _DEFAULT_SCHEME_ID)
+            try:
+                get_scheme(scheme_id)
+            except RegistaError:
+                sig_valid = False
+                detail = f"Unknown signing scheme: {scheme_id}"
+            else:
+                result = _verify_event_with_referents(
+                    ev,
+                    self._keys[pred_id],
+                    referents=referents,
+                    scheme_id=scheme_id,
+                    policy=self._policy,
+                )
+                if result.applicability is _Applicability.INVALID:
+                    sig_valid = False
+                    detail = (
+                        "Rotation event signature does not verify against "
+                        f"predecessor key {pred_id}: {result.summary()}"
+                    )
+                elif result.accepted:
+                    sig_valid = True
+                else:
+                    # Evidentiary gap (e.g. unresolved v6 referents): the
+                    # rotation is not proven, and not proven false either.
+                    sig_valid = None
+                    detail = (
+                        "Rotation signature could not be established from this "
+                        f"material: {result.summary()}"
+                    )
 
         report.key_rotations.append(
             KeyRotationEntry(
@@ -807,15 +896,23 @@ class Verifier:
         )
 
     def _accumulate_delegation_chains(self, report: VerificationReport, ev: Event) -> None:
-        """Validate on_behalf_of delegation chains using regista's DelegationChain."""
-        if ev.on_behalf_of is None:
+        """Validate on_behalf_of delegation chains using regista's DelegationChain.
+
+        The chain is read through the ONE shared carrier helper
+        (:func:`cairn.schema.delegation_chain_of`): pre-v6 rows carry it as the
+        writer-level column, v6 rows inside the signed payload. Anything that
+        is not a chain-shaped mapping reads as "no chain", so arbitrary
+        payload data cannot masquerade as a delegation.
+        """
+        chain = _delegation_chain_of(ev)
+        if chain is None:
             return
 
-        principal_id = ev.on_behalf_of.get("principal_id", "")
-        session_id = ev.on_behalf_of.get("session_id")
-        authenticated_at = ev.on_behalf_of.get("authenticated_at")
-        scope = ev.on_behalf_of.get("scope")
-        expires_at = ev.on_behalf_of.get("expires_at")
+        principal_id = chain.get("principal_id", "")
+        session_id = chain.get("session_id")
+        authenticated_at = chain.get("authenticated_at")
+        scope = chain.get("scope")
+        expires_at = chain.get("expires_at")
 
         validation_ok = True
         validation_detail = None
@@ -825,7 +922,7 @@ class Verifier:
             from regista._contract import validate_delegation_chain
 
             validate_delegation_chain(
-                ev.on_behalf_of,
+                chain,
                 event_timestamp=ev.timestamp.isoformat(),
             )
         except (ValueError, TypeError, KeyError, RegistaError) as exc:
@@ -857,30 +954,28 @@ class Verifier:
         raw_bundle: dict[str, Any],
         events: list[Event],
         report: VerificationReport,
-    ) -> dict[str, bytes]:
+    ) -> None:
         """Load TSA timestamp batches from the bundle and check event coverage.
 
-        Returns a mapping ``batch_id → tsa_token_bytes`` for confirmed batches
-        so that ``_verify_timestamp_signatures`` can verify them.
-
-        Also records, per confirmed batch, the list of event UUIDs the batch
-        claims to cover that are actually present in the bundle, so that
-        ``_verify_timestamp_signatures`` can recompute the Merkle root from the
-        bundle's own events (BC-015) rather than trusting the bundle-supplied
-        ``merkle_root``.
+        Historical bundles (exported from pre-0.6 regista stores) carry an
+        RFC 3161 ``timestamp_batches`` section; the batches are reported as
+        they are stated, with ``verified=None``. regista removed the
+        timestamping subsystem outright in 0.6.0 — the batch Merkle tree
+        committed to ``uuid.bytes`` and therefore witnessed no content — so
+        cairn no longer attempts CMS/Merkle verification of these tokens and
+        never reports one as verified. The BC-020 temporal cross-check of the
+        bundle's own ``tsa_timestamp`` claims still runs.
         """
         raw_batches = raw_bundle.get("timestamp_batches")
         if not raw_batches:
-            return {}
+            return
 
         exported_ids = {str(ev.event_id) for ev in events}
         covered_ids: set[str] = set()
-        raw_tokens: dict[str, bytes] = {}
 
         for raw in raw_batches:
-            batch_id = raw.get("batch_id", "unknown")
             entry = TimestampBatchEntry(
-                batch_id=batch_id,
+                batch_id=raw.get("batch_id", "unknown"),
                 merkle_root=raw.get("merkle_root", ""),
                 event_count=len(raw.get("event_ids", [])),
                 event_ids=tuple(str(eid) for eid in raw.get("event_ids", [])),
@@ -892,14 +987,6 @@ class Verifier:
             if raw.get("status") == "confirmed":
                 batch_ids = {str(eid) for eid in raw.get("event_ids", [])}
                 covered_ids.update(batch_ids & exported_ids)
-                # Record the claimed coverage and present coverage for this
-                # batch so the root can be recomputed against bundle events.
-                self._batch_claimed_ids[batch_id] = [
-                    str(eid) for eid in raw.get("event_ids", [])
-                ]
-                token_hex = raw.get("tsa_token")
-                if token_hex:
-                    raw_tokens[batch_id] = bytes.fromhex(token_hex)
 
         uncovered = exported_ids - covered_ids
         if uncovered:
@@ -908,142 +995,6 @@ class Verifier:
                 count=len(uncovered),
                 sample=sorted(uncovered)[:5],
             )
-        return raw_tokens
-
-    def _verify_timestamp_signatures(
-        self,
-        raw_tokens: dict[str, bytes],
-        events: list[Event],
-        report: VerificationReport,
-    ) -> None:
-        """Verify TSA tokens against a Merkle root recomputed from bundle events.
-
-        BC-015: the TSA token must be bound to the *actual* event content in the
-        bundle, not to a bundle-supplied ``merkle_root`` an operator can copy
-        from an unrelated honest batch.  For each confirmed batch we:
-
-        1. Recompute the Merkle root from the UUIDs of the batch's claimed
-           events that are present in the bundle (``compute_merkle_root`` — the
-           same construction regista's timestamping uses).
-        2. Reject the batch if the recomputed root differs from the bundle's
-           stated ``merkle_root`` (the operator altered/added/removed events
-           but kept an old root and token).
-        3. When a trust anchor is configured, verify the TSA token's CMS
-           signature and message imprint against the **recomputed** root.
-
-        Without a trust anchor (no ``--tsa-cert``) the CMS signature cannot be
-        checked, but the recomputed-vs-stated root binding (step 2) is still
-        enforced so a copied token over a different root is caught.
-        """
-        if not raw_tokens:
-            return
-
-        try:
-            from regista._timestamping import (
-                TSAConfig,
-                compute_merkle_root,
-                verify_tsa_token_full,
-            )
-        except ImportError:
-            log.warning("cairn.tsa_verify_import_failed")
-            return
-
-        import uuid as _uuid
-
-        config = (
-            TSAConfig(tsa_url="", tsa_cert_path=self._tsa_cert_path)
-            if self._tsa_cert_path
-            else None
-        )
-
-        events_by_id = {str(ev.event_id): ev for ev in events}
-
-        updated: list[TimestampBatchEntry] = []
-        for entry in report.timestamp_batches:
-            token = raw_tokens.get(entry.batch_id)
-            if token is None or entry.status != "confirmed":
-                updated.append(entry)
-                continue
-
-            # (1) Recompute the Merkle root from the bundle's own events.
-            claimed_ids = self._batch_claimed_ids.get(entry.batch_id, [])
-            present_uuids: list[_uuid.UUID] = []
-            for eid in claimed_ids:
-                if eid in events_by_id:
-                    try:
-                        present_uuids.append(_uuid.UUID(eid))
-                    except ValueError:
-                        pass
-
-            verified: bool | None
-            detail: str
-            if not present_uuids:
-                # The batch claims to cover events, none of which are in the
-                # bundle.  The token proves nothing about this bundle.
-                verified = False
-                detail = (
-                    "Timestamp batch covers no events present in the bundle; "
-                    "the TSA token is not bound to any bundle event (BC-015)."
-                )
-            else:
-                recomputed = compute_merkle_root(present_uuids)
-                recomputed_hex = recomputed.hex()
-                stated_hex = (entry.merkle_root or "").lower()
-
-                if stated_hex and recomputed_hex != stated_hex:
-                    # (2) Root recomputed from bundle events disagrees with the
-                    # bundle-stated root: the events were altered/reordered or
-                    # the token belongs to a different batch.
-                    verified = False
-                    detail = (
-                        "Recomputed Merkle root over bundle events "
-                        f"({recomputed_hex[:16]}...) does not match the "
-                        f"bundle-stated merkle_root ({stated_hex[:16]}...). "
-                        "The TSA token is not bound to the events in this "
-                        "bundle (BC-015 — backdating / token-reuse defense)."
-                    )
-                elif config is None:
-                    # No trust anchor: cannot check the CMS signature, but the
-                    # recomputed root matched the stated root.  Leave the
-                    # signature unverified (None) as before, without claiming
-                    # cryptographic verification.
-                    verified = None
-                    detail = (
-                        "Recomputed Merkle root matches stated root; CMS "
-                        "signature NOT checked (no --tsa-cert)."
-                    )
-                else:
-                    # (3) Verify the token against the recomputed root.
-                    ok, sig_detail = verify_tsa_token_full(token, recomputed, config)
-                    verified = ok
-                    detail = sig_detail
-
-            updated.append(
-                TimestampBatchEntry(
-                    batch_id=entry.batch_id,
-                    merkle_root=entry.merkle_root,
-                    first_global_seq=entry.first_global_seq,
-                    last_global_seq=entry.last_global_seq,
-                    event_count=entry.event_count,
-                    event_ids=entry.event_ids,
-                    status=entry.status,
-                    tsa_timestamp=entry.tsa_timestamp,
-                    verified=verified,
-                    verification_detail=detail,
-                )
-            )
-            if verified is True:
-                log.info("cairn.tsa_signature_verified", batch_id=entry.batch_id[:8])
-            elif verified is False:
-                log.warning(
-                    "cairn.tsa_signature_failed",
-                    batch_id=entry.batch_id[:8],
-                    detail=detail,
-                )
-
-        # Replace the list contents in-place
-        report.timestamp_batches.clear()
-        report.timestamp_batches.extend(updated)
 
     def _accumulate_witness_data(
         self,
@@ -1419,6 +1370,8 @@ class Verifier:
         seq_events = [ev for ev in events if ev.global_seq is not None]
         seen_seq: dict[int, Event] = {}
         for ev in seq_events:
+            if ev.global_seq is None:  # narrow the Optional for the type checker
+                continue
             dup = seen_seq.get(ev.global_seq)
             if dup is not None:
                 report.chain_contiguity_violations.append(
@@ -1444,10 +1397,17 @@ class Verifier:
             own_hash: dict[bytes, Event] = {}
             for ev in events:
                 if ev.canonical_envelope and ev.signature:
-                    h = hashlib.sha256(
-                        bytes(ev.canonical_envelope) + bytes(ev.signature)
-                    ).digest()
-                    own_hash[h] = ev
+                    # Version-aware chain-link formula: v6 links are the
+                    # domain-separated, length-framed v6 event hash, v1-v5 the
+                    # plain SHA-256 concatenation. Delegated to regista's one
+                    # implementation — a hand copy here is how a v6 chain gets
+                    # walked with the legacy formula and every event becomes a
+                    # false "root".
+                    own_hash[
+                        _chain_head_hash(
+                            bytes(ev.canonical_envelope), bytes(ev.signature)
+                        )
+                    ] = ev
 
             # A "root" is an event whose global predecessor is absent from the
             # bundle: either the true genesis (prev is None) or the first event of
@@ -1461,7 +1421,9 @@ class Verifier:
                 if ev.prev_global_event_hash is None
                 or bytes(ev.prev_global_event_hash) not in own_hash
             ]
-            roots.sort(key=lambda e: e.global_seq if e.global_seq is not None else 0)
+            roots.sort(
+                key=lambda e: e.global_seq if e.global_seq is not None else 0
+            )
             for extra in roots[1:]:
                 report.chain_contiguity_violations.append(
                     ChainContiguityViolation(
@@ -1505,9 +1467,11 @@ class Verifier:
         elif seq_events:
             # Legacy bundles predating the global chain (migration 030) carry no
             # prev_global_event_hash; fall back to numeric global_seq contiguity.
-            ordered = sorted(seq_events, key=lambda e: e.global_seq)
+            ordered = sorted(
+                seq_events, key=lambda e: cast(int, e.global_seq)
+            )
             for prev, ev in itertools.pairwise(ordered):
-                gap = ev.global_seq - prev.global_seq
+                gap = cast(int, ev.global_seq) - cast(int, prev.global_seq)
                 if gap > 1:
                     report.chain_contiguity_violations.append(
                         ChainContiguityViolation(
@@ -1520,7 +1484,7 @@ class Verifier:
                             ),
                             event_id=str(ev.event_id),
                             work_item_id=str(ev.work_item_id),
-                            expected=str(prev.global_seq + 1),
+                            expected=str(cast(int, prev.global_seq) + 1),
                             actual=str(ev.global_seq),
                         )
                     )
@@ -1597,7 +1561,7 @@ class Verifier:
                 )
                 continue
 
-            computed = hashlib.sha256(bytes(prev_env) + bytes(prev_sig)).digest()
+            computed = _chain_head_hash(bytes(prev_env), bytes(prev_sig))
             if computed != bytes(ev.prev_event_hash):
                 report.chain_contiguity_violations.append(
                     ChainContiguityViolation(
@@ -1681,9 +1645,8 @@ class Verifier:
             return chosen_pid
 
         for ev in tool_calls:
-            principal_id = None
-            if ev.on_behalf_of is not None:
-                principal_id = ev.on_behalf_of.get("principal_id") or None
+            chain = _delegation_chain_of(ev)
+            principal_id = chain.get("principal_id") if chain is not None else None
 
             if not principal_id:
                 report.principal_binding_violations.append(
@@ -1734,8 +1697,9 @@ class Verifier:
                 sid = payload.get("session_id")
                 if sid and sid != "?":
                     attested.add(sid)
-            elif transition == "scope_statement" and ev.on_behalf_of is not None:
-                sid = ev.on_behalf_of.get("session_id")
+            elif transition == "scope_statement":
+                chain = _delegation_chain_of(ev)
+                sid = chain.get("session_id") if chain is not None else None
                 if sid:
                     attested.add(sid)
         return attested
@@ -1781,8 +1745,9 @@ class Verifier:
             # Also collect session IDs from scope attestation events (legacy path).
             sa_event_ids = {sa.event_id for sa in report.scope_attestations}
             for ev in events:
-                if str(ev.event_id) in sa_event_ids and ev.on_behalf_of is not None:
-                    sid = ev.on_behalf_of.get("session_id")
+                if str(ev.event_id) in sa_event_ids:
+                    chain = _delegation_chain_of(ev)
+                    sid = chain.get("session_id") if chain is not None else None
                     if sid:
                         attested_sessions.add(sid)
 
@@ -1795,9 +1760,8 @@ class Verifier:
             payload = ev.payload or {}
             if not payload.get("harness"):
                 continue
-            session_id = None
-            if ev.on_behalf_of is not None:
-                session_id = ev.on_behalf_of.get("session_id")
+            chain = _delegation_chain_of(ev)
+            session_id = chain.get("session_id") if chain is not None else None
             if not session_id or session_id == "?":
                 continue
             session_tool_calls.setdefault(session_id, []).append(ev)
@@ -1863,8 +1827,9 @@ class Verifier:
         """
         seen: set[str] = set(self._collect_attested_session_ids(events))
         for ev in events:
-            if ev.on_behalf_of is not None:
-                sid = ev.on_behalf_of.get("session_id")
+            chain = _delegation_chain_of(ev)
+            if chain is not None:
+                sid = chain.get("session_id")
                 if sid:
                     seen.add(sid)
             payload = ev.payload or {}
@@ -1923,8 +1888,9 @@ class Verifier:
             payload = ev.payload or {}
             session_id = payload.get("session_id")
             if not session_id:
-                if ev.on_behalf_of:
-                    session_id = ev.on_behalf_of.get("session_id")
+                chain = _delegation_chain_of(ev)
+                if chain is not None:
+                    session_id = chain.get("session_id")
             if not session_id or session_id not in content_sessions:
                 continue
 
@@ -2288,8 +2254,8 @@ class Verifier:
                 lineage = meta.get("model_lineage")
                 if lineage:
                     author_lineages.add(str(lineage))
-                delegation = ev.on_behalf_of
-                if isinstance(delegation, dict):
+                delegation = _delegation_chain_of(ev)
+                if delegation is not None:
                     p_lineage = delegation.get("principal_lineage")
                     if p_lineage:
                         author_lineages.add(str(p_lineage))
