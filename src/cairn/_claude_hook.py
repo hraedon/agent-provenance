@@ -92,6 +92,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from ._hook_selftest import is_selftest, selftest_line
+from ._model_observation import observe_claude_transcript, submit_model_observation
 
 _DEFAULT_STATE_DIR = str(Path(tempfile.gettempdir()) / "cairn-sessions")
 _FALLBACK_SESSION_ID = "unknown"
@@ -385,6 +386,34 @@ def _note_withheld_content(
         _mark_degraded(session_id, action, note)
 
 
+def _record_model_observation(hook_input: dict[str, Any]) -> None:
+    session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
+    transcript_path = hook_input.get("transcript_path")
+    observed = (
+        observe_claude_transcript(transcript_path, session_id)
+        if isinstance(transcript_path, str)
+        else None
+    )
+    requested_model = os.environ.get("ANTHROPIC_MODEL")
+    payload: dict[str, Any] = {
+        "source": "claude.transcript.assistant",
+        "observed_provider_id": observed.provider_id if observed else None,
+        "observed_model_id": observed.model_id if observed else None,
+        "requested_provider_id": "anthropic" if requested_model else None,
+        "requested_model_id": requested_model,
+    }
+    if _env_truthy("CAIRN_SINGLE_MODEL_SERVICE"):
+        payload["declared_model_lineage"] = os.environ.get("CAIRN_MODEL_LINEAGE")
+    submit_model_observation(
+        session_id,
+        payload,
+        _run_bridge,
+        _state_dir,
+        _mark_degraded,
+        action="model_observation",
+    )
+
+
 def _extract_files(tool_name: str, tool_input: dict[str, Any]) -> list[str]:
     files: list[str] = []
     for key in ("filePath", "file_path", "path", "file"):
@@ -627,6 +656,7 @@ def handle_message_display() -> None:
     _capture_raw("message-display", raw)
     hook_input = json.loads(raw)
     session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
+    _record_model_observation(hook_input)
 
     message = ""
     if "message" in hook_input:
@@ -677,6 +707,7 @@ def handle_stop() -> None:
     _capture_raw("stop", raw)
     hook_input = json.loads(raw)
     session_id = hook_input.get("session_id", _FALLBACK_SESSION_ID)
+    _record_model_observation(hook_input)
 
     reply = _run_bridge(
         {

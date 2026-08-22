@@ -84,6 +84,11 @@ def _is_disabled() -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_truthy(name: str) -> bool:
+    value = os.environ.get(name)
+    return value is not None and value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _get_adapter() -> tuple[Any, Any, Any]:
     """Lazily initialize the CairnAdapter.
 
@@ -325,6 +330,15 @@ def _safe(fn: Any) -> None:
         logger.debug("cairn plugin hook failed: %s", exc, exc_info=True)
 
 
+def _mark_model_degraded(session_id: str, detail: str) -> None:
+    try:
+        from cairn._claude_hook import _mark_degraded
+
+        _mark_degraded(session_id, "hermes:model_observation", detail)
+    except Exception:
+        logger.debug("cairn plugin: could not persist model observation degradation")
+
+
 # ---------------------------------------------------------------------------
 # Hook callbacks
 # ---------------------------------------------------------------------------
@@ -457,6 +471,34 @@ def on_session_start(**kwargs: Any) -> None:
             ],
             scope_statement=f"In scope: {harness_name}.",
         )
+        single_model_service = _env_truthy("CAIRN_SINGLE_MODEL_SERVICE")
+        observed_model = None
+        observed_provider = None
+        if single_model_service:
+            observed_model = os.environ.get("CAIRN_HERMES_MODEL") or os.environ.get(
+                "HERMES_MODEL"
+            )
+            observed_provider = os.environ.get("CAIRN_HERMES_PROVIDER") or os.environ.get(
+                "HERMES_PROVIDER"
+            )
+        try:
+            event = adapter.record_model_observation(
+                session_id,
+                source="hermes.single_model_service_environment",
+                observation_basis=(
+                    "single_model_service_declaration"
+                    if observed_model
+                    else "unavailable"
+                ),
+                observed_provider_id=observed_provider,
+                observed_model_id=observed_model,
+                declared_model_lineage=os.environ.get("CAIRN_MODEL_LINEAGE"),
+                on_behalf_of=_build_delegation(cfg, session_id=session_id),
+            )
+            if event is not None and (event.payload or {}).get("status") == "unavailable":
+                _mark_model_degraded(session_id, "service model environment unavailable")
+        except Exception as exc:
+            _mark_model_degraded(session_id, f"capture failed: {type(exc).__name__}")
 
     _safe(_record)
 

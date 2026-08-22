@@ -177,11 +177,68 @@ export function stateDir(sessionId, stateDir) {
  * @param {string} [stateDirOverride]
  */
 export function markDegraded(sessionId, action, detail, stateDirOverride) {
-  const ts = new Date().toISOString();
-  const dir = stateDir(sessionId, stateDirOverride);
-  const entry = JSON.stringify({ ts, action, detail }) + "\n";
-  const marker = join(dir, "degradation.log");
-  appendFileSync(marker, entry, { mode: 0o600 });
+  try {
+    const ts = new Date().toISOString();
+    const dir = stateDir(sessionId, stateDirOverride);
+    const entry = JSON.stringify({ ts, action, detail }) + "\n";
+    const marker = join(dir, "degradation.log");
+    appendFileSync(marker, entry, { mode: 0o600 });
+  } catch {
+    // Observation must not block the harness even when its local gap log is unavailable.
+  }
+}
+
+function loadModelObservationKeys(sessionId, stateDirOverride) {
+  try {
+    const path = join(stateDir(sessionId, stateDirOverride), "model-observations.json");
+    if (!existsSync(path)) return new Set();
+    const values = JSON.parse(readFileSync(path, "utf8"));
+    return new Set(Array.isArray(values) ? values.filter((value) => typeof value === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function persistModelObservationKeys(sessionId, keys, stateDirOverride) {
+  try {
+    const path = join(stateDir(sessionId, stateDirOverride), "model-observations.json");
+    writeFileSync(
+      path,
+      JSON.stringify([...keys].slice(-MODEL_OBSERVATION_DEDUP_LIMIT)) + "\n",
+      { mode: 0o600 },
+    );
+  } catch {
+    markDegraded(
+      sessionId,
+      "model_observation",
+      "could not persist model observation deduplication state",
+      stateDirOverride,
+    );
+  }
+}
+
+// Shared bound for the model-observation dedup window, both in memory
+// (observedModels, via rememberObservedModel) and on disk (the
+// model-observations.json restart-dedup file, via
+// persistModelObservationKeys). These two used to drift silently — the
+// in-memory set was bounded at 4096 while the persisted file was sliced to
+// only 256 — so a restart's dedup window was 16x narrower than the
+// in-process one with no indication anywhere that this was intentional.
+// 4096 is chosen (rather than shrinking the in-memory side down to 256)
+// because the persisted file holds only short JSON strings (one
+// `JSON.stringify([sessionID, providerID, modelID])` key each), so 4096
+// entries costs at most a few hundred KB on disk — cheap relative to the
+// benefit of restart-dedup covering the same window as in-process dedup.
+// It also matches the existing per-plugin-instance bound already used for
+// `requestedModels` above, so all three model-identity maps in this file
+// share one order-of-magnitude convention.
+export const MODEL_OBSERVATION_DEDUP_LIMIT = 4096;
+
+function rememberObservedModel(keys, observationKey) {
+  keys.add(observationKey);
+  while (keys.size > MODEL_OBSERVATION_DEDUP_LIMIT) {
+    keys.delete(keys.values().next().value);
+  }
 }
 
 /**
@@ -517,6 +574,9 @@ export default async function cairnPlugin(ctx) {
   // across sessions/calls.  Bounded so a flood of unclosed begins cannot grow
   // memory without bound; evictions are recorded as degradations.
   const sessionMap = createSessionMap();
+  const requestedModels = new Map();
+  const observedModels = new Set();
+  const pendingModelObservations = new Set();
   const client = ctx?.client ?? null;
   const stateDirOverride = ctx?.stateDir ?? null;
 
@@ -571,6 +631,22 @@ export default async function cairnPlugin(ctx) {
   }
 
   return {
+    "chat.message": async (input) => {
+      if (
+        input?.sessionID &&
+        typeof input.model?.providerID === "string" &&
+        typeof input.model?.modelID === "string"
+      ) {
+        requestedModels.set(input.sessionID, {
+          providerID: input.model.providerID,
+          modelID: input.model.modelID,
+        });
+        while (requestedModels.size > 4096) {
+          requestedModels.delete(requestedModels.keys().next().value);
+        }
+      }
+    },
+
     "tool.execute.before": async (input, output) => {
       const { tool, sessionID, callID } = input;
       const args = output.args ?? {};
@@ -686,6 +762,92 @@ export default async function cairnPlugin(ctx) {
     },
 
     event: async ({ event }) => {
+      if (event?.type === "message.updated") {
+        const info = event.properties?.info;
+        if (info?.role === "assistant" && info.sessionID) {
+          const requested = requestedModels.get(info.sessionID);
+          const observedProvider =
+            typeof info.providerID === "string" ? info.providerID : null;
+          const observedModel = typeof info.modelID === "string" ? info.modelID : null;
+          const observationKey = JSON.stringify([
+            info.sessionID,
+            observedProvider,
+            observedModel,
+          ]);
+          if (
+            !observedModels.has(observationKey) &&
+            !pendingModelObservations.has(observationKey)
+          ) {
+            const persisted = loadModelObservationKeys(info.sessionID, stateDirOverride);
+            if (persisted.has(observationKey)) {
+              rememberObservedModel(observedModels, observationKey);
+            }
+          }
+          // Guard the submit gate with both sets, not just observedModels:
+          // observedModels is populated only once the bridge's `.then()`
+          // resolves, but `message.updated` fires repeatedly while an
+          // assistant message streams. Without also checking
+          // pendingModelObservations, every one of those repeat events for
+          // the same key would fire its own bridge call while the first is
+          // still in flight (review finding 1). The bridge derives a
+          // deterministic uuid5 event id from observation_id, so a
+          // duplicate call is an idempotent append rather than a duplicate
+          // event, but it is still a wasted round-trip and degradation-log
+          // noise we can avoid for free.
+          if (!observedModels.has(observationKey) && !pendingModelObservations.has(observationKey)) {
+            const body = {
+              action: "model_observation",
+              session_id: info.sessionID,
+              source: "opencode.message.updated",
+              observation_id: observationKey,
+              observed_provider_id: observedProvider,
+              observed_model_id: observedModel,
+              requested_provider_id: requested?.providerID ?? null,
+              requested_model_id: requested?.modelID ?? null,
+            };
+            if (isEnvTruthy("CAIRN_SINGLE_MODEL_SERVICE")) {
+              body.declared_model_lineage = process.env.CAIRN_MODEL_LINEAGE ?? null;
+            }
+            pendingModelObservations.add(observationKey);
+            void invokeBridge(body, client)
+              .then((reply) => {
+                if (reply?.status === "ok") {
+                  rememberObservedModel(observedModels, observationKey);
+                  const persisted = loadModelObservationKeys(info.sessionID, stateDirOverride);
+                  persisted.add(observationKey);
+                  persistModelObservationKeys(info.sessionID, persisted, stateDirOverride);
+                  if (reply.finding) {
+                    logTo(client, `[cairn] model observation finding: ${reply.finding}`);
+                  }
+                } else {
+                  markDegraded(
+                    info.sessionID,
+                    "model_observation",
+                    "model observation bridge call failed",
+                    stateDirOverride,
+                  );
+                }
+                if (!observedModel) {
+                  markDegraded(
+                    info.sessionID,
+                    "model_observation",
+                    "assistant message metadata has no observed model identifier",
+                    stateDirOverride,
+                  );
+                }
+              })
+              .catch(() => {
+                markDegraded(
+                  info.sessionID,
+                  "model_observation",
+                  "model observation callback failed",
+                  stateDirOverride,
+                );
+              })
+              .finally(() => pendingModelObservations.delete(observationKey));
+          }
+        }
+      }
       if (event?.type === "session.started" && isEnvTruthy("CAIRN_ATTEST_ON_START")) {
         const sessionID = event.properties?.sessionID ?? "";
         if (!sessionID) {

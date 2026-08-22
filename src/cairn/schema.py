@@ -409,6 +409,41 @@ class SessionAttestationPayload:
 
 
 @dataclass(frozen=True)
+class ModelObservationPayload:
+    status: str
+    source: str
+    observation_basis: str
+    observed_provider_id: str | None = None
+    observed_model_id: str | None = None
+    observed_model_lineage: str | None = None
+    requested_provider_id: str | None = None
+    requested_model_id: str | None = None
+    declared_model_lineage: str | None = None
+    finding: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "version": "1",
+            "status": self.status,
+            "source": self.source,
+            "observation_basis": self.observation_basis,
+        }
+        for field in (
+            "observed_provider_id",
+            "observed_model_id",
+            "observed_model_lineage",
+            "requested_provider_id",
+            "requested_model_id",
+            "declared_model_lineage",
+            "finding",
+        ):
+            value = getattr(self, field)
+            if value is not None:
+                result[field] = value
+        return result
+
+
+@dataclass(frozen=True)
 class UserMessagePayload:
     """The human's prompt/message to the agent (Plan 010 WI-2.1).
 
