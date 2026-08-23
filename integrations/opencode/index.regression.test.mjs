@@ -58,24 +58,30 @@ test("finding 1: a second message.updated for the same key does not fire a secon
   const saved = process.env.CAIRN_BRIDGE_PATH;
   try {
     const recordFile = join(sub, "record.jsonl");
+    const startsFile = join(sub, "starts.jsonl");
+    const releaseFile = join(sub, "release");
     const bridge = join(sub, "rec.mjs");
-    // Deliberately slow (50ms) so the first call is still in flight when the
-    // second event fires synchronously after it — this is the
-    // streaming-update race the finding describes ("message.updated" firing
-    // repeatedly while an assistant message streams).
+    // The bridge announces that it has started, then blocks until the test
+    // releases it. The test therefore holds the in-flight window open itself
+    // rather than betting that a fixed delay outruns node's startup cost —
+    // that bet is what CI runs 32395152087 and 32613140792 lost, reporting
+    // "got 0" because the first call had not landed yet, which is a slow
+    // runner and not the duplicate-call regression this test is here for.
     writeBridge(
       bridge,
-      `import { readFileSync, appendFileSync } from "node:fs";
+      `import { readFileSync, appendFileSync, existsSync } from "node:fs";
 const msg = JSON.parse(readFileSync(0, "utf8"));
-setTimeout(() => {
-  appendFileSync(${JSON.stringify(recordFile)}, JSON.stringify(msg) + "\\n");
-  process.stdout.write(JSON.stringify({ status: "ok", event_id: "ev" }) + "\\n");
-}, 50);`,
+appendFileSync(${JSON.stringify(startsFile)}, JSON.stringify(msg) + "\\n");
+while (!existsSync(${JSON.stringify(releaseFile)})) {
+  await new Promise((resolve) => setTimeout(resolve, 5));
+}
+appendFileSync(${JSON.stringify(recordFile)}, JSON.stringify(msg) + "\\n");
+process.stdout.write(JSON.stringify({ status: "ok", event_id: "ev" }) + "\\n");`,
     );
     process.env.CAIRN_BRIDGE_PATH = bridge;
 
     const plugin = await cairnPlugin({ client: mkClient(), stateDir: sub });
-    const event = {
+    const eventFor = (modelID) => ({
       type: "message.updated",
       properties: {
         info: {
@@ -83,30 +89,66 @@ setTimeout(() => {
           sessionID: "sess-dup",
           role: "assistant",
           providerID: "provider-b",
-          modelID: "glm-5.2",
+          modelID,
         },
       },
-    };
+    });
 
-    // Fire the same event twice back-to-back. plugin.event() returns as soon
-    // as it has synchronously kicked off (but not awaited) the bridge call,
-    // so the second call reaches the gate before the first's promise
-    // resolves. Under the bug (submit gate checked only observedModels, not
+    // Bounded below the 10s bridge spawn timeout so a genuinely stuck bridge
+    // surfaces as this timeout rather than as a killed child.
+    async function waitFor(what, satisfied) {
+      for (let attempt = 0; attempt < 500; attempt += 1) {
+        if (satisfied()) return;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      throw new Error(`timed out waiting for ${what}`);
+    }
+    const startsFor = (modelID) =>
+      readRecord(startsFile).filter((call) => call.observed_model_id === modelID);
+    const recordsFor = (modelID) =>
+      readRecord(recordFile).filter(
+        (call) => call.action === "model_observation" && call.observed_model_id === modelID,
+      );
+
+    // Fire the first observation and wait for its bridge to block. From here
+    // the call is provably in flight: the submit gate clears
+    // pendingModelObservations only in the invokeBridge().finally(), which
+    // cannot run until this child exits.
+    await plugin.event({ event: eventFor("glm-5.2") });
+    await waitFor("the first bridge call to start", () => startsFor("glm-5.2").length >= 1);
+
+    // The same key again, while the first is still in flight. The submit gate
+    // is synchronous, so with the first call pending the outcome is settled
+    // here with no timing left in it. Under the bug (gate checked only
+    // observedModels, which is populated in the bridge's .then(), and not
     // pendingModelObservations) this issued a second bridge call.
-    await plugin.event({ event });
-    await plugin.event({ event });
+    await plugin.event({ event: eventFor("glm-5.2") });
 
-    // Give the slow bridge time to respond and the .then() to run.
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // A different key is never deduped, so its call is a barrier: it is
+    // dispatched after any duplicate call would have been, so once it has
+    // started, a duplicate would have started too.
+    await plugin.event({ event: eventFor("glm-5.3") });
+    await waitFor("the barrier bridge call to start", () => startsFor("glm-5.3").length >= 1);
 
-    const observations = readRecord(recordFile).filter(
-      (call) => call.action === "model_observation",
+    assert.equal(
+      startsFor("glm-5.2").length,
+      1,
+      `expected exactly one bridge call while the first was in flight, got ${startsFor("glm-5.2").length}`,
+    );
+
+    // Release everything and confirm the same count on the recorded side,
+    // once every bridge that started has finished.
+    writeFileSync(releaseFile, "");
+    await waitFor(
+      "every started bridge call to finish",
+      () => readRecord(recordFile).length >= readRecord(startsFile).length,
     );
     assert.equal(
-      observations.length,
+      recordsFor("glm-5.2").length,
       1,
-      `expected exactly one bridge call while the first was in flight, got ${observations.length}`,
+      `expected exactly one recorded observation for the duplicated key, got ${recordsFor("glm-5.2").length}`,
     );
+    assert.equal(recordsFor("glm-5.3").length, 1, "the distinct key should not be deduped");
   } finally {
     process.env.CAIRN_BRIDGE_PATH = saved;
     rmSync(sub, { recursive: true, force: true });
