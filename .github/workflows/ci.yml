@@ -34,7 +34,7 @@ jobs:
       - name: Install dependencies (develop-against-lock, Plan 019 B2)
         run: |
           # The paved installer reads SUITE.lock [spine].version and installs
-          # regista-hraedon at that locked release from PyPI (today 0.7.1),
+          # regista-hraedon at that locked release from PyPI (today 0.7.2),
           # then `-e .[dev]`. Same install shape as local `make dev`, so CI and
           # a developer's machine develop against the same shipped substrate.
           # No hardcoded version pin here — it would silently drift from
