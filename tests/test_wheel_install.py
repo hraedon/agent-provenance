@@ -28,7 +28,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Summary-line parser for the conformance proof; copied from
 # test_conformance_meta_guard.py so this file stands alone.
-_SUMMARY_LINE_RE = re.compile(r"^(?P<line>.*?\bin \d+(?:\.\d+)?s)\s*$", re.MULTILINE)
+_SUMMARY_LINE_RE = re.compile(
+    r"^(?P<line>.*?\bin \d+(?:\.\d+)?s)\s*(?:=+\s*)?$", re.MULTILINE
+)
 _COUNT_RE = {
     "passed": re.compile(r"(\d+)\s+passed"),
     "skipped": re.compile(r"(\d+)\s+skipped"),
@@ -66,6 +68,13 @@ def _require_builder() -> str:
     if not builder:
         pytest.skip("neither pip nor uv is available to build/install a wheel")
     return builder
+
+
+def _venv_python(venv_dir: Path) -> Path:
+    """Return the interpreter path for a venv on the current platform."""
+    if os.name == "nt":
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
 
 
 def _build_wheel(tmp_path: Path) -> Path:
@@ -178,34 +187,91 @@ def test_wheel_install_opencode_finds_plugin(tmp_path: Path, monkeypatch) -> Non
 
 
 @pytest.mark.slow
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="agent-suite-conformance 1.1.0 requires Python 3.12+",
+)
 def test_wheel_install_conformance_cases_pass(tmp_path: Path) -> None:
-    """A clean target install resolves deps and conformance cases actually run."""
+    """A clean venv install resolves deps and conformance cases actually run."""
     wheel = _build_wheel(tmp_path)
-    target = tmp_path / "installed"
-    # Install the wheel and its declared runtime dependencies into a clean target
-    # directory. This proves the wheel metadata is sufficient for resolution and
-    # that the conformance gate does not depend on the editable source layout.
-    _install_wheel(wheel, target, with_deps=True)
+    venv_dir = tmp_path / "wheel-venv"
+    subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+    venv_python = _venv_python(venv_dir)
+    assert venv_python.is_file(), f"venv interpreter not found at {venv_python}"
 
-    # cairn + its runtime dependencies landed in the target directory.
-    assert (target / "cairn" / "__init__.py").is_file()
-    assert (target / "regista" / "__init__.py").is_file()
-    assert (target / "click" / "__init__.py").is_file()
+    # Match the CI wheel lane: install the wheel normally so its declared runtime
+    # dependencies and console entry points are resolved into the venv, then add
+    # only pytest and the pinned conformance kit needed by the copied tests.
+    subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+            str(wheel),
+            "agent-suite-conformance==1.1.0",
+            "pytest>=8,<9",
+        ],
+        check=True,
+    )
+
+    # Run outside the checkout and copy only the conformance modules, not the
+    # repository conftest or any fixtures. This is the same source-isolation
+    # shape as the CI wheel lane.
+    scratch = tmp_path / "conformance-run"
+    scratch_tests = scratch / "tests"
+    scratch_tests.mkdir(parents=True)
+    for name in ("test_cli_conformance.py", "test_conformance_meta_guard.py"):
+        shutil.copy2(
+            REPO_ROOT / "tests" / name,
+            scratch_tests / name,
+        )
 
     env = os.environ.copy()
-    pythonpath = str(target)
-    if "PYTHONPATH" in env:
-        pythonpath = pythonpath + os.pathsep + env["PYTHONPATH"]
-    env["PYTHONPATH"] = pythonpath
+    env.pop("PYTHONPATH", None)
+    env["NO_COLOR"] = "1"
+    env["PY_COLORS"] = "0"
+    env.pop("FORCE_COLOR", None)
 
-    conformance_test = REPO_ROOT / "tests" / "test_cli_conformance.py"
+    # Prove that imports resolve from the venv before running the gate. The
+    # scratch cwd plus the stripped PYTHONPATH make an editable checkout
+    # unavailable to both this probe and the conformance subprocesses.
+    probe = subprocess.run(
+        [
+            str(venv_python),
+            "-c",
+            (
+                "import cairn, click, regista; "
+                "assert 'site-packages' in cairn.__file__, cairn.__file__; "
+                "print(cairn.__file__)"
+            ),
+        ],
+        cwd=str(scratch),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probe.returncode == 0, f"stderr: {probe.stderr}\nstdout: {probe.stdout}"
+
     proc = subprocess.run(
         [
-            sys.executable, "-m", "pytest", str(conformance_test),
-            "-q", "-p", "no:cacheprovider", "--no-header", "--color=no",
+            str(venv_python),
+            "-m",
+            "pytest",
+            "tests/",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "--color=no",
         ],
         capture_output=True,
         text=True,
+        cwd=str(scratch),
         env=env,
         check=False,
     )

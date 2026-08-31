@@ -66,7 +66,7 @@ run_usage_case = conformance.run_usage_case
 
 # `python -m cairn` invokes the *bridge*, not the CLI; the CLI is the `cairn`
 # console script installed next to this interpreter.
-_CAIRN = str(Path(sys.executable).parent / "cairn")
+_CAIRN = str(Path(sys.executable).parent / ("cairn.exe" if os.name == "nt" else "cairn"))
 
 # Fixtures for the ErrorCase: files that exist (so click.Path(exists=True)
 # passes) but hold malformed content (so the key loader raises an operational
