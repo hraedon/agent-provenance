@@ -434,7 +434,8 @@ def test_all_short_denylist_entries_fail_closed_for_a_public_repo(
     _declare(repo, "public")
     _track(repo, "publication.toml", (repo / "publication.toml").read_text())
     _commit(repo, "declare public")
-    monkeypatch.setenv("CAIRN_FORBIDDEN_IDENTIFIERS", "x" * (gate.MIN_IDENTIFIER_LENGTH - 1))
+    too_short = "x" * (gate.MIN_IDENTIFIER_LENGTH - 1)
+    monkeypatch.setenv("CAIRN_FORBIDDEN_IDENTIFIERS", too_short)
     assert gate.main([]) == 1
 
 

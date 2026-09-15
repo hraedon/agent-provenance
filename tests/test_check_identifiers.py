@@ -136,10 +136,41 @@ def test_main_blocks_tracked_file_under_samples(
 # --- Secret-driven identifier scan ---
 
 
-def test_main_exits_zero_when_env_var_empty(
+def test_main_exits_one_when_env_var_empty_on_this_public_repo(
     monkeypatch: pytest.MonkeyPatch, checker: ModuleType
 ) -> None:
+    """An unconfigured denylist is a FAILURE here, not a skip.
+
+    cairn's publication.toml declares ``visibility = "public"``. On a public repo
+    an unset denylist makes the gate print "skipping" and exit 0 -- which is
+    indistinguishable from a clean tree, so CI goes green having scanned nothing.
+    A leak here is irreversible, so the gate refuses instead.
+
+    This test previously asserted 0: it encoded the old fail-open contract.
+    """
     monkeypatch.setenv("CAIRN_FORBIDDEN_IDENTIFIERS", "")
+
+    def fake_run(*args: object, **kwargs: object) -> CompletedProcess[str]:
+        return CompletedProcess(args=[], returncode=0, stdout="")
+
+    monkeypatch.setattr(checker.subprocess, "run", fake_run)
+    assert checker.main([]) == 1
+
+
+def test_main_exits_zero_when_env_var_empty_and_repo_is_not_public(
+    monkeypatch: pytest.MonkeyPatch, checker: ModuleType, tmp_path: Path
+) -> None:
+    """The fail-open path survives for a repo awaiting publication review.
+
+    Without this, the change above would read as "the gate now always fails
+    unconfigured", and a fresh clone or a fork of a private-until-review repo
+    would be blocked for no reason. Both halves of the asymmetry are asserted.
+    """
+    monkeypatch.setenv("CAIRN_FORBIDDEN_IDENTIFIERS", "")
+    (tmp_path / "publication.toml").write_text(
+        '[publication]\nvisibility = "private-until-review"\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
 
     def fake_run(*args: object, **kwargs: object) -> CompletedProcess[str]:
         return CompletedProcess(args=[], returncode=0, stdout="")

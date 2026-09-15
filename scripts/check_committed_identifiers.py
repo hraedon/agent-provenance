@@ -430,8 +430,15 @@ def _unconfigured(reason: str) -> None:
         raise GateError(
             f"{reason} but {_DECLARATION_FILENAME} declares visibility=\"public\". "
             "A public repo with an unconfigured gate is a silent pass, so this is "
-            "a failure, not a skip. Provide the denylist via the CAIRN_FORBIDDEN_IDENTIFIERS "
-            "environment variable (in CI, the shared organisation secret of that name)."
+            # The env-name placeholder below sits on a line of its own. The longest
+            # name in the estate is 52 characters, and folding it into a prose line
+            # pushes the SUBSTITUTED file past 100 columns while the template itself
+            # still looks clean. (This comment may not name the placeholder: it would
+            # be substituted too, and would itself go over.)
+            "a failure, not a skip. Provide the denylist via the "
+            "CAIRN_FORBIDDEN_IDENTIFIERS environment variable "
+            "(in CI, the secret of that name: org-level where the repo is in an "
+            "org, otherwise a repo-level secret)."
         )
     print(f"{reason}; skipping identifier gate.", file=sys.stderr)
 
