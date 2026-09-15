@@ -210,22 +210,36 @@ def test_main_exits_zero_when_no_violation(
 def test_staged_mode_scans_staged_diff(
     monkeypatch: pytest.MonkeyPatch, checker: ModuleType, tmp_path: Path
 ) -> None:
+    """--staged enumerates with ``git diff --cached`` and reads the INDEX blob.
+
+    The fake dispatches on the command because the two calls have different
+    contracts: path enumeration is text, blob content is BYTES (decoding before
+    the binary/BOM sniff would defeat it). A single text-returning fake used to
+    satisfy this test, which is precisely why it did not notice that the scan
+    was reading the working tree rather than what the commit would record.
+    """
     file_path = tmp_path / "staged.txt"
     file_path.write_text("Secret FAKEDOM value\n", encoding="utf-8")
     monkeypatch.setenv("CAIRN_FORBIDDEN_IDENTIFIERS", "FAKEDOM")
 
-    seen: dict[str, list[str]] = {}
+    calls: list[list[str]] = []
 
-    def fake_run(args: list[str], **kwargs: object) -> CompletedProcess[str]:
-        seen["args"] = args
-        return CompletedProcess(args=args, returncode=0, stdout=f"{file_path}\0")
+    def fake_run(args: list[str], **kwargs: object) -> CompletedProcess[object]:
+        calls.append(args)
+        if args[:3] == ["git", "diff", "--cached"]:
+            return CompletedProcess(args=args, returncode=0, stdout=f"{file_path}\0")
+        if args[:2] == ["git", "show"]:
+            return CompletedProcess(args=args, returncode=0, stdout=file_path.read_bytes())
+        return CompletedProcess(args=args, returncode=0, stdout="")
 
     monkeypatch.setattr(checker.subprocess, "run", fake_run)
     assert checker.main(["--staged"]) == 1
-    assert seen["args"] == [
+    assert [
         "git", "diff", "--cached", "--name-only",
         "--diff-filter=ACM", "--no-renames", "-z",
-    ]
+    ] in calls
+    # The index, addressed explicitly as stage 0 -- not the worktree path.
+    assert any(a[:2] == ["git", "show"] and a[2].startswith(":0:") for a in calls)
 
 
 def test_main_scans_nested_samples_dir(
