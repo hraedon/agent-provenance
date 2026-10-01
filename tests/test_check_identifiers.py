@@ -236,7 +236,7 @@ def test_staged_mode_scans_staged_diff(
     assert checker.main(["--staged"]) == 1
     assert [
         "git", "diff", "--cached", "--name-only",
-        "--diff-filter=ACM", "--no-renames", "-z",
+        "--diff-filter=ACMT", "--no-renames", "-z",
     ] in calls
     # The index, addressed explicitly as stage 0 -- not the worktree path.
     assert any(a[:2] == ["git", "show"] and a[2].startswith(":0:") for a in calls)
