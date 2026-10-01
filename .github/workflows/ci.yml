@@ -24,6 +24,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # gate walks history when publication.toml is absent; refuses shallow
 
       - name: Set up Python
         uses: actions/setup-python@v6
