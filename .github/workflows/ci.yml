@@ -51,6 +51,15 @@ jobs:
           CAIRN_FORBIDDEN_IDENTIFIERS: ${{ secrets.CAIRN_FORBIDDEN_IDENTIFIERS }}
         run: python3 scripts/check_committed_identifiers.py
 
+      # Everything the push or PR publishes, not just the tip tree: every commit's
+      # message, author/committer identity, and added or changed files. The range
+      # comes from the event (needs the fetch-depth: 0 checkout above).
+      - name: Published-range identifier gate
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        env:
+          CAIRN_FORBIDDEN_IDENTIFIERS: ${{ secrets.CAIRN_FORBIDDEN_IDENTIFIERS }}
+        run: python3 scripts/check_committed_identifiers.py --ci-range
+
       - name: Lint (ruff)
         run: ruff check src tests
 
