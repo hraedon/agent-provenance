@@ -287,13 +287,14 @@ def _save_last_bundle_hash(directory: Path, bundle_hash: str) -> None:
         )
 
 
-_SECTION_RE = re.compile(r"^#+\s+(\d+(?:\.\d+)?)")
+_SECTION_RE = re.compile(r"^#+\s+(\d+(?:\.\d+)*)")
 
 
 def _extract_readme_sections(readme_text: str) -> tuple[str | None, str | None]:
     """Return control description and caveat from README §4.2.
 
-    Uses regex to match section headings like ``## 4.2`` or ``### 4.2.1``.
+    Includes numbered descendants such as ``### 4.2.1`` and stops at the next
+    unrelated numbered heading; ``4.20`` is not a descendant of ``4.2``.
     """
     control_lines: list[str] = []
     in_control = False
@@ -302,11 +303,8 @@ def _extract_readme_sections(readme_text: str) -> tuple[str | None, str | None]:
         m = _SECTION_RE.match(line)
         if m:
             section = m.group(1)
-            if section.startswith("4.2"):
-                in_control = True
-                continue
-            elif section.startswith("4.3"):
-                in_control = False
+            in_control = section == "4.2" or section.startswith("4.2.")
+            continue
         if in_control:
             if line.startswith("> "):
                 control_lines.append(line[2:])
